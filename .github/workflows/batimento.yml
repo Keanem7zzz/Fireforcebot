@@ -1,0 +1,61 @@
+# ==============================================================================
+#  💓 BATIMENTO - mantém o repositório sempre "vivo"
+# ==============================================================================
+#  POR QUE ISSO EXISTE:
+#  O GitHub desativa automaticamente workflows AGENDADOS quando o repositório
+#  fica ~60 dias SEM NENHUMA ATIVIDADE (é uma regra deles). Com o bot rodando
+#  a cada 5h isso quase não acontece - mas este arquivo garante que NUNCA
+#  aconteça: duas vezes por mês ele faz um commitzinho automático no
+#  repositório, e isso conta como atividade e reinicia o contador dos 60 dias.
+#
+#  Não precisa mexer em nada depois de criar. Ele roda sozinho:
+#      dias 1 e 15 de cada mês, às 06:00 (UTC)
+#  (cada vez "gasta" ~30 segundos de máquina - nada na sua cota)
+#
+#  COMO INSTALAR (1 minuto):
+#      No repositório: Add file > Create new file
+#      Nome do arquivo:  .github/workflows/batimento.yml
+#      Cole ESTE conteúdo inteiro e clique em Commit changes
+#
+#  COMO TESTAR NA HORA:
+#      Aba Actions > "Batimento" > Run workflow   (ele commita na hora)
+# ==============================================================================
+
+name: Batimento
+
+on:
+  schedule:
+    - cron: "0 6 1,15 * *"     # dias 1 e 15 de cada mês (UTC)
+  workflow_dispatch:            # botão pra testar/rodar na mão
+
+permissions:
+  contents: write               # precisa poder commitar no repositório
+
+jobs:
+  batimento:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 📥 Baixar o repositório
+        uses: actions/checkout@v4
+
+      - name: 💓 Carimbar a data de hoje
+        shell: bash
+        run: |
+          printf 'Batimento do Fire Force — repositorio ativo em %s\n' "$(date -u '+%d/%m/%Y %H:%M UTC')" > batimento.txt
+          echo "Carimbo: $(cat batimento.txt)"
+
+      - name: 📤 Commitar (é isso que mantém o agendamento vivo)
+        shell: bash
+        run: |
+          git config user.name "Fire Force Bot"
+          git config user.email "bot@fireforce.local"
+          git add batimento.txt
+          if git diff --staged --quiet; then
+            echo "Nada mudou (já tinha batido hoje) - nada a fazer."
+          else
+            git commit -m "💓 batimento $(date -u '+%d/%m/%Y')"
+            git push
+            echo "Commit feito! O contador dos 60 dias do GitHub zerou."
+          fi
+          
