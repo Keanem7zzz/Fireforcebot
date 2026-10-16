@@ -1,0 +1,224 @@
+# ==============================================================================
+#  FIRE FORCE - workflow completo (RDP + Tailscale + BOT) - ARQUIVO UNICO
+# ==============================================================================
+#  Salve como:  .github/workflows/fireforce.yml
+#
+#  Este arquivo faz TUDO sozinho dentro da máquina:
+#     - liga o RDP (usuario runneradmin + senha do segredo RDP_SENHA)
+#     - entra no Tailscale (hostname fireforce-rdp)
+#     - cria o .env com as chaves dos Segredos
+#     - sobe o bot ESCONDIDO, com vigia (se cair, levanta de novo)
+#     - cria os atalhos na area de trabalho (Ligar / Reiniciar / Status)
+#     - mantem a maquina viva e se relanca a cada 5h (cron)
+#
+#  Voce NAO precisa subir nenhum .ps1 ou .bat: a maquina cria os arquivos.
+#  No repositorio ficam apenas 2 arquivos:
+#     fireforce_bot.py
+#     .github/workflows/fireforce.yml   (este)
+#
+#  QUER 100% NO SEU TEMPO (sem relancar sozinho)? Comente o bloco "schedule:".
+# ==============================================================================
+
+name: Fire Force (RDP + Bot)
+
+on:
+  workflow_dispatch:            # seu botao de sempre: Run workflow
+  schedule:
+    - cron: "0 */5 * * *"       # relanca a cada 5h -> emenda sem buraco
+
+# UMA maquina por vez: o proximo run fica na fila e entra no lugar do antigo.
+# NUNCA rode duas ao mesmo tempo (o mesmo PIX contaria 2x e brigariam pelo token).
+concurrency:
+  group: fireforce-bot
+  cancel-in-progress: false
+
+env:
+  SYNC_SEGUNDOS: "30"           # a maquina morre de repente: salva no Supabase mais seguido
+
+jobs:
+  maquina:
+    runs-on: windows-latest
+    timeout-minutes: 360        # LIMITE DO GITHUB: 6h. O loop interno para antes (5h50).
+    steps:
+      - name: 📥 Baixar o código
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------- RDP ---
+      - name: 🖥️ Preparar o RDP (usuário runneradmin + senha do segredo)
+        shell: pwsh
+        run: |
+          net user runneradmin "${{ secrets.RDP_SENHA }}"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+      - name: 🌐 Entrar no Tailscale
+        shell: pwsh
+        run: |
+          $msi = "$env:RUNNER_TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn" -Wait
+          & 'C:\Program Files\Tailscale\tailscale.exe' up --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" --hostname=fireforce-rdp --unattended --accept-routes
+          $ip = (& 'C:\Program Files\Tailscale\tailscale.exe' ip -4) | Select-Object -First 1
+          Write-Host "------------------------------------------------------"
+          Write-Host "  Windows App -> fireforce-rdp   (ou $ip)"
+          Write-Host "  Usuario: runneradmin           Senha: RDP_SENHA"
+          Write-Host "------------------------------------------------------"
+
+      # ------------------------------------------------------------- BOT ------
+      - name: 🐍 Instalar o Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 📦 Instalar as bibliotecas do bot
+        shell: pwsh
+        run: python -m pip install --quiet --disable-pip-version-check discord.py aiohttp aiosqlite "qrcode[pil]" Pillow
+
+      - name: 🛠️ Criar os controles do bot (vigia + atalhos)
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+
+          # ---- vigia: sobe o bot e levanta de novo se ele cair ------------------
+          @'
+          $ErrorActionPreference = "Continue"
+          Set-Location -Path $PSScriptRoot
+          $log = Join-Path $PSScriptRoot "vigia.log"
+          function Escrever($t) { Add-Content -Path $log -Value "[vigia] $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss') $t" -Encoding UTF8 }
+          if ((Test-Path $log) -and ((Get-Item $log).Length -gt 4MB)) { Remove-Item $log -Force }
+          $q = 0
+          Escrever "vigia ligado"
+          while ($true) {
+            $q++
+            Escrever "subindo o bot (tentativa $q)"
+            python fireforce_bot.py *>> $log
+            Escrever "o bot saiu (codigo $LASTEXITCODE)"
+            if ($q -ge 300) { Escrever "300 quedas seguidas - parando. Rode o bot na mao e leia o erro."; break }
+            Start-Sleep -Seconds 5
+          }
+          '@ | Set-Content -Path (Join-Path $ws 'vigia_bot.ps1') -Encoding UTF8
+
+          # ---- ligar o bot (escondido, com vigia) ------------------------------
+          @'
+          $ErrorActionPreference = "Continue"
+          Set-Location -Path $PSScriptRoot
+          $p = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
+          if ($p) { Write-Host "O bot JA esta no ar (PID $($p.ProcessId -join ','))." -ForegroundColor Green; exit }
+          Start-Process powershell -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File",(Join-Path $PSScriptRoot 'vigia_bot.ps1') -WindowStyle Hidden
+          Start-Sleep -Seconds 8
+          $p = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
+          if ($p) { Write-Host "BOT NO AR (PID $($p.ProcessId -join ','))." -ForegroundColor Green }
+          else { Write-Host "O bot NAO subiu - veja o vigia.log nesta pasta." -ForegroundColor Red }
+          '@ | Set-Content -Path (Join-Path $ws 'iniciar_bot.ps1') -Encoding UTF8
+
+          # ---- reiniciar (pra usar dentro do RDP) ------------------------------
+          @'
+          $ErrorActionPreference = "Continue"
+          Set-Location -Path $PSScriptRoot
+          Write-Host "Encerrando o bot atual (se estiver rodando)..."
+          Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like "*fireforce_bot.py*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          & (Join-Path $PSScriptRoot "iniciar_bot.ps1")
+          Read-Host "Aperte ENTER pra fechar"
+          '@ | Set-Content -Path (Join-Path $ws 'reiniciar_bot.ps1') -Encoding UTF8
+
+          # ---- status (pra usar dentro do RDP) ---------------------------------
+          @'
+          $ErrorActionPreference = "Continue"
+          Set-Location -Path $PSScriptRoot
+          Write-Host ""
+          Write-Host "  ============================================" -ForegroundColor DarkCyan
+          Write-Host "    FIRE FORCE - STATUS DO BOT" -ForegroundColor Cyan
+          Write-Host "  ============================================" -ForegroundColor DarkCyan
+          $p = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
+          if ($p) { Write-Host ("  BOT NO AR - PID " + ($p.ProcessId -join ",")) -ForegroundColor Green }
+          else { Write-Host "  BOT PARADO - use o atalho Ligar bot" -ForegroundColor Red }
+          Write-Host ""
+          Write-Host "  Ultimas linhas do vigia.log:" -ForegroundColor Gray
+          $log = Join-Path $PSScriptRoot "vigia.log"
+          if (Test-Path $log) { Get-Content $log -Tail 15 } else { Write-Host "  (o vigia.log ainda nao existe)" -ForegroundColor DarkGray }
+          Write-Host ""
+          Write-Host "  No Discord, /saude mostra LivePix, Supabase e pendencias." -ForegroundColor Gray
+          Read-Host "  Aperte ENTER pra fechar"
+          '@ | Set-Content -Path (Join-Path $ws 'status_bot.ps1') -Encoding UTF8
+
+          # ---- atalhos na area de trabalho (area de trabalho do RDP) -----------
+          $desktop = Join-Path $env:USERPROFILE 'Desktop'
+          $sh = New-Object -ComObject WScript.Shell
+          $atalhos = @(
+            @{ Nome = 'Fire Force - Ligar bot';     Arquivo = (Join-Path $ws 'iniciar_bot.ps1') },
+            @{ Nome = 'Fire Force - Reiniciar bot'; Arquivo = (Join-Path $ws 'reiniciar_bot.ps1') },
+            @{ Nome = 'Fire Force - Status do bot'; Arquivo = (Join-Path $ws 'status_bot.ps1') }
+          )
+          foreach ($a in $atalhos) {
+            $lnk = $sh.CreateShortcut((Join-Path $desktop "$($a.Nome).lnk"))
+            $lnk.TargetPath = 'powershell.exe'
+            $lnk.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$($a.Arquivo)`""
+            $lnk.WorkingDirectory = $ws
+            $lnk.Description = 'Fire Force - Liga de Diario'
+            $lnk.Save()
+          }
+          Write-Host "Controles prontos: vigia_bot.ps1, iniciar_bot.ps1, reiniciar_bot.ps1, status_bot.ps1"
+          Write-Host "E 3 atalhos na area de trabalho: Ligar bot / Reiniciar bot / Status do bot"
+
+      - name: 🔐 Criar o .env do bot (vindo dos Segredos)
+        shell: pwsh
+        env:
+          DISCORD_TOKEN:         ${{ secrets.DISCORD_TOKEN }}
+          SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY:     ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_KEY:          ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_ID:           ${{ secrets.SUPABASE_ID }}
+          LIVEPIX_CLIENT_ID:     ${{ secrets.LIVEPIX_CLIENT_ID }}
+          LIVEPIX_CLIENT_SECRET: ${{ secrets.LIVEPIX_CLIENT_SECRET }}
+        run: |
+          $linhas = @()
+          foreach ($k in @("DISCORD_TOKEN","SUPABASE_URL","SUPABASE_ANON_KEY","SUPABASE_KEY","SUPABASE_ID","LIVEPIX_CLIENT_ID","LIVEPIX_CLIENT_SECRET")) {
+            $v = [Environment]::GetEnvironmentVariable($k)
+            if ($v) { $linhas += "$k=$v" }
+          }
+          $linhas += "SYNC_SEGUNDOS=30"
+          $linhas | Set-Content -Path "$env:GITHUB_WORKSPACE\.env" -Encoding UTF8
+          Write-Host "(.env criado com $($linhas.Count) linha(s) - nenhuma chave aparece no log)"
+
+      - name: 🤖 Subir o bot
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\iniciar_bot.ps1"
+          Start-Sleep -Seconds 12
+          Write-Host "--- vigia.log ---"
+          if (Test-Path .\vigia.log) { Get-Content .\vigia.log -Tail 20 }
+
+      # ------------------------------------------------- MANTER VIVA ----------
+      - name: 🕒 Manter a máquina viva (até o limite de 6h)
+        shell: pwsh
+        run: |
+          $fim = (Get-Date).AddMinutes(350)     # 5h50: termina ANTES do corte de 6h
+          while ((Get-Date) -lt $fim) {
+            Start-Sleep -Seconds 300
+            $proc = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
+            if (-not $proc) {
+              Write-Host "[$(Get-Date -Format 'HH:mm')] o bot caiu - levantando de novo..."
+              powershell -NoProfile -ExecutionPolicy Bypass -File .\iniciar_bot.ps1 *>&1 | ForEach-Object { Write-Host $_ }
+              $proc = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+                      Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
+            }
+            $resta = [int](($fim - (Get-Date)).TotalMinutes)
+            Write-Host "[$(Get-Date -Format 'HH:mm')] bot: $(if ($proc) { 'NO AR (PID ' + ($proc.ProcessId -join ',') + ')' } else { 'PARADO' }) | faltam $resta min"
+          }
+          Write-Host "Fim do ciclo. O estado ja esta no Supabase e o proximo run da fila assume."
+
+      - name: 📄 Resumo e últimas linhas do log
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "======================================================"
+          Write-Host "  FIRE FORCE - resumo do ciclo"
+          Write-Host "  RDP: Windows App > fireforce-rdp > runneradmin"
+          Write-Host "  Atalhos na area de trabalho: Ligar / Reiniciar / Status"
+          Write-Host "  Conferir no Discord: /saude"
+          Write-Host "======================================================"
+          if (Test-Path .\vigia.log) { Get-Content .\vigia.log -Tail 30 }
