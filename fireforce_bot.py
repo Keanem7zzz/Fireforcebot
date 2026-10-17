@@ -411,6 +411,7 @@ async def init_db():
             valor REAL,
             chave_pix TEXT,
             titular TEXT,
+            tipo_chave TEXT,
             status TEXT DEFAULT 'na_fila',
             criado_em TEXT,
             processado_em TEXT,
@@ -602,10 +603,15 @@ async def init_db():
             ("depositos", "canal_id", "INTEGER"), ("depositos", "assumido_por", "INTEGER"),
             ("depositos", "apelidos", "TEXT"),
             ("saques", "tipo", "TEXT DEFAULT 'jogador'"),
+            ("saques", "tipo_chave", "TEXT"),
             ("saques", "saldo_antes", "REAL"),
             ("saques", "saldo_apos", "REAL"),
             ("saques", "retirada_em", "TEXT"),
             ("saques", "retirada_prova", "TEXT"),
+            ("saques", "canal_ticket_id", "INTEGER"),
+            ("saques", "msg_ticket_id", "INTEGER"),
+            ("saques", "ticket_status", "TEXT DEFAULT 'aguardando_pagamento'"),
+            ("saques", "ticket_assumido_por", "INTEGER"),
             ("slots", "assumido_por", "INTEGER"),
             ("slots", "apelidos", "TEXT"),
         ):
@@ -4562,52 +4568,50 @@ class SaqueModal(discord.ui.Modal, title="💸 Sacar — PIX"):
 
         async with aiosqlite.connect(DATABASE_FILE) as db:
             cursor = await db.execute(
-                "INSERT INTO saques (guild_id, user_id, valor, chave_pix, titular, status, tipo, criado_em, "
-                "saldo_antes, saldo_apos) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (interaction.guild.id, interaction.user.id, valor, chave, titular, status,
+                "INSERT INTO saques (guild_id, user_id, valor, chave_pix, titular, tipo_chave, status, tipo, criado_em, "
+                "saldo_antes, saldo_apos) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (interaction.guild.id, interaction.user.id, valor, chave, titular, self.tipo_chave, status,
                  "trabalho" if de_trabalho else "jogador", agora_brt().isoformat(),
                  arredondar(saldo), arredondar(novo)))
             saque_id = cursor.lastrowid
             await db.commit()
         marcar_sujo()
 
-        embed = criar_embed(
-            "💸 Saque solicitado",
-            f"**{interaction.user.mention}**, seu saque de **{formatar_moeda(valor)}** foi registrado.\n\n"
-            f"> 🏦 **Chave ({self.tipo_chave}):** `{chave}`\n"
-            f"> 👤 **Titular:** `{titular or 'não informado'}`\n"
-            f"> 💼 **{'Carteira de trabalho agora' if de_trabalho else 'Saldo agora'}:** "
-            f"`{formatar_moeda(novo)}`\n"
-            f"> 🔖 **Protocolo:** `#{saque_id}`\n\n"
-            f"⏳ **Pagamento:** de **1 minuto a 24 horas (ou mais)** — quem paga é o **dono/gerente**, "
-            f"que são os únicos com acesso à conta. Você não precisa fazer nada: quando o PIX sair, "
-            f"a confirmação chega aqui. 💛",
-            "Esmeralda")
-        embed.add_field(
-            name=("⚡ Prioridade" if liberado else "🤝 Fila de pagamento"),
-            value=("> Seu saque já entrou na **fila de pagamento de agora** — a equipe foi avisada e o PIX sai "
-                   "em instantes." if liberado else
-                   "> O caixa está no limite de segurança agora, então seu saque entrou na fila. Assim que entrar "
-                   "saldo, ele é **pago automaticamente** — sem você pedir de novo."),
-            inline=False)
-        embed.add_field(
-            name="⏱️ Quanto tempo demora?",
-            value=("> O PIX sai **na mão**, pelo **dono ou gerente** (só eles entram na conta).\n"
-                   "> O normal é cair em **minutos** — mas pode levar **até 24 horas ou mais** se "
-                   "nenhum deles estiver online.\n"
-                   "> **Seu saque não se perde:** ele fica na fila, o bot cobra a equipe sozinho "
-                   "e o status é sempre atualizado com o seu protocolo. 💛"), inline=False)
-        embed.add_field(name="⭐ Próxima vez",
-                        value="> Sua chave ficou **salva**: no próximo saque é só clicar em "
-                              "**Usar minha chave salva**. ⚡", inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        try:
+            canal_ticket = await abrir_ticket_saque(interaction.guild, interaction.user, saque_id)
+        except Exception as erro:
+            # Não deixa o saque debitado sem um canal privado para acompanhar.
+            if de_trabalho:
+                await creditar_trabalho(interaction.user.id, interaction.guild.id, valor, "estorno",
+                                        f"Estorno automático: não foi possível abrir ticket do saque #{saque_id}",
+                                        ref=f"saque-ticket-erro:{saque_id}")
+            else:
+                await creditar_saldo(interaction.user.id, interaction.guild.id, valor, "estorno",
+                                     f"Estorno automático: não foi possível abrir ticket do saque #{saque_id}",
+                                     ref=f"saque-ticket-erro:{saque_id}")
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                await db.execute("UPDATE saques SET status='estornado',ticket_status='estornado' WHERE id=?",(saque_id,))
+                await db.commit()
+            _log_arquivo(f"[SAQUE] ticket #{saque_id} não abriu; valor devolvido: {erro}")
+            return await interaction.followup.send(embed=criar_embed(
+                "❌ Não foi possível abrir seu ticket",
+                "O valor foi devolvido à sua carteira. Avise o dono/gerente para conferir a permissão **Gerenciar Canais** do bot.","Vermelho"),ephemeral=True)
+        aviso_saque=criar_embed(
+            "💸 Pedido de saque registrado",
+            f"Seu ticket privado está em {canal_ticket.mention}.\n"
+            f"> 🔖 Protocolo: `#{saque_id}` • Valor: `{formatar_moeda(valor)}`\n"
+            f"> 🔐 A chave PIX e o titular ficam no canal, visível para você e dono/gerente.\n"
+            f"> ⏳ Prazo: de 1 minuto a 24 horas ou mais.","Esmeralda")
+        aviso_saque.add_field(name="⏱️ Quanto tempo demora?",value="O pagamento é manual e pode levar de **1 minuto a 24 horas ou mais**, conforme disponibilidade.",inline=False)
+        aviso_saque.add_field(name="👑 Quem paga agora",value="Somente **dono ou gerente** tem acesso à conta da LivePix e marca o pagamento feito.",inline=False)
+        await interaction.followup.send(embed=aviso_saque,ephemeral=True)
 
         await anunciar(
             interaction.guild, "saque", "💸 Novo pedido de saque",
             f"{mencao(interaction.user.id)} pediu **{formatar_moeda(valor)}** e já reservou o valor da "
             f"carteira.\n> 🔖 Protocolo: `#{saque_id}`\n"
             f"> 📋 Status: **{'liberado para pagar ✅' if liberado else 'na fila de pagamento 🤝'}**\n"
-            f"> 🏦 Chave: `{chave}`"
+            f"> 🏦 Chave: `{mascarar_chave(chave)}`"
             + (f"\n> ⏱️ O pagamento sai pelo **dono/gerente** — de minutos até 24h ou mais."
                if liberado else "\n> ⏳ Entra na fila de pagamento assim que o caixa liberar."),
             "Amarelo", marcar=None)
@@ -4617,13 +4621,196 @@ class SaqueModal(discord.ui.Modal, title="💸 Sacar — PIX"):
             f"{mencao(interaction.user.id)} pediu saque de **{formatar_moeda(valor)}**"
             f"{' — descontado da **carteira de trabalho** (salário)' if de_trabalho else ''}.\n"
             f"> 🔖 Protocolo: `#{saque_id}` • Status: `{'liberado para pagar' if liberado else 'na fila'}`\n"
-            f"> 🏦 Chave ({self.tipo_chave}): `{chave}` • Titular: `{titular or '-'}`\n"
+            f"> 🏦 Chave ({self.tipo_chave}): `{mascarar_chave(chave)}` • Titular: `{titular or '-'}`\n"
             + (f"> 💼 Carteira de trabalho: `{formatar_moeda(saldo)}` − `{formatar_moeda(valor)}` = "
                f"**total atualizado `{formatar_moeda(novo)}`**"
                if de_trabalho else
                f"> 💰 Carteira: `{formatar_moeda(saldo)}` − `{formatar_moeda(valor)}` = "
                f"**total atualizado `{formatar_moeda(novo)}`**"),
             "Amarelo")
+
+
+def embed_ticket_saque(saque) -> discord.Embed:
+    """Resumo privado do saque: contém a chave integral, visível só no ticket restrito."""
+    tipo=(saque["tipo"] or "jogador")
+    fonte="Carteira de trabalho da equipe" if tipo=="trabalho" else "Carteira do jogador"
+    estado=saque["status"]
+    fila={"na_fila":"⏳ Aguardando liberação do caixa", "liberado":"💳 Caixa liberado; aguardando envio do PIX",
+          "pago":"✅ Pagamento feito", "estornado":"↩️ Saque estornado"}.get(estado,"⏳ Aguardando pagamento")
+    status_ticket="✅ Pagamento feito" if estado=="pago" else ("↩️ Estornado" if estado=="estornado" else "⏳ Aguardando pagamento")
+    embed=criar_embed(f"💸 Ticket de saque — protocolo #{saque['id']}",
+        f"**Solicitante:** {mencao(saque['user_id'])}\n"
+        f"**Valor:** `{formatar_moeda(saque['valor'])}`\n"
+        f"**Origem:** {fonte}\n"
+        f"**Chave PIX ({saque['tipo_chave'] or 'tipo não informado'}):** `{saque['chave_pix']}`\n"
+        f"**Titular:** `{saque['titular'] or 'não informado'}`\n\n"
+        f"> **Status do pedido:** {status_ticket}\n"
+        f"> **Caixa:** {fila}\n"
+        f"> **Prazo informado:** de 1 minuto a 24 horas ou mais; paga manualmente o dono/gerente.",
+        "Esmeralda" if estado=="pago" else "Dourado",
+        footer="Fire Force • Canal privado: solicitante + dono/gerente")
+    if saque["ticket_assumido_por"]:
+        embed.add_field(name="🙋 Responsável",value=mencao(saque["ticket_assumido_por"]),inline=True)
+    return embed
+
+
+async def atualizar_ticket_saque(guild, saque_id: int):
+    """Atualiza o cartão privado do saque em qualquer mudança (fila, espera ou pagamento)."""
+    if not guild:return False
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory=aiosqlite.Row
+        row=await (await db.execute("SELECT * FROM saques WHERE id=?",(saque_id,))).fetchone()
+    if not row or not row["canal_ticket_id"] or not row["msg_ticket_id"]:return False
+    canal=guild.get_channel(int(row["canal_ticket_id"]))
+    if not canal:return False
+    try:
+        msg=await canal.fetch_message(int(row["msg_ticket_id"]))
+        await msg.edit(embed=embed_ticket_saque(row),view=SaqueTicketView(saque_id))
+        return True
+    except Exception as erro:
+        _log_arquivo(f"[SAQUE] ticket #{saque_id} não atualizou: {erro}")
+        return False
+
+
+async def abrir_ticket_saque(guild, solicitante, saque_id: int):
+    """Cria o atendimento privado do saque; sem acesso de suporte/mediador."""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory=aiosqlite.Row
+        row=await (await db.execute("SELECT * FROM saques WHERE id=?",(saque_id,))).fetchone()
+    if not row:raise RuntimeError("protocolo de saque não encontrado")
+    cfg=await obter_config(guild.id)
+    categoria=guild.get_channel(cfg.get("cat_pagamentos")) if cfg.get("cat_pagamentos") else None
+    if not categoria and cfg.get("cat_tickets"):categoria=guild.get_channel(cfg.get("cat_tickets"))
+    overwrites={
+        guild.default_role:discord.PermissionOverwrite(view_channel=False),
+        solicitante:discord.PermissionOverwrite(view_channel=True,send_messages=True,attach_files=True,read_message_history=True),
+    }
+    bot_member=getattr(guild,"me",None)
+    if bot_member:
+        overwrites[bot_member]=discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True,read_message_history=True)
+    cargos_permitidos=set()
+    for key in ("cargo_dono","cargo_gerente"):
+        role_id=cfg.get(key)
+        role=guild.get_role(int(role_id)) if role_id else None
+        if role:
+            cargos_permitidos.add(role.id)
+            overwrites[role]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)
+    for key in ("cargo_suporte","cargo_mediador"):
+        role_id=cfg.get(key)
+        role=guild.get_role(int(role_id)) if role_id and int(role_id) not in cargos_permitidos else None
+        if role:overwrites[role]=discord.PermissionOverwrite(view_channel=False,send_messages=False)
+    nome=getattr(solicitante,"display_name",None) or getattr(solicitante,"name","jogador")
+    slug=re.sub(r"[^a-z0-9-]","-",str(nome).lower()).strip("-")[:35] or "jogador"
+    canal=await guild.create_text_channel(f"💸│saque-{int(saque_id)}-{slug}"[:100],category=categoria,overwrites=overwrites)
+    try:
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute("UPDATE saques SET canal_ticket_id=?,ticket_status='aguardando_pagamento' WHERE id=?",(canal.id,saque_id))
+            await db.commit()
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory=aiosqlite.Row
+            row=await (await db.execute("SELECT * FROM saques WHERE id=?",(saque_id,))).fetchone()
+        msg=await canal.send(content=mencao(row["user_id"]),embed=embed_ticket_saque(row),view=SaqueTicketView(saque_id))
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute("UPDATE saques SET msg_ticket_id=? WHERE id=?",(msg.id,saque_id))
+            await db.commit()
+        marcar_sujo()
+        return canal
+    except Exception:
+        try:await canal.delete()
+        except Exception:pass
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute("UPDATE saques SET canal_ticket_id=NULL,msg_ticket_id=NULL WHERE id=?",(saque_id,))
+            await db.commit()
+        raise
+
+
+class SaqueTicketView(discord.ui.View):
+    """Atendimento privado do saque: solicitante + dono/gerente."""
+    def __init__(self,saque_id:int=0):
+        super().__init__(timeout=None);self.saque_id=int(saque_id) if isinstance(saque_id,int) else 0
+        sid=self.saque_id
+        self.assumir.custom_id=f"ff_sqt_assumir:{sid}"
+        self.aguardar.custom_id=f"ff_sqt_aguardar:{sid}"
+        self.pago.custom_id=f"ff_sqt_pago:{sid}"
+        self.adicionar.custom_id=f"ff_sqt_adicionar:{sid}"
+        self.fechar.custom_id=f"ff_sqt_fechar:{sid}"
+
+    async def _buscar(self):
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory=aiosqlite.Row
+            return await (await db.execute("SELECT * FROM saques WHERE id=?",(self.saque_id,))).fetchone()
+
+    async def _equipe(self,interaction):
+        if await e_dono_ou_gerente(interaction.user):return True
+        await interaction.response.send_message(embed=criar_embed("❌ Sem permissão","Este ticket é exclusivo do solicitante e do dono/gerente.","Vermelho"),ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Assumir",style=discord.ButtonStyle.blurple,emoji="🙋")
+    async def assumir(self,interaction:discord.Interaction,button:discord.ui.Button):
+        if not await self._equipe(interaction):return
+        if not await aviso_fora_de_servico(interaction):return
+        row=await self._buscar()
+        if not row or row["status"] in ("pago","estornado"):
+            return await interaction.response.send_message(embed=criar_embed("ℹ️ Saque resolvido","Este pedido já foi pago/estornado.","Amarelo"),ephemeral=True)
+        if row["ticket_assumido_por"] and row["ticket_assumido_por"]!=interaction.user.id:
+            return await interaction.response.send_message(embed=criar_embed("🙋 Já assumido",f"{mencao(row['ticket_assumido_por'])} está responsável.","Amarelo"),ephemeral=True)
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute("UPDATE saques SET ticket_assumido_por=? WHERE id=?",(interaction.user.id,self.saque_id));await db.commit()
+        marcar_sujo()
+        await atualizar_ticket_saque(interaction.guild,self.saque_id)
+        await interaction.response.send_message(embed=criar_embed("🙋 Ticket assumido","Você ficou responsável por acompanhar este saque.","Esmeralda"),ephemeral=True)
+
+    @discord.ui.button(label="Aguardar pagamento",style=discord.ButtonStyle.gray,emoji="⏳")
+    async def aguardar(self,interaction:discord.Interaction,button:discord.ui.Button):
+        if not await self._equipe(interaction):return
+        row=await self._buscar()
+        if not row or row["status"] in ("pago","estornado"):
+            return await interaction.response.send_message(embed=criar_embed("ℹ️ Saque resolvido","Este pedido já foi pago/estornado.","Amarelo"),ephemeral=True)
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute("UPDATE saques SET ticket_status='aguardando_pagamento' WHERE id=?",(self.saque_id,));await db.commit()
+        marcar_sujo()
+        await atualizar_ticket_saque(interaction.guild,self.saque_id)
+        await interaction.response.send_message(embed=criar_embed("⏳ Status atualizado","O ticket está marcado como **Aguardando pagamento**.","Azul"),ephemeral=True)
+
+    @discord.ui.button(label="Pagamento feito",style=discord.ButtonStyle.green,emoji="✅")
+    async def pago(self,interaction:discord.Interaction,button:discord.ui.Button):
+        if not await self._equipe(interaction):return
+        row=await self._buscar()
+        if not row or row["status"] in ("pago","estornado"):
+            return await interaction.response.send_message(embed=criar_embed("ℹ️ Saque resolvido","Este pedido já foi pago/estornado.","Amarelo"),ephemeral=True)
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        ok=await concluir_saque(self.saque_id,interaction.user.id,"pagamento marcado como feito no ticket privado")
+        await interaction.followup.send(embed=criar_embed("✅ Pagamento registrado" if ok else "ℹ️ Já resolvido",
+            "O saque foi marcado como pago; o solicitante recebeu a confirmação." if ok else "Outro responsável já resolveu este saque.",
+            "Esmeralda" if ok else "Amarelo"),ephemeral=True)
+
+    @discord.ui.button(label="Adicionar pessoa",style=discord.ButtonStyle.gray,emoji="➕")
+    async def adicionar(self,interaction:discord.Interaction,button:discord.ui.Button):
+        if not await self._equipe(interaction):return
+        row=await self._buscar()
+        if not row or row["status"] in ("pago","estornado"):
+            return await interaction.response.send_message(embed=criar_embed("ℹ️ Ticket encerrado","Não é possível alterar este ticket resolvido.","Amarelo"),ephemeral=True)
+        await interaction.response.send_message("Selecione quem adicionar a este ticket:",view=TicketAddView(),ephemeral=True)
+
+    @discord.ui.button(label="Fechar ticket",style=discord.ButtonStyle.red,emoji="🔒")
+    async def fechar(self,interaction:discord.Interaction,button:discord.ui.Button):
+        row=await self._buscar()
+        if not row:return await interaction.response.send_message(embed=criar_embed("❌ Ticket não encontrado","","Vermelho"),ephemeral=True)
+        if interaction.user.id!=row["user_id"]:
+            return await interaction.response.send_message(embed=criar_embed("🔒 Só quem pediu o saque fecha","O dono/gerente marca o pagamento; o solicitante fecha o ticket quando estiver resolvido.","Amarelo"),ephemeral=True)
+        if row["status"] not in ("pago","estornado"):
+            return await interaction.response.send_message(embed=criar_embed("⏳ Ainda aguardando pagamento","Feche depois que o PIX for enviado ou o saque for estornado.","Amarelo"),ephemeral=True)
+        await interaction.response.send_message(embed=criar_embed("🔒 Ticket encerrado","Este canal será removido em 10 segundos.","Cinza Escuro"))
+        await asyncio.sleep(10)
+        apagado=False
+        try:
+            await interaction.channel.delete();apagado=True
+        except Exception:
+            pass
+        if apagado:
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                await db.execute("UPDATE saques SET canal_ticket_id=NULL,msg_ticket_id=NULL WHERE id=?",(self.saque_id,));await db.commit()
+            marcar_sujo()
 
 
 class SaqueAcaoView(discord.ui.View):
@@ -4643,7 +4830,7 @@ class SaqueAcaoView(discord.ui.View):
 
     @discord.ui.button(label="PIX enviado ✅", style=discord.ButtonStyle.green)
     async def marcar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await e_staff(interaction.user):
+        if not await e_dono_ou_gerente(interaction.user):
             return await interaction.response.send_message(
                 embed=criar_embed("❌ Sem Permissão", "Apenas a equipe financeira.", "Vermelho"), ephemeral=True
             )
@@ -4659,7 +4846,7 @@ class SaqueAcaoView(discord.ui.View):
 
     @discord.ui.button(label="Estornar (devolver saldo)", style=discord.ButtonStyle.gray)
     async def estornar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await e_staff(interaction.user):
+        if not await e_dono_ou_gerente(interaction.user):
             return await interaction.response.send_message(
                 embed=criar_embed("❌ Sem Permissão", "Apenas a equipe financeira.", "Vermelho"), ephemeral=True
             )
@@ -4669,10 +4856,14 @@ class SaqueAcaoView(discord.ui.View):
                 embed=criar_embed("ℹ️ Já resolvido", "Este saque já foi pago ou estornado.", "Amarelo"), ephemeral=True
             )
         async with aiosqlite.connect(DATABASE_FILE) as db:
-            await db.execute("UPDATE saques SET status = 'estornado' WHERE id = ?", (saque["id"],))
+            await db.execute("UPDATE saques SET status='estornado',ticket_status='estornado' WHERE id=?",(saque["id"],))
             await db.commit()
-        await creditar_saldo(saque["user_id"], saque["guild_id"], saque["valor"], "estorno",
-                             f"Estorno do saque #{saque['id']}", ref=f"saque:{saque['id']}")
+        if saque["tipo"] == "trabalho":
+            await creditar_trabalho(saque["user_id"],saque["guild_id"],saque["valor"],"estorno",f"Estorno do saque #{saque['id']}",ref=f"saque:{saque['id']}")
+        else:
+            await creditar_saldo(saque["user_id"],saque["guild_id"],saque["valor"],"estorno",f"Estorno do saque #{saque['id']}",ref=f"saque:{saque['id']}")
+        marcar_sujo()
+        await atualizar_ticket_saque(interaction.guild,saque["id"])
         await registrar_log(
             interaction.guild, "💸 SAQUE", "↩️ Saque estornado",
             f"Protocolo `#{saque['id']}` foi estornado por {interaction.user.mention}.\n"
@@ -4689,7 +4880,7 @@ class SaqueAcaoView(discord.ui.View):
 
     @discord.ui.button(label="Tentar novamente", style=discord.ButtonStyle.blurple)
     async def marcar_auto(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await e_staff(interaction.user):
+        if not await e_dono_ou_gerente(interaction.user):
             return await interaction.response.send_message(
                 embed=criar_embed("❌ Sem Permissão", "Apenas a equipe financeira.", "Vermelho"), ephemeral=True
             )
@@ -4759,10 +4950,11 @@ async def concluir_saque(saque_id: int, staff_id: Optional[int] = None, motivo: 
         saque = await (await db.execute("SELECT * FROM saques WHERE id = ?", (saque_id,))).fetchone()
         if not saque or saque["status"] in ("pago", "estornado"):
             return False
-        await db.execute(
-            "UPDATE saques SET status = 'pago', processado_em = ?, processado_por = ? WHERE id = ?",
-            (agora_brt().isoformat(), staff_id, saque_id)
-        )
+        cursor=await db.execute(
+            "UPDATE saques SET status='pago',ticket_status='pago',processado_em=?,processado_por=? "
+            "WHERE id=? AND status NOT IN ('pago','estornado')",
+            (agora_brt().isoformat(),staff_id,saque_id))
+        if cursor.rowcount==0:return False
         await db.commit()
 
     await registrar_caixa(saque["guild_id"], "despesa", saque["valor"],
@@ -4770,6 +4962,7 @@ async def concluir_saque(saque_id: int, staff_id: Optional[int] = None, motivo: 
 
     guild = bot.get_guild(saque["guild_id"])
     if guild:
+        await atualizar_ticket_saque(guild,saque_id)
         try:
             canal, publico = await canal_anuncio(guild, "saque")
             if canal:
@@ -4793,7 +4986,7 @@ async def concluir_saque(saque_id: int, staff_id: Optional[int] = None, motivo: 
         await registrar_log(
             guild, "💸 SAQUE", "✅ Saque pago",
             f"Protocolo `#{saque_id}` — {formatar_moeda(saque['valor'])} para {mencao(saque['user_id'])}{quem}.\n"
-            f"> {motivo or 'pagamento enviado'}\n> 🏦 Chave: `{saque['chave_pix']}`\n"
+            f"> {motivo or 'pagamento enviado'}\n> 🏦 Chave: `{mascarar_chave(saque['chave_pix'])}`\n"
             + (f"> 💼 Carteira de trabalho: `{formatar_moeda(saque['saldo_antes'])}` − "
                f"`{formatar_moeda(saque['valor'])}` = **total atualizado `{formatar_moeda(atual)}`**"
                if (de_trabalho and saque["saldo_antes"] is not None)
@@ -4843,6 +5036,7 @@ async def processar_fila_saques(guild_id: int) -> list:
     guild = bot.get_guild(guild_id)
     for saque in liberados:
         if guild:
+            await atualizar_ticket_saque(guild,saque["id"])
             await notificar_saque(guild, saque["id"])
             await registrar_log(
                 guild, "💸 SAQUE", "⚡ Saque liberado para pagamento",
@@ -5867,6 +6061,8 @@ class FilaPagoModal(discord.ui.Modal, title="✅ Marcar saques como pagos"):
         placeholder="Só os que você JÁ mandou o PIX", required=True, max_length=200)
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(embed=criar_embed("❌ Sem permissão","Só dono/gerente marca saques como pagos.","Vermelho"),ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         texto = str(self.campo.value or "").lower().strip()
         resumo = await saques_disponiveis(interaction.guild.id)
@@ -5914,10 +6110,10 @@ class FilaPagamentoView(discord.ui.View):
         self.cobrar.custom_id = "ff_fila_cobrar"
 
     async def _permissao(self, interaction: discord.Interaction) -> bool:
-        if await e_staff(interaction.user):
+        if await e_dono_ou_gerente(interaction.user):
             return True
         await interaction.response.send_message(
-            embed=criar_embed("❌ Sem Permissão", "Apenas a equipe financeira (dono/gerente/mediador).",
+            embed=criar_embed("❌ Sem Permissão", "Apenas dono ou gerente pode movimentar a fila de pagamentos.",
                               "Vermelho"), ephemeral=True)
         return False
 
@@ -9164,6 +9360,10 @@ async def on_ready():
             "SELECT id FROM saques WHERE status IN ('na_fila', 'liberado')")).fetchall()
         for linha_saque in saques_abertos:
             bot.add_view(SaqueAcaoView(linha_saque["id"]))
+        tickets_saque = await (await db.execute(
+            "SELECT id FROM saques WHERE canal_ticket_id IS NOT NULL")).fetchall()
+        for linha_saque in tickets_saque:
+            bot.add_view(SaqueTicketView(linha_saque["id"]))
 
         # 🎧 atendimentos abertos voltam funcionando depois de qualquer restart
         tickets_abertos = await (await db.execute(
