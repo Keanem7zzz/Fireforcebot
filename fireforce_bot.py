@@ -83,7 +83,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
-DATABASE_FILE = "ffv1.db"
+DATABASE_FILE = "ffv11.db"
 VERSAO_BOT = "11.1"
 
 # O arquivo antigo é mantido intacto: a nova instalação usa ffv1.db.
