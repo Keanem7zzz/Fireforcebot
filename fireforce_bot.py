@@ -1,14 +1,15 @@
 # ══════════════════════════════════════════════════════════════
-#  🔥 FIRE FORCE — BOT PREMIUM v11.4
+#  🔥 FIRE FORCE — BOT PREMIUM v11.5
 #  Liga de Diário Free Fire
 #
-#  • Consulta de ID do Free Fire confiável (corrida de provedores + regiões
-#    + cache de 24h + disjuntor) — seção 'CONSULTA DE ID FREE FIRE'
+#  • Consulta de ID do Free Fire OB55 confiável (corrida multi-provedores +
+#    regiões + cache de 24h + disjuntor) — seção 'CONSULTA DE ID FREE FIRE'
 #  • Inscrição obrigatória por ID numérico do Free Fire (puxa Nick e Level na API)
 #  • Tabela do diário em TEXTO: "1. (nick)" — sem imagem, sem contador
 #  • Vaga e acesso liberados depois do pagamento aprovado pelo ADM
 #  • CARTEIRA: painel privado, depósito/saque PIX via LivePix e moedas do bot
-#  • v11.4: Keep-Alive Supabase (2 dias), PIX direto ao ADM (/pix), carteira de
+#  • v11.5: API de verificação de ID atualizada para OB55 (multi-provedor),
+#    Keep-Alive Supabase (2 dias), PIX direto ao ADM (/pix), carteira de
 #    trabalho exclusiva do Suporte, regra +R$ 1,00 PIX em moedas, Repetição
 #    Diária por painel, tempo dinâmico configurável de bloqueio e ID FF obrigatório
 #
@@ -82,7 +83,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "11.4"
+VERSAO_BOT = "11.5"
 TAXA_MOEDAS_ADM_PIX = 1.00
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
 SUPABASE_KEEPALIVE_SEGUNDOS = max(3600, int(os.getenv("SUPABASE_PING_HORAS", "48")) * 3600)
@@ -971,22 +972,23 @@ FF_DESCANSO_SEGUNDOS = 300    # tempo de descanso do provedor problemático
 # Ordem de regiões testadas (BR primeiro — maioria dos usuários do bot)
 FF_REGIOES = ["BR", "NA", "SAC", "US", "EU", "ME", "SG", "IND", "ID", "TH", "VN", "PK", "BD", "CIS", "TW"]
 
-# Provedores. Em 12/10/2026 só o primeiro está de pé — os dois que o bot usava
-# antes (free-ff-api e freefireinfo, ambos no Render) morreram: respondem 404
-# em TODAS as rotas. Ficaram só como histórico; se voltarem, basta descomentar.
+# Provedores atualizados para Free Fire OB55 (corrida com fallback automático):
+#   1. free-fire-info-ob55 (Vercel) — principal OB55 (BR + multi-região nativo)
+#   2. bancheck-seven (Vercel) — espelho OB55 independente
+#   3. freefireapis.lat (/GetPlayer) — rota OB55 atualizada (substitui /info-player)
 FF_PROVEDORES = [
     {
-        "nome": "freefireapis.lat",
-        "url": "https://freefireapis.lat/info-player?uid={uid}&region={region}",
+        "nome": "ff-info-ob55",
+        "url": "https://free-fire-info-ob55.vercel.app/player-info?uid={uid}&region={region}",
     },
-    # {
-    #     "nome": "free-ff-api (Render)",
-    #     "url": "https://free-ff-api-src-5plp.onrender.com/api/v1/account?region={region}&uid={uid}",
-    # },
-    # {
-    #     "nome": "freefireinfo (Render)",
-    #     "url": "https://freefireinfo-zy9l.onrender.com/api/v1/player-profile?uid={uid}&region={region}",
-    # },
+    {
+        "nome": "ff-mirror-ob55",
+        "url": "https://bancheck-seven.vercel.app/api/player?uid={uid}&region={region}",
+    },
+    {
+        "nome": "freefireapis.lat",
+        "url": "https://freefireapis.lat/GetPlayer?uid={uid}&region={region}&formatar=true",
+    },
 ]
 
 # status de cada provedor (disjuntor)
@@ -1046,8 +1048,15 @@ _CHAVES_PRIME = ("primelevel", "prime_level")
 _CHAVES_CLA = ("clanname", "guildname")
 
 
-def _ff_procurar(objeto, chaves, profundidade=0):
-    """Procura uma chave (case-insensitive) em qualquer nível do JSON."""
+_SUBS_IGNORADOS_JOGADOR = {
+    "petinfo", "pet_info", "captainbasicinfo", "captain_basic_info",
+    "servicestatus", "service_status", "owner", "usage", "creditscoreinfo",
+}
+
+
+def _ff_procurar(objeto, chaves, profundidade=0, permitir_cla: bool = False):
+    """Procura uma chave (case-insensitive) apenas nos blocos da conta do jogador
+    (nunca confunde nick/level do pet ou do capitão da guilda com o jogador)."""
     if profundidade > 6:
         return None
     if isinstance(objeto, dict):
@@ -1056,21 +1065,30 @@ def _ff_procurar(objeto, chaves, profundidade=0):
             for chave, valor in objeto.items():
                 if chave.lower() == chave_busca and valor not in (None, "", 0, []):
                     return valor
-        # depois nos sub-objetos (basicInfo, data, result, player...)
-        for sub in ("basicInfo", "basic_info", "data", "result", "player", "account", "profile"):
+        # depois nos sub-objetos prioritários da conta
+        subs_prioritarios = (
+            ("clanBasicInfo", "clan_basic_info", "guild", "guildInfo", "basicInfo", "basic_info", "data", "result")
+            if permitir_cla
+            else ("basicInfo", "basic_info", "accountInfo", "account_info", "primeInfo", "data", "result", "player", "account")
+        )
+        for sub in subs_prioritarios:
             if isinstance(objeto.get(sub), dict):
-                achado = _ff_procurar(objeto[sub], chaves, profundidade + 1)
+                achado = _ff_procurar(objeto[sub], chaves, profundidade + 1, permitir_cla=permitir_cla)
                 if achado not in (None, "", 0, []):
                     return achado
-        # por último, em qualquer dicionário aninhado
-        for valor in objeto.values():
+        # por último, em dicionários aninhados seguros (ignorando petInfo / captainBasicInfo / ServiceStatus)
+        for nome_sub, valor in objeto.items():
+            if str(nome_sub).lower() in _SUBS_IGNORADOS_JOGADOR:
+                continue
+            if not permitir_cla and str(nome_sub).lower() in ("clanbasicinfo", "clan_basic_info"):
+                continue
             if isinstance(valor, (dict, list)):
-                achado = _ff_procurar(valor, chaves, profundidade + 1)
+                achado = _ff_procurar(valor, chaves, profundidade + 1, permitir_cla=permitir_cla)
                 if achado not in (None, "", 0, []):
                     return achado
     elif isinstance(objeto, list):
         for item in objeto[:5]:
-            achado = _ff_procurar(item, chaves, profundidade + 1)
+            achado = _ff_procurar(item, chaves, profundidade + 1, permitir_cla=permitir_cla)
             if achado not in (None, "", 0, []):
                 return achado
     return None
@@ -1079,6 +1097,10 @@ def _ff_procurar(objeto, chaves, profundidade=0):
 def _ff_extrair(dados) -> Optional[dict]:
     """Extrai nick/nível/região/rank/clã de qualquer formato de resposta."""
     if not isinstance(dados, (dict, list)):
+        return None
+    if isinstance(dados, dict) and dados.get("success") is False:
+        return None
+    if isinstance(dados, dict) and dados.get("ok") is False:
         return None
 
     nome = _ff_procurar(dados, _CHAVES_NOME)
@@ -1098,9 +1120,9 @@ def _ff_extrair(dados) -> Optional[dict]:
     regiao = str(regiao).upper() if isinstance(regiao, (str, int)) else ""
 
     rank = _ff_procurar(dados, _CHAVES_RANK)
-    if isinstance(rank, int):
+    if isinstance(rank, int) or not rank:
         rank = ""
-    elif rank:
+    else:
         rank = str(rank)[:28]
 
     prime = _ff_procurar(dados, _CHAVES_PRIME)
@@ -1109,7 +1131,7 @@ def _ff_extrair(dados) -> Optional[dict]:
     except Exception:
         prime = 0
 
-    cla = _ff_procurar(dados, _CHAVES_CLA)
+    cla = _ff_procurar(dados, _CHAVES_CLA, permitir_cla=True)
     cla = str(cla)[:26] if cla else ""
 
     return {"nome": nome, "nivel": nivel, "regiao": regiao, "rank": rank, "prime": prime, "cla": cla}
@@ -1128,7 +1150,47 @@ def _ff_nao_encontrado(dados) -> bool:
     if not isinstance(dados, dict):
         return False
     texto = json.dumps(dados, ensure_ascii=False).upper()
-    return any(p in texto for p in ("PLAYER_NOT_FOUND", "NOT FOUND", "USER_NOT_FOUND", "NOTFOUND"))
+    return any(p in texto for p in (
+        "PLAYER_NOT_FOUND", "UID NOT FOUND", "UID_NOT_FOUND",
+        "PLAYER NOT FOUND", "ACCOUNT NOT FOUND", "ACCOUNT_NOT_FOUND",
+        "USER_NOT_FOUND", "DOES NOT EXIST", "NOT EXIST",
+    ))
+
+
+def _ff_nao_encontrado_global(dados) -> bool:
+    """O provedor já procurou em TODAS as regiões e confirmou que o UID não existe?"""
+    if not isinstance(dados, dict):
+        return False
+    texto = json.dumps(dados, ensure_ascii=False).upper()
+    return "NOT FOUND IN ANY REGION" in texto or "NOT FOUND ON ANY SERVER" in texto
+
+
+def _ff_erro_provedor(dados) -> Optional[str]:
+    """Detecta quando o provedor respondeu HTTP 200/4xx/5xx mas está sem contas bot,
+    desatualizado ou fora do ar (NUNCA deve ser confundido com 'ID não existe')."""
+    if not isinstance(dados, dict):
+        return None
+    texto = json.dumps(dados, ensure_ascii=False).upper()
+    gatilhos_falha = (
+        ("ACCOUNTS_EMPTY", "sem contas de consulta na região"),
+        ("NO ACCOUNTS ARE AVAILABLE", "sem contas de consulta na região"),
+        ("SERVICESTATUS", "rota desativada/status página"),
+        ("UNRECOGNIZED_LOGIN_RESPONSE", "falha de login do provedor"),
+        ("DEPLOYMENT_NOT_FOUND", "provedor removido"),
+        ("RATE_LIMIT", "limite de requisições"),
+        ("TOO MANY REQUESTS", "limite de requisições"),
+        ("UPSTREAM", "falha no servidor upstream"),
+        ("INTERNAL SERVER ERROR", "erro interno do provedor"),
+    )
+    for chave, descricao in gatilhos_falha:
+        if chave in texto:
+            return descricao
+    if (dados.get("success") is False or dados.get("ok") is False) and not (
+        _ff_nao_encontrado(dados) or _ff_uid_invalido(dados)
+    ):
+        msg = str(dados.get("error") or dados.get("message") or "falha no provedor")[:80]
+        return msg
+    return None
 
 
 # ---------- cache no banco ----------
@@ -1170,12 +1232,14 @@ def _ff_cache_valido(linha: dict) -> bool:
 
 # ---------- requisição a um provedor ----------
 
-async def _ff_pedir(provedor: dict, uid: str, regiao: str) -> Optional[dict]:
-    """Devolve o jogador, None se o ID não existe, ou levanta erro se o provedor falhou.
+class _FFNaoEncontradoGlobal(Exception):
+    """Sinal interno: o provedor já varreu todas as regiões e confirmou que o UID não existe."""
 
-    Importante: vários provedores respondem "jogador não encontrado" com HTTP 404
-    e um JSON explicando — isso NÃO é provedor caído, então o corpo é lido antes
-    de julgar pelo status (era o que fazia a consulta parecer "fora do ar")."""
+
+async def _ff_pedir(provedor: dict, uid: str, regiao: str) -> Optional[dict]:
+    """Devolve o jogador, None se o ID não existe na região consultada,
+    levanta _FFNaoEncontradoGlobal se não existe em região nenhuma,
+    ou levanta RuntimeError se o provedor falhou/mudou de rota."""
     url = provedor["url"].format(uid=uid, region=regiao)
     sessao = _ff_sessao()
     async with sessao.get(url) as resposta:
@@ -1192,6 +1256,11 @@ async def _ff_pedir(provedor: dict, uid: str, regiao: str) -> Optional[dict]:
         jogador = _ff_extrair(dados)
         if jogador:
             return jogador
+        falha_prov = _ff_erro_provedor(dados)
+        if falha_prov:
+            raise RuntimeError(falha_prov)
+        if _ff_nao_encontrado_global(dados):
+            raise _FFNaoEncontradoGlobal()
         if _ff_nao_encontrado(dados) or _ff_uid_invalido(dados):
             return None                      # provedor vivo; o ID é que não existe
 
@@ -1201,7 +1270,7 @@ async def _ff_pedir(provedor: dict, uid: str, regiao: str) -> Optional[dict]:
         raise RuntimeError(f"servidor fora ({status})")
     if status != 200:
         raise RuntimeError(f"endpoint indisponível (http {status})")
-    return None
+    raise RuntimeError("resposta sem dados do jogador")
 
 
 async def _ff_tentar_provedor(provedor: dict, uid: str):
@@ -1209,8 +1278,7 @@ async def _ff_tentar_provedor(provedor: dict, uid: str):
 
     1º tenta a região principal (BR) — resolve a maioria e é rápido.
     Se não achar, dispara as outras regiões TODAS EM PARALELO: assim o tempo
-    total continua sendo ~1 requisição, em vez de somar o tempo de cada região
-    (era o que fazia a consulta parecer "fora do ar" nos picos de lentidão)."""
+    total continua sendo ~1 requisição, em vez de somar o tempo de cada região."""
     nome = provedor["nome"]
     if not _ff_provedor_disponivel(nome):
         return ("descartado", "em descanso", nome)
@@ -1221,6 +1289,9 @@ async def _ff_tentar_provedor(provedor: dict, uid: str):
         jogador = await _ff_pedir(provedor, uid, regioes[0])
     except asyncio.CancelledError:
         raise
+    except _FFNaoEncontradoGlobal:
+        _ff_marcar_sucesso(nome)
+        return ("nao_encontrado", None, nome)
     except Exception as erro:
         _ff_marcar_falha(nome, erro)
         return ("erro", str(erro), nome)
@@ -1233,6 +1304,7 @@ async def _ff_tentar_provedor(provedor: dict, uid: str):
     # não achou no BR: procura nas outras regiões ao mesmo tempo
     outras = regioes[1:]
     tarefas = [asyncio.create_task(_ff_pedir(provedor, uid, regiao)) for regiao in outras]
+    confirmou_vazio = True  # BR já respondeu validamente que não existe lá
     try:
         pendentes = set(tarefas)
         while pendentes:
@@ -1244,6 +1316,9 @@ async def _ff_tentar_provedor(provedor: dict, uid: str):
             for tarefa in prontas:
                 try:
                     resultado = tarefa.result()
+                except _FFNaoEncontradoGlobal:
+                    _ff_marcar_sucesso(nome)
+                    return ("nao_encontrado", None, nome)
                 except Exception:
                     continue
                 if resultado:
@@ -1254,8 +1329,10 @@ async def _ff_tentar_provedor(provedor: dict, uid: str):
         for tarefa in tarefas:
             tarefa.cancel()
 
-    _ff_marcar_sucesso(nome)  # respondeu bem, o ID é que não existe
-    return ("nao_encontrado", None, nome)
+    if confirmou_vazio:
+        _ff_marcar_sucesso(nome)
+        return ("nao_encontrado", None, nome)
+    return ("erro", "falha nas regiões secundárias", nome)
 
 
 async def _ff_disparar(provedor: dict, uid: str, atraso: float):
@@ -1375,6 +1452,25 @@ async def verificar_ff(uid: str, forcar: bool = False) -> dict:
             "aviso": "Os servidores de consulta estão instáveis agora — mostrando o último dado salvo.",
             "atualizado": salvo["atualizado_em"],
         }
+
+    # 5) último recurso quando as APIs externas estão fora: histórico de partidas já jogadas no bot
+    try:
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            hist = await (await db.execute(
+                "SELECT ff_nome, ff_nivel FROM slot_jogadores "
+                "WHERE ff_uid = ? AND ff_nome != '' ORDER BY id DESC LIMIT 1",
+                (uid,),
+            )).fetchone()
+        if hist and hist["ff_nome"]:
+            return {
+                "ok": True, "nome": hist["ff_nome"], "nivel": int(hist["ff_nivel"] or 0), "regiao": "BR",
+                "rank": "", "prime": 0, "cla": "", "provedor": "histórico-local", "cache": True,
+                "aviso": "APIs externas em manutenção — conta recuperada do histórico do servidor.",
+                "atualizado": agora_brt().isoformat(),
+            }
+    except Exception:
+        pass
 
     return {"ok": False, "motivo": "offline",
             "mensagem": "Os servidores de consulta não responderam agora (instabilidade ou manutenção). "
