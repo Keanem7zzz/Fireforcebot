@@ -1,19 +1,15 @@
 # ══════════════════════════════════════════════════════════════
-#  🔥 FIRE FORCE — BOT PREMIUM v11.2
+#  🔥 FIRE FORCE — BOT PREMIUM v11.3
 #  Liga de Diário Free Fire
 #
 #  • Consulta de ID do Free Fire confiável (corrida de provedores + regiões
 #    + cache de 24h + disjuntor) — seção 'CONSULTA DE ID FREE FIRE'
 #  • Tabela do diário em TEXTO: "1. (nick)" — sem imagem, sem contador
-#  • Vaga e acesso liberados depois do pagamento aprovado (staff, saldo ou LivePix)
-#  • CARTEIRA: painel privado, depósito/saque PIX via LivePix, transferência e saldo que paga vaga
-#  • v11.0: diagnóstico de configuração, perfil, anúncio com prévia e confirmação
-#  • v11.1: painéis diários paginados, carteira privada e regras de serviço/autoajuste
-#  • v11.2: mantém saque pelo painel privado da carteira; sem slash duplicado
-#  • Painéis persistentes sem duplicar loops após reconexões
-#  • PIX integral protegido em canal financeiro privado + ocultação no canal geral
-#  • Ajustes de saldo confirmados, transferência atômica e reset com arquivo histórico
-#  • Comissão de ADM configurável + logs + reserva da organização
+#  • Vaga e acesso liberados depois do pagamento aprovado pelo ADM
+#  • CARTEIRA: painel privado, depósito/saque PIX via LivePix e moedas do bot
+#  • v11.3: Keep-Alive Supabase (2 dias), PIX direto ao ADM (/pix), carteira de
+#    trabalho exclusiva do Suporte, regra +R$ 1,00 PIX em moedas, Repetição
+#    Diária por painel e tempo dinâmico configurável de bloqueio de compra
 #
 #  pip install -r requirements.txt
 # ══════════════════════════════════════════════════════════════
@@ -85,7 +81,10 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "11.2"
+VERSAO_BOT = "11.3"
+TAXA_MOEDAS_ADM_PIX = 1.00
+BLOQUEIO_COMPRA_PADRAO_MIN = 10
+SUPABASE_KEEPALIVE_SEGUNDOS = max(3600, int(os.getenv("SUPABASE_PING_HORAS", "48")) * 3600)
 
 # O arquivo antigo é mantido intacto: a nova instalação usa ffv1.db.
 # Não renomear/migrar bancos locais antigos automaticamente. Com Supabase
@@ -104,7 +103,6 @@ LIVEPIX_API = "https://api.livepix.gg/v2"
 LIVEPIX_PAINEL = "https://livepix.gg"
 
 CARTEIRA_RESERVA = 200.0        # R$ que a org SEMPRE tenta manter livres
-CARTEIRA_COMISSAO_PCT = 25.0    # R$ 2,50 a cada R$ 10,00 → 25% pro ADM
 CARTEIRA_SAQUE_MIN = 5.0
 CARTEIRA_DEPOSITO_MIN = 1.0
 CARTEIRA_JANELA_MIN = 5         # janela da confirmação automática (minutos)
@@ -232,6 +230,7 @@ _lock_aprovacao = asyncio.Lock()
 _lock_deposito = asyncio.Lock()
 _lock_ticket_estado = asyncio.Lock()
 _lock_reset_diarios = asyncio.Lock()
+_lock_repeticao_diaria = asyncio.Lock()
 _ON_READY_LOCK = asyncio.Lock()
 _BOT_INICIALIZADO = False
 _COMANDOS_SINCRONIZADOS = False
@@ -692,7 +691,8 @@ async def init_db():
                                ("canal_log_pagamento", "INTEGER"),
                                ("canal_log_vaga", "INTEGER"),
                                ("canal_log_pag_suporte", "INTEGER"),
-                               ("canal_log_pag_adm", "INTEGER")):
+                               ("canal_log_pag_adm", "INTEGER"),
+                               ("bloqueio_compra_min", "INTEGER")):
             try:
                 await db.execute(f"ALTER TABLE config ADD COLUMN {_coluna} {_tipo}")
             except Exception:
@@ -719,6 +719,13 @@ async def init_db():
             ("saques", "ticket_assumido_por", "INTEGER"),
             ("slots", "assumido_por", "INTEGER"),
             ("slots", "apelidos", "TEXT"),
+            ("slots", "pago_moedas", "INTEGER DEFAULT 0"),
+            ("slots", "valor_moedas", "REAL DEFAULT 0"),
+            ("slots", "taxa_adm_pix", "REAL DEFAULT 0"),
+            ("paineis", "repetir_diario", "INTEGER DEFAULT 0"),
+            ("horarios", "data_ciclo", "TEXT"),
+            ("horarios", "encerrado_hoje", "INTEGER DEFAULT 0"),
+            ("pix", "atualizado_em", "TEXT"),
         ):
             try:
                 await db.execute(f"ALTER TABLE {_tabela} ADD COLUMN {_coluna} {_tipo}")
@@ -886,18 +893,41 @@ def horario_para_datetime(horario_str: str) -> datetime.datetime:
     return dt_local.replace(tzinfo=TZ_BRASILIA)
 
 
-def pode_comprar_vaga(horario_str: str, lotes_usados: int, lotes_total: int) -> tuple[bool, str]:
-    if lotes_usados >= lotes_total:
-        return False, "Todas as vagas/lotes deste diário foram preenchidos."
-    
+async def obter_bloqueio_compra_min(guild_id: int) -> int:
+    """Minutos antes do início em que a compra do diário é bloqueada (configurável)."""
+    cfg = await obter_config(guild_id)
+    val = cfg.get("bloqueio_compra_min")
+    try:
+        if val is not None and str(val).strip() != "":
+            return max(0, min(int(val), 720))
+    except (TypeError, ValueError):
+        pass
+    return BLOQUEIO_COMPRA_PADRAO_MIN
+
+
+def pode_comprar_vaga(horario_str: str, lotes_usados: int, lotes_total: int,
+                      bloqueio_min: int = BLOQUEIO_COMPRA_PADRAO_MIN,
+                      repetir: bool = False,
+                      encerrado_hoje: bool = False) -> tuple[bool, str]:
+    sufixo_rep = " A compra será liberada novamente amanhã." if repetir else ""
+    if encerrado_hoje:
+        return False, f"Este diário já iniciou/encerrou hoje.{sufixo_rep}"
+
     tempo_restante = (horario_para_datetime(horario_str) - agora_brt()).total_seconds()
     if tempo_restante < 0:
-        return False, "O horário deste diário já passou."
-    
-    if tempo_restante < 600:  # 10 minutos
-        minutos = int(tempo_restante // 60)
-        return False, f"As inscrições fecham 10 minutos antes do início. Restam apenas {minutos} min."
-    
+        return False, f"O horário deste diário já passou hoje.{sufixo_rep}"
+
+    bloqueio_seg = max(0, int(bloqueio_min)) * 60
+    if bloqueio_seg > 0 and tempo_restante <= bloqueio_seg:
+        minutos = max(0, int(math.ceil(tempo_restante / 60)))
+        return (
+            False,
+            f"Compra bloqueada: faltam {minutos} min (bloqueio configurado em {int(bloqueio_min)} min antes do início).{sufixo_rep}"
+        )
+
+    if lotes_usados >= lotes_total:
+        return False, f"Todas as vagas/lotes deste diário foram preenchidos.{sufixo_rep}"
+
     return True, "Liberado"
 
 
@@ -1433,19 +1463,253 @@ async def consultar_jogador_local(busca: str) -> dict:
     }
 
 
-# ==================== PIX PAYLOAD GENERATOR ====================
+# ==================== PIX PAYLOAD GENERATOR (BRCODE OFICIAL BACEN) ====================
 
 def _crc16(payload: str) -> str:
+    """CRC16-CCITT (0xFFFF, polinômio 0x1021) — padrão oficial EMVCo / Banco Central (vetor Bacen -> 1D3D)."""
     crc = 0xFFFF
-    for char in payload:
-        crc ^= ord(char) << 8
+    for byte in payload.encode("utf-8"):
+        crc ^= byte << 8
         for _ in range(8):
             if crc & 0x8000:
-                crc = (crc << 1) ^ 0x1021
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
             else:
-                crc = crc << 1
-            crc &= 0xFFFF
-    return format(crc, '04X')
+                crc = (crc << 1) & 0xFFFF
+    return f"{crc:04X}"
+
+
+def _emv_campo(campo_id: str, valor: str) -> str:
+    return f"{campo_id}{len(valor):02d}{valor}"
+
+
+def _ascii_pix(texto: str, limite: int, padrao: str) -> str:
+    import unicodedata
+    limpo = unicodedata.normalize("NFKD", str(texto or "")).encode("ascii", "ignore").decode("ascii")
+    limpo = re.sub(r"[^A-Za-z0-9 ]+", " ", limpo).upper()
+    limpo = " ".join(limpo.split())[:limite].strip()
+    return limpo or padrao[:limite]
+
+
+def _cpf_valido(digitos: str) -> bool:
+    if len(digitos) != 11 or len(set(digitos)) == 1:
+        return False
+    for tam in (9, 10):
+        soma = sum(int(digitos[i]) * ((tam + 1) - i) for i in range(tam))
+        dv = (soma * 10) % 11
+        if dv == 10:
+            dv = 0
+        if dv != int(digitos[tam]):
+            return False
+    return True
+
+
+def _cnpj_valido(digitos: str) -> bool:
+    if len(digitos) != 14 or len(set(digitos)) == 1:
+        return False
+    pesos1 = (5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2)
+    pesos2 = (6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2)
+    for idx, pesos in ((12, pesos1), (13, pesos2)):
+        soma = sum(int(digitos[i]) * pesos[i] for i in range(idx))
+        resto = soma % 11
+        dv = 0 if resto < 2 else 11 - resto
+        if dv != int(digitos[idx]):
+            return False
+    return True
+
+
+_RE_EVP_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_RE_EMAIL_PIX = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def validar_e_normalizar_chave_pix(tipo_escolhido: Optional[str], chave_bruta: str) -> tuple[bool, str, str, str]:
+    """Valida e formata a chave PIX exatamente no padrão DICT do Banco Central.
+    Retorna `(ok, tipo_normalizado, chave_dict, erro_amigavel)`."""
+    limpa = re.sub(r"[\u200b\u200c\u200d\ufeff\xa0]", "", str(chave_bruta or "")).strip()
+    if not limpa:
+        return False, "", "", "Informe uma chave PIX."
+
+    tipo = (tipo_escolhido or "").strip().lower()
+    digitos = re.sub(r"\D", "", limpa)
+
+    # Auto-detecção segura caso a pessoa não tenha escolhido tipo ou tenha escolhido "aleatoria" por engano
+    if "@" in limpa:
+        tipo = "email"
+    elif _RE_EVP_UUID.match(limpa):
+        tipo = "aleatoria"
+    elif limpa.startswith("+"):
+        tipo = "telefone"
+    elif len(digitos) == 14 and _cnpj_valido(digitos) and tipo in ("", "cpf", "cnpj", "aleatoria"):
+        tipo = "cnpj"
+    elif not tipo:
+        if len(digitos) == 11:
+            if _cpf_valido(digitos) and not (11 <= int(digitos[:2]) <= 99 and digitos[2] == "9"):
+                tipo = "cpf"
+            elif not _cpf_valido(digitos) and 11 <= int(digitos[:2]) <= 99 and digitos[2] in ("8", "9"):
+                tipo = "telefone"
+            else:
+                return (
+                    False,
+                    "",
+                    "",
+                    "Esse número de 11 dígitos pode ser **CPF** ou **Celular**. Selecione o `tipo` da chave (`CPF` ou `Celular / Telefone`) para o QR Code sair perfeito!",
+                )
+        elif len(digitos) in (10, 12, 13):
+            tipo = "telefone"
+        else:
+            tipo = "aleatoria"
+
+    # Se marcou aleatoria mas digitou CPF/celular sem ser UUID, corrige ou avisa
+    if tipo == "aleatoria" and not _RE_EVP_UUID.match(limpa):
+        if len(digitos) == 11 and _cpf_valido(digitos) and "." in limpa:
+            tipo = "cpf"
+        elif "(" in limpa or (digitos.startswith("55") and len(digitos) in (12, 13)):
+            tipo = "telefone"
+        else:
+            return (
+                False,
+                "aleatoria",
+                "",
+                "Chave aleatória (EVP) precisa estar no formato de 36 caracteres com traços (ex: `123e4567-e89b-12d3-a456-426614174000`).\n"
+                "Se sua chave for **CPF**, **Celular** ou **E-mail**, selecione o tipo correspondente!",
+            )
+
+    if tipo == "email":
+        email_fmt = limpa.replace(" ", "").lower()
+        if not _RE_EMAIL_PIX.match(email_fmt) or len(email_fmt) > 77:
+            return False, "email", "", "E-mail PIX inválido. Exemplo válido: `seunome@gmail.com`."
+        return True, "email", email_fmt, ""
+
+    if tipo == "cpf":
+        if len(digitos) == 14 and _cnpj_valido(digitos):
+            return True, "cnpj", digitos, ""
+        if len(digitos) != 11:
+            return False, "cpf", "", "O CPF precisa ter **11 dígitos** (ou 14 dígitos para CNPJ)."
+        if not _cpf_valido(digitos):
+            dica_cel = (
+                "\n💡 *Se esse número for um **Celular**, escolha o tipo **Celular / Telefone** (para o banco incluir o `+55`).*"
+                if (11 <= int(digitos[:2]) <= 99 and digitos[2] == "9")
+                else ""
+            )
+            return False, "cpf", "", f"CPF inválido (dígitos verificadores não conferem). Confira os números!{dica_cel}"
+        return True, "cpf", digitos, ""
+
+    if tipo == "cnpj":
+        if len(digitos) != 14 or not _cnpj_valido(digitos):
+            return False, "cnpj", "", "CNPJ inválido. Informe os 14 dígitos corretos."
+        return True, "cnpj", digitos, ""
+
+    if tipo in ("telefone", "celular"):
+        if limpa.startswith("+"):
+            d_tel = re.sub(r"\D", "", limpa[1:])
+            if not d_tel.startswith("55"):
+                return True, "telefone", f"+{d_tel}", ""
+            digitos = d_tel[2:]
+        elif digitos.startswith("55") and len(digitos) in (12, 13):
+            digitos = digitos[2:]
+
+        if len(digitos) not in (10, 11) or not (11 <= int(digitos[:2]) <= 99):
+            return (
+                False,
+                "telefone",
+                "",
+                "Celular inválido. Informe **DDD + número** (ex: `92991234567` ou `(92) 99123-4567`).",
+            )
+        return True, "telefone", f"+55{digitos}", ""
+
+    if tipo == "aleatoria":
+        return True, "aleatoria", limpa.lower(), ""
+
+    return False, tipo, "", "Tipo de chave PIX desconhecido."
+
+
+def normalizar_chave_pix_emv(tipo: str, chave: str) -> str:
+    """Garante a formatação DICT mesmo para chaves salvas anteriormente."""
+    ok, _, chave_fmt, _ = validar_e_normalizar_chave_pix(tipo, chave)
+    if ok:
+        return chave_fmt
+    t = (tipo or "aleatoria").strip().lower()
+    c = str(chave or "").strip()
+    digitos = re.sub(r"\D", "", c)
+    if t in ("cpf", "cnpj"):
+        return digitos
+    if t in ("telefone", "celular"):
+        if c.startswith("+"):
+            return "+" + re.sub(r"\D", "", c[1:])
+        if len(digitos) in (10, 11):
+            return f"+55{digitos}"
+        if digitos.startswith("55") and len(digitos) in (12, 13):
+            return f"+{digitos}"
+    if t == "email":
+        return c.replace(" ", "").lower()
+    return c
+
+
+def gerar_payload_pix(chave: str, tipo_chave: str = "aleatoria", titular: str = "FIRE FORCE",
+                      valor: float = 0.0, txid: str = "***") -> str:
+    """Gera o código PIX Copia e Cola (BRCode Estático oficial do Banco Central).
+
+    Nota técnica importante (Manual do BR Code Bacen, seção 2.1.1):
+    Em QR Codes estáticos gerados fora do PSP do recebedor, o campo 62/05 (txid)
+    DEVE ser `***` (`62070503***`), pois bancos como Caixa, Santander, Bradesco,
+    BB e Itaú rejeitam TXIDs personalizados não registrados no PSP de destino.
+    """
+    chave_fmt = normalizar_chave_pix_emv(tipo_chave, chave)
+    gui = _emv_campo("00", "br.gov.bcb.pix")
+    chave_sub = _emv_campo("01", chave_fmt)
+    conta = _emv_campo("26", gui + chave_sub)
+
+    partes = [
+        _emv_campo("00", "01"),
+        conta,
+        _emv_campo("52", "0000"),
+        _emv_campo("53", "986"),
+    ]
+    if valor and float(valor) > 0:
+        partes.append(_emv_campo("54", f"{float(valor):.2f}"))
+    partes.append(_emv_campo("58", "BR"))
+    partes.append(_emv_campo("59", _ascii_pix(titular, 25, "FIRE FORCE")))
+    partes.append(_emv_campo("60", "BRASILIA"))
+    partes.append(_emv_campo("62", _emv_campo("05", "***")))
+
+    sem_crc = "".join(partes) + "6304"
+    return sem_crc + _crc16(sem_crc)
+
+
+async def obter_pix_adm(user_id: int, guild_id: int) -> Optional[dict]:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        linha = await (await db.execute(
+            "SELECT * FROM pix WHERE user_id = ? AND guild_id = ?",
+            (int(user_id), int(guild_id))
+        )).fetchone()
+    return dict(linha) if linha and linha["chave"] else None
+
+
+async def salvar_pix_adm(user_id: int, guild_id: int, tipo: str, chave: str, titular: str) -> None:
+    agora = agora_brt().isoformat()
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute(
+            "INSERT INTO pix (user_id, guild_id, tipo, chave, titular, atualizado_em) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id, guild_id) DO UPDATE SET "
+            "tipo = excluded.tipo, chave = excluded.chave, titular = excluded.titular, atualizado_em = excluded.atualizado_em",
+            (int(user_id), int(guild_id), tipo.strip().lower(), chave.strip(), titular.strip(), agora)
+        )
+        await db.commit()
+    marcar_sujo()
+
+
+async def remover_pix_adm(user_id: int, guild_id: int) -> bool:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cur = await db.execute(
+            "DELETE FROM pix WHERE user_id = ? AND guild_id = ?",
+            (int(user_id), int(guild_id))
+        )
+        await db.commit()
+    if cur.rowcount:
+        marcar_sujo()
+        return True
+    return False
 
 
 # ==================== TABELA EM TEXTO — "1. (NICK)" ====================
@@ -1566,8 +1830,14 @@ async def criar_canal_tabela(guild: discord.Guild, horario_id: int):
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (horario_id,))).fetchone()
-        if not horario or horario["canal_tabela"]:
-            return horario["canal_tabela"] if horario else None
+        if not horario:
+            return None
+        if horario["canal_tabela"]:
+            canal_existente = guild.get_channel(int(horario["canal_tabela"]))
+            if canal_existente:
+                return int(horario["canal_tabela"])
+            await db.execute("UPDATE horarios SET canal_tabela = NULL, msg_tabela = NULL WHERE id = ?", (horario_id,))
+            await db.commit()
 
     cfg = await obter_config(guild.id)
     cat_chave = "cat_premium" if horario["categoria"] == "premium" else "cat_basico"
@@ -1663,6 +1933,7 @@ def _registrar_view_painel_inscricao(view: discord.ui.View, message_id: int) -> 
 async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[int] = None,
                          interaction: Optional[discord.Interaction] = None):
     """Reconstrói o painel visual de inscrições e seus seletores atualizados."""
+    bloqueio_min = await obter_bloqueio_compra_min(guild.id)
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         painel = await (await db.execute("SELECT * FROM paineis WHERE id = ?", (painel_id,))).fetchone()
@@ -1682,6 +1953,8 @@ async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[in
     if not canal:
         return
 
+    painel_dict = dict(painel)
+    repetir = bool(painel_dict.get("repetir_diario", 0))
     tipo = painel["tipo"]
     categoria = painel["categoria"]
     total = LOTES_POR_MODO[tipo]
@@ -1689,22 +1962,41 @@ async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[in
     jogadores_lote = JOGADORES_POR_LOTE[tipo]
     rotulo = formatar_rotulo_diario(tipo, categoria)
     opcoes_select = []
+    linhas_visiveis = []
     fechados = 0
 
     for h in horarios:
         h_dict = dict(h)
         ocupadas = int(ocupacao.get(h_dict["id"], 0))
-        pode, _ = pode_comprar_vaga(h_dict["horario"], ocupadas, total)
+        encerrado_hoje = bool(h_dict.get("encerrado_hoje", 0))
+        pode, _ = pode_comprar_vaga(
+            h_dict["horario"], ocupadas, total,
+            bloqueio_min=bloqueio_min, repetir=repetir, encerrado_hoje=encerrado_hoje
+        )
         restantes = max(0, total - ocupadas)
-        if not pode:
-            fechados += 1
-            continue
         diferenca = (horario_para_datetime(h_dict["horario"]) - agora_brt()).total_seconds()
-        tempo_legivel = formatar_tempo_restante(diferenca)
         rotulo_vagas = texto_slot(tipo).lower() if restantes == 1 else rotulo_plural.lower()
         estado_vagas = "disponível" if restantes == 1 else "disponíveis"
+
+        if not pode:
+            fechados += 1
+            if encerrado_hoje or diferenca < 0:
+                status_vis = "🔒 Encerrado hoje • libera amanhã" if repetir else "⏸️ Encerrado"
+            elif diferenca <= max(0, int(bloqueio_min)) * 60:
+                status_vis = f"🔒 Compra bloqueada (≤ {bloqueio_min} min)" + (" • libera amanhã" if repetir else "")
+            else:
+                status_vis = f"🔴 Lotado ({ocupadas}/{total})" + (" • libera amanhã" if repetir else "")
+            linhas_visiveis.append(
+                f"> `{h_dict['horario']}` • `{formatar_moeda(h_dict['valor'])}` — {status_vis}"
+            )
+            continue
+
+        tempo_legivel = formatar_tempo_restante(diferenca)
         vagas_txt = f"{restantes} {rotulo_vagas} {estado_vagas}"
         descricao = f"{vagas_txt} • inicia em {tempo_legivel} • {formatar_moeda(h_dict['valor'])}"
+        linhas_visiveis.append(
+            f"> 🟢 `{h_dict['horario']}` • `{formatar_moeda(h_dict['valor'])}` — {vagas_txt} (inicia em {tempo_legivel})"
+        )
         opcoes_select.append(discord.SelectOption(
             label=f"{tipo.title()} • {h_dict['horario']}",
             value=str(h_dict["id"]),
@@ -1715,7 +2007,8 @@ async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[in
     descricao = (
         "Escolha um horário no menu para fazer sua inscrição.\n"
         "Vagas disponíveis, início e preço são atualizados automaticamente.\n"
-        "As inscrições encerram 10 minutos antes do horário marcado."
+        f"As compras são bloqueadas quando faltar **{bloqueio_min} minuto(s) ou menos** para o início"
+        + (" e liberam novamente no próximo dia." if repetir else ".")
     )
     embed = criar_embed(
         titulo=f"🔥 Central de inscrições • {rotulo}",
@@ -1729,16 +2022,35 @@ async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[in
         value=f"{jogadores_lote} jogador{'es' if jogadores_lote != 1 else ''} por {texto_slot(tipo).lower()}",
         inline=True
     )
-    embed.add_field(name="🎟️ Disponibilidade", value=f"**{len(opcoes_select)}** horário(s) aberto(s)", inline=True)
+    embed.add_field(
+        name="🎟️ Disponibilidade",
+        value=f"**{len(opcoes_select)}** aberto(s)" + (" • 🔄 Diário" if repetir else ""),
+        inline=True
+    )
+
+    if linhas_visiveis:
+        # Mantém todos os diários visíveis no painel mesmo quando bloqueados (não clicáveis)
+        bloco_txt = "\n".join(linhas_visiveis[:20])
+        if len(linhas_visiveis) > 20:
+            bloco_txt += f"\n> *...e mais {len(linhas_visiveis) - 20} horário(s)*"
+        embed.add_field(name="📅 Diários do painel", value=bloco_txt[:1024], inline=False)
 
     if not opcoes_select:
         if horarios:
-            explicacao = "Os diários cadastrados estão lotados ou com inscrições encerradas."
+            explicacao = (
+                "As compras dos diários acima estão bloqueadas no momento (quem já comprou permanece na fila de espera)."
+                + (" As vagas reabrem automaticamente amanhã!" if repetir else "")
+            )
+            embed.add_field(name="🔒 Compras bloqueadas", value=f"> {explicacao}", inline=False)
         else:
-            explicacao = "Nenhum diário foi cadastrado neste painel ainda."
-        embed.add_field(name="📭 Nenhum diário disponível", value=f"> {explicacao}", inline=False)
+            embed.add_field(name="📭 Nenhum diário disponível", value="> Nenhum diário foi cadastrado neste painel ainda.", inline=False)
     elif fechados:
-        embed.add_field(name="⏸️ Outros horários", value=f"> {fechados} horário(s) fechado(s) ou sem vagas.", inline=False)
+        embed.add_field(
+            name="🔒 Horários com compra bloqueada",
+            value=f"> {fechados} horário(s) permanecem visíveis acima, porém não clicáveis"
+                  + (" (reabrem no próximo dia)." if repetir else "."),
+            inline=False
+        )
 
     # Discord: até 25 opções por Select e 5 linhas por mensagem. Até 125 opções
     # ficam em cinco seletores; acima disso, quatro seletores por página + navegação.
@@ -1757,7 +2069,10 @@ async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[in
             inline=False
         )
 
-    view = PainelInscricaoView(opcoes_select, tipo, painel_id, page=page)
+    view = PainelInscricaoView(
+        opcoes_select, tipo, painel_id, page=page,
+        possui_horarios=bool(horarios), repetir=repetir
+    )
     try:
         if interaction is not None:
             await interaction.response.edit_message(embed=embed, view=view)
@@ -1776,21 +2091,27 @@ async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[in
 
 class HorarioSelectMenu(discord.ui.Select):
     def __init__(self, opcoes: list, tipo: str, painel_id: int, row: int = 0,
-                 inicio_opcoes: int = 1):
+                 inicio_opcoes: int = 1, possui_horarios: bool = False, repetir: bool = False):
         if opcoes:
             fim_opcoes = inicio_opcoes + len(opcoes) - 1
             placeholder = f"🎮 Horários {inicio_opcoes}–{fim_opcoes} • escolha para se inscrever"
             custom_id = f"ff_psel_{painel_id}_{row}"
             disabled = False
         else:
-            placeholder = "Nenhum diário disponível para este painel"
+            if possui_horarios:
+                placeholder = (
+                    "🔒 Compra bloqueada hoje • libera amanhã" if repetir
+                    else "🔒 Compras bloqueadas para os horários atuais"
+                )
+            else:
+                placeholder = "Nenhum diário disponível para este painel"
             custom_id = f"ff_psel_empty_{painel_id}"
             disabled = True
             opcoes = [discord.SelectOption(
-                label="Nenhum diário disponível para este painel",
+                label=placeholder[:100],
                 value="nenhum",
-                description="Volte mais tarde: novos horários aparecerão aqui.",
-                emoji="📭"
+                description="Volte no próximo dia ou aguarde novos horários.",
+                emoji="🔒" if possui_horarios else "📭"
             )]
         super().__init__(
             placeholder=placeholder[:100],
@@ -1805,9 +2126,14 @@ class HorarioSelectMenu(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         horario_id = int(self.values[0])
+        bloqueio_min = await obter_bloqueio_compra_min(interaction.guild.id) if interaction.guild else BLOQUEIO_COMPRA_PADRAO_MIN
         async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory = aiosqlite.Row
-            horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (horario_id,))).fetchone()
+            horario = await (await db.execute(
+                "SELECT h.*, COALESCE(p.repetir_diario, 0) AS repetir_diario "
+                "FROM horarios h LEFT JOIN paineis p ON h.painel_id = p.id WHERE h.id = ?",
+                (horario_id,)
+            )).fetchone()
             if not horario or not interaction.guild or int(horario["guild_id"]) != interaction.guild.id:
                 return await interaction.response.send_message(
                     embed=criar_embed("❌ Erro", "Horário não localizado neste servidor.", "Vermelho"),
@@ -1818,6 +2144,10 @@ class HorarioSelectMenu(discord.ui.Select):
                     embed=criar_embed("⏸️ Inscrições encerradas", "Este diário foi arquivado ou encerrado.", "Amarelo"),
                     ephemeral=True
                 )
+
+            ocupadas = (await (await db.execute(
+                "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (horario_id,)
+            )).fetchone())[0]
 
             ja_comprou = await (await db.execute(
                 "SELECT 1 FROM slots WHERE horario_id = ? AND comprador_id = ?",
@@ -1838,10 +2168,17 @@ class HorarioSelectMenu(discord.ui.Select):
                 ), ephemeral=True
             )
 
-        pode, motivo = pode_comprar_vaga(horario["horario"], horario["lotes_usados"], LOTES_POR_MODO[horario["tipo"]])
+        h_dict = dict(horario)
+        pode, motivo = pode_comprar_vaga(
+            h_dict["horario"], ocupadas, LOTES_POR_MODO[h_dict["tipo"]],
+            bloqueio_min=bloqueio_min,
+            repetir=bool(h_dict.get("repetir_diario", 0)),
+            encerrado_hoje=bool(h_dict.get("encerrado_hoje", 0))
+        )
         if not pode:
+            await rebuild_painel(interaction.guild, int(h_dict["painel_id"]))
             return await interaction.response.send_message(
-                embed=criar_embed("❌ Indisponível", motivo, "Vermelho"),
+                embed=criar_embed("🔒 Compra bloqueada", motivo, "Vermelho"),
                 ephemeral=True
             )
 
@@ -1873,7 +2210,8 @@ class PainelPaginaButton(discord.ui.Button):
 
 
 class PainelInscricaoView(discord.ui.View):
-    def __init__(self, opcoes: list, tipo: str, painel_id: int, page: int = 0):
+    def __init__(self, opcoes: list, tipo: str, painel_id: int, page: int = 0,
+                 possui_horarios: bool = False, repetir: bool = False):
         super().__init__(timeout=None)
         self.painel_id = int(painel_id)
         self.tipo = tipo
@@ -1884,7 +2222,10 @@ class PainelInscricaoView(discord.ui.View):
         opcoes_pagina = opcoes[inicio_pagina:inicio_pagina + tamanho_pagina]
 
         if not opcoes_pagina:
-            self.add_item(HorarioSelectMenu([], tipo, painel_id, row=0, inicio_opcoes=1))
+            self.add_item(HorarioSelectMenu(
+                [], tipo, painel_id, row=0, inicio_opcoes=1,
+                possui_horarios=possui_horarios, repetir=repetir
+            ))
         else:
             for row, inicio_local in enumerate(range(0, len(opcoes_pagina), 25)):
                 bloco = opcoes_pagina[inicio_local:inicio_local + 25]
@@ -1977,15 +2318,25 @@ class ComprarSlotModal(discord.ui.Modal):
                     embed=criar_embed("⏸️ Inscrições encerradas", "Este diário foi arquivado ou encerrado.", "Amarelo"),
                     ephemeral=True
                 )
+            painel_info = await (await db.execute(
+                "SELECT repetir_diario FROM paineis WHERE id = ?", (horario["painel_id"],)
+            )).fetchone()
             ocupadas = (await (await db.execute(
                 "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (self.horario_id,)
             )).fetchone())[0]
 
+        bloqueio_min = await obter_bloqueio_compra_min(interaction.guild.id)
+        repetir_painel = bool(painel_info["repetir_diario"]) if painel_info and painel_info["repetir_diario"] else False
+        h_dict_ini = dict(horario)
         total_vagas = LOTES_POR_MODO[horario["tipo"]]
-        pode, motivo = pode_comprar_vaga(horario["horario"], ocupadas, total_vagas)
+        pode, motivo = pode_comprar_vaga(
+            horario["horario"], ocupadas, total_vagas,
+            bloqueio_min=bloqueio_min, repetir=repetir_painel,
+            encerrado_hoje=bool(h_dict_ini.get("encerrado_hoje", 0))
+        )
         if not pode:
             return await interaction.followup.send(
-                embed=criar_embed("❌ Indisponível", motivo, "Vermelho"),
+                embed=criar_embed("🔒 Compra bloqueada", motivo, "Vermelho"),
                 ephemeral=True
             )
 
@@ -2025,8 +2376,6 @@ class ComprarSlotModal(discord.ui.Modal):
         async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
-            # A validação do status fica na mesma transação da reserva: não deixa
-            # uma troca para Em serviço escapar entre a criação do canal e a inscrição.
             if membro_equipe_para_diario:
                 linha_servico = await (await db.execute(
                     "SELECT online FROM staff_status WHERE user_id = ? AND guild_id = ?",
@@ -2056,8 +2405,11 @@ class ComprarSlotModal(discord.ui.Modal):
             ocupadas_atual = (await (await db.execute(
                 "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (self.horario_id,)
             )).fetchone())[0]
+            h_atual_dict = dict(horario_atual) if horario_atual else {}
             pode_atual, motivo_atual = (pode_comprar_vaga(
-                horario_atual["horario"], ocupadas_atual, LOTES_POR_MODO.get(horario_atual["tipo"], 0)
+                horario_atual["horario"], ocupadas_atual, LOTES_POR_MODO.get(horario_atual["tipo"], 0),
+                bloqueio_min=bloqueio_min, repetir=repetir_painel,
+                encerrado_hoje=bool(h_atual_dict.get("encerrado_hoje", 0))
             ) if horario_atual else (False, "Este diário foi arquivado ou encerrado."))
             if not horario_atual or duplicada or not pode_atual:
                 await db.rollback()
@@ -2073,7 +2425,8 @@ class ComprarSlotModal(discord.ui.Modal):
 
             cursor = await db.execute(
                 "INSERT INTO slots (horario_id, guild_id, comprador_id, comprador_nome, apelidos, numero, "
-                "confirmado, canal_pag, criado_em, valor_cobrado) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)",
+                "confirmado, canal_pag, criado_em, valor_cobrado, pago_moedas, valor_moedas, taxa_adm_pix) "
+                "VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 0, 0, 0)",
                 (self.horario_id, interaction.guild.id, interaction.user.id, interaction.user.display_name,
                  "|".join([apelidos_do_usuario(interaction.user)] + [str(n).strip() for n in nicks if str(n).strip()])[:200],
                  canal_pagamento.id, agora_brt().isoformat(), horario_atual["valor"])
@@ -2098,7 +2451,7 @@ class ComprarSlotModal(discord.ui.Modal):
                       f"║  🏷️  {formatar_rotulo_diario(self.tipo, self.categoria)}\n"
                       f"║  ⏰  `{self.horario_str}`\n"
                       f"║  💰  `{formatar_moeda(self.valor)}`\n"
-                      f"║  🎫  Reserva — vaga liberada após o pagamento\n"
+                      f"║  🎫  Reserva — vaga liberada após aprovação do ADM\n"
                       f"╚══════════════════════════════════╝\n\n"
                       f"**Jogadores:**\n{lista_nicks}",
             cor_nome="Amarelo",
@@ -2113,54 +2466,26 @@ class ComprarSlotModal(discord.ui.Modal):
                 if role:
                     mencoes_staff.append(role.mention)
 
-        instrucoes = (
-            "> 1️⃣ Faça o PIX no valor acima\n"
-            "> 2️⃣ Envie o comprovante aqui neste canal\n"
-            "> 3️⃣ A equipe valida o comprovante e libera tudo pra você\n\n"
-            "> 🔒 **A vaga, o número do lote e o acesso ao canal do diário só são liberados depois da aprovação do pagamento.**\n"
-            "> 🎟️ Tem cupom? Use `/cupom <codigo>` aqui antes de pagar."
-        )
-
-        # ---- PIX agora é 100% LivePix: gera o checkout com o valor exato ----
-        link = await link_pagamento(interaction.guild.id, self.valor, tipo="diario", alvo_id=slot_id,
-                                    user_id=interaction.user.id, nick=nicks[0] if nicks else "",
-                                    horario_id=self.horario_id, canal_id=canal_pagamento.id)
-
-        if link:
-            embed_pagamento.add_field(
-                name="💳 PIX via LivePix",
-                value=f"> **Valor exato:** `{formatar_moeda(self.valor)}`\n"
-                      f"> **Nome no pagamento:** `{interaction.user.display_name}`\n"
-                      f"> **Link:** {link}",
-                inline=False
-            )
-            embed_pagamento.add_field(
-                name="⚡ Liberação automática",
-                value="> Pague pelo LivePix escrevendo **o seu nome** no campo de mensagem.\n"
-                      "> Assim que o PIX aparecer, a vaga é liberada **sozinha** — sem esperar a equipe.\n"
-                      "> Pagou depois de 5 minutos? Sem problema: a equipe valida manualmente pra você.",
-                inline=False
-            )
-        else:
-            embed_pagamento.add_field(
-                name="💳 PIX via LivePix",
-                value=f"> **Valor exato:** `{formatar_moeda(self.valor)}`\n"
-                      f"> Fale com a equipe pra receber o link de pagamento.",
-                inline=False
-            )
         embed_pagamento.add_field(
-            name="💰 Tem saldo na carteira?",
-            value="> Clique em **💰 Pagar com saldo** aqui embaixo e a vaga é liberada **na hora**.",
+            name="💳 Pagamento via PIX (direto para o ADM)",
+            value=f"> **Valor integral:** `{formatar_moeda(self.valor)}`\n"
+                  f"> 1️⃣ Aguarde um ADM clicar em **🙋 Assumir** abaixo para exibir a chave PIX e o QR Code dele.\n"
+                  f"> 2️⃣ Faça o PIX direto para o ADM e envie o comprovante neste canal.\n"
+                  f"> 3️⃣ O ADM confere e libera sua vaga na hora!",
             inline=False
         )
-
-        arquivo_qr = None
-        if link:
-            try:
-                arquivo_qr = discord.File(gerar_qr_url(link), "pagamento.png")
-                embed_pagamento.set_image(url="attachment://pagamento.png")
-            except Exception:
-                arquivo_qr = None
+        embed_pagamento.add_field(
+            name="🪙 Pagar com moedas do bot (saldo da carteira)",
+            value=f"> Clique em **🪙 Pagar com moedas** abaixo para usar o saldo da sua carteira.\n"
+                  f"> ⚠️ Ao pagar com moedas, será necessário enviar **+{formatar_moeda(TAXA_MOEDAS_ADM_PIX)} via Pix** "
+                  f"para o ADM liberar sua vaga (pois moedas não contam como pagamento para ele).",
+            inline=False
+        )
+        embed_pagamento.add_field(
+            name="🎟️ Cupom de desconto",
+            value="> Tem cupom? Use `/cupom <codigo>` aqui antes de pagar.",
+            inline=False
+        )
 
         # 🎉 evento rolando? avisa (e inscreve) quem está dentro da aposta mínima
         try:
@@ -2179,17 +2504,17 @@ class ComprarSlotModal(discord.ui.Modal):
         except Exception as erro:
             _log_arquivo(f"[EVENTO] erro ao inscrever: {erro}")
 
-        enviar = dict(content=f"{interaction.user.mention} {' '.join(mencoes_staff)}",
-                      embed=embed_pagamento, view=PagamentoAcaoView())
-        if arquivo_qr:
-            enviar["file"] = arquivo_qr
-        await canal_pagamento.send(**enviar)
+        await canal_pagamento.send(
+            content=f"{interaction.user.mention} {' '.join(mencoes_staff)}",
+            embed=embed_pagamento,
+            view=PagamentoAcaoView()
+        )
 
         await interaction.followup.send(
             embed=criar_embed(
                 "✅ Reserva Criada",
                 f"{rotulo} reservado(a) para **{self.horario_str}**!\n"
-                f"> Pague em {canal_pagamento.mention} — a vaga é liberada quando a equipe confirmar o pagamento.",
+                f"> Finalize o pagamento em {canal_pagamento.mention} — a vaga é liberada quando o ADM aprovar.",
                 "Esmeralda"
             ),
             ephemeral=True
@@ -2246,13 +2571,230 @@ class ComprovanteAcaoView(discord.ui.View):
         await PagamentoAcaoView().recusar(interaction,None)
 
 
+AVISO_MOEDAS_ADM_PIX = (
+    "Você pagou com moedas e sua vaga está quase aprovada, porém é necessário enviar "
+    "**+R$ 1,00 via Pix** para o ADM, pois moedas não contam como pagamento para ele."
+)
+
+
+class PixAdmModal(discord.ui.Modal, title="🏦 Cadastrar Chave PIX do ADM"):
+    campo_chave = discord.ui.TextInput(
+        label="Sua chave PIX",
+        placeholder="CPF, celular (+55...), e-mail ou chave aleatória",
+        required=True,
+        max_length=120,
+    )
+    campo_titular = discord.ui.TextInput(
+        label="Nome do titular da conta",
+        placeholder="Ex: JOAO DA SILVA",
+        required=True,
+        max_length=80,
+    )
+
+    def __init__(self, tipo_chave: str = "aleatoria", chave_atual: str = "", titular_atual: str = ""):
+        super().__init__()
+        self.tipo_chave = (tipo_chave or "aleatoria").strip().lower()
+        if chave_atual:
+            self.campo_chave.default = chave_atual
+        if titular_atual:
+            self.campo_titular.default = titular_atual
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not await e_staff(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas ADMs (Mediador, Gerente ou Dono) podem cadastrar chave PIX.", "Vermelho"),
+                ephemeral=True,
+            )
+        chave_bruta = self.campo_chave.value.strip()
+        titular = self.campo_titular.value.strip()
+        ok_pix, tipo_norm, chave_dict, erro_pix = validar_e_normalizar_chave_pix(self.tipo_chave, chave_bruta)
+        if not ok_pix:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Chave PIX inválida", erro_pix, "Vermelho"),
+                ephemeral=True,
+            )
+
+        await salvar_pix_adm(interaction.user.id, interaction.guild.id, tipo_norm, chave_dict, titular)
+        await registrar_log(
+            interaction.guild,
+            "🏦 PIX ADM",
+            "🏦 Chave PIX de ADM atualizada",
+            f"{interaction.user.mention} configurou sua chave PIX para recebimento direto dos diários.\n"
+            f"> 🔑 Tipo: `{tipo_norm.upper()}` • Chave: `{mascarar_chave(chave_dict)}`\n"
+            f"> 👤 Titular: `{titular}`",
+            "Esmeralda",
+        )
+
+        payload_teste = gerar_payload_pix(chave_dict, tipo_norm, titular, valor=1.00)
+        arq_qr = None
+        emb = criar_embed(
+            "✅ Chave PIX Cadastrada e Validada!",
+            f"Sua chave PIX foi formatada no padrão oficial do Banco Central:\n\n"
+            f"> 🔑 **Tipo:** `{tipo_norm.upper()}`\n"
+            f"> 🏦 **Chave no DICT:** `{chave_dict}`\n"
+            f"> 👤 **Titular:** `{titular}`\n\n"
+            f"**🧪 Prévia real de R$ 1,00 (pode testar no app do seu banco agora):**\n"
+            f"```\n{payload_teste}\n```",
+            "Esmeralda",
+        )
+        try:
+            arq_qr = discord.File(gerar_qr_url(payload_teste), "teste_pix_adm.png")
+            emb.set_image(url="attachment://teste_pix_adm.png")
+        except Exception:
+            arq_qr = None
+
+        kwargs_resp = {"embed": emb, "view": CopiarPixAdmView(payload_teste), "ephemeral": True}
+        if arq_qr:
+            kwargs_resp["file"] = arq_qr
+        await interaction.response.send_message(**kwargs_resp)
+
+
+class PixAdmTipoSelect(discord.ui.Select):
+    def __init__(self, chave_atual: str = "", titular_atual: str = ""):
+        self.chave_atual = chave_atual
+        self.titular_atual = titular_atual
+        opcoes = [
+            discord.SelectOption(label="CPF", value="cpf", emoji="🪪", description="11 dígitos (com ou sem pontos)"),
+            discord.SelectOption(label="CNPJ", value="cnpj", emoji="🏢", description="14 dígitos (com ou sem pontos)"),
+            discord.SelectOption(label="Celular / Telefone", value="telefone", emoji="📱", description="DDD + número (ex: 92991234567)"),
+            discord.SelectOption(label="E-mail", value="email", emoji="📧", description="Seu e-mail PIX"),
+            discord.SelectOption(label="Chave Aleatória (EVP)", value="aleatoria", emoji="🔑", description="36 caracteres com traços do banco"),
+        ]
+        super().__init__(placeholder="Escolha o tipo da sua chave PIX...", options=opcoes)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            PixAdmModal(self.values[0], self.chave_atual, self.titular_atual)
+        )
+
+
+class PixAdmTipoView(discord.ui.View):
+    def __init__(self, chave_atual: str = "", titular_atual: str = ""):
+        super().__init__(timeout=180)
+        self.add_item(PixAdmTipoSelect(chave_atual, titular_atual))
+
+
+class CopiarPixAdmView(discord.ui.View):
+    """Botão que entrega o código PIX Copia e Cola puro (sem crases), facilitando copiar com 1 toque no celular."""
+
+    def __init__(self, payload: str):
+        super().__init__(timeout=3600)
+        self.payload = payload
+
+    @discord.ui.button(label="Copiar PIX Copia e Cola", style=discord.ButtonStyle.green, emoji="📋")
+    async def copiar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(self.payload, ephemeral=True)
+
+
+async def montar_cobranca_pix_adm_embed(
+    adm_id: int,
+    comprador_id: int,
+    pix_adm: dict,
+    valor_pix: float,
+    slot_id: int,
+    pago_moedas: bool = False,
+    valor_moedas: float = 0.0,
+) -> tuple[discord.Embed, Optional[discord.File], str]:
+    """Gera o embed + QR Code real (BRCode Bacen) com o PIX direto do ADM."""
+    payload = gerar_payload_pix(
+        chave=pix_adm["chave"],
+        tipo_chave=pix_adm.get("tipo") or "aleatoria",
+        titular=pix_adm.get("titular") or "FIRE FORCE",
+        valor=valor_pix,
+    )
+    chave_exibida = normalizar_chave_pix_emv(pix_adm.get("tipo") or "aleatoria", pix_adm["chave"])
+    if pago_moedas:
+        titulo = "🪙 Quase lá! Falta enviar +R$ 1,00 via Pix ao ADM"
+        descricao = (
+            f"{mencao(comprador_id)}, {AVISO_MOEDAS_ADM_PIX}\n\n"
+            f"> 🙋 **ADM responsável:** {mencao(adm_id)}\n"
+            f"> 🪙 **Pago em moedas do bot:** `{formatar_moeda(valor_moedas)}` *(não repassado ao ADM)*\n"
+            f"> 💸 **Valor a enviar via PIX ao ADM:** **`{formatar_moeda(valor_pix)}`**"
+        )
+        cor = "Dourado"
+    else:
+        titulo = "🏦 Pagamento assumido — PIX direto para o ADM"
+        descricao = (
+            f"{mencao(adm_id)} assumiu este atendimento!\n"
+            f"{mencao(comprador_id)}, envie o valor **integral** diretamente para o PIX do ADM abaixo:\n\n"
+            f"> 💰 **Valor exato do PIX:** **`{formatar_moeda(valor_pix)}`**"
+        )
+        cor = "Esmeralda"
+
+    embed = criar_embed(titulo, descricao, cor, footer="Fire Force • QR Code PIX Oficial (BRCode)")
+    embed.add_field(
+        name="🏦 Dados PIX do ADM",
+        value=(
+            f"> 👤 **Titular:** `{pix_adm.get('titular') or 'ADM Fire Force'}`\n"
+            f"> 🔑 **Tipo:** `{(pix_adm.get('tipo') or 'chave').upper()}`\n"
+            f"> 📋 **Chave PIX:** `{chave_exibida}`"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📲 PIX Copia e Cola",
+        value=f"```\n{payload}\n```\n> 💡 *No celular, clique no botão **📋 Copiar PIX Copia e Cola** abaixo para receber só o texto puro!*",
+        inline=False,
+    )
+    embed.add_field(
+        name="✅ Como liberar sua vaga",
+        value=(
+            "> 1️⃣ Escaneie o **QR Code** abaixo no app do seu banco (ou use o **PIX Copia e Cola**).\n"
+            "> 2️⃣ Envie o **comprovante** aqui neste canal.\n"
+            "> 3️⃣ Assim que o ADM conferir o recebimento no PIX dele, ele clicará em **Liberar Vaga / Confirmar**!"
+        ),
+        inline=False,
+    )
+
+    arquivo_qr = None
+    try:
+        arquivo_qr = discord.File(gerar_qr_url(payload), "pix_adm.png")
+        embed.set_image(url="attachment://pix_adm.png")
+    except Exception:
+        arquivo_qr = None
+
+    return embed, arquivo_qr, payload
+
+
+async def estornar_moedas_reserva_se_necessario(guild, slot_dict: dict, motivo: str) -> bool:
+    """Se o jogador tinha pago com moedas numa reserva que foi cancelada/recusada antes da aprovação, devolve as moedas."""
+    if not slot_dict or int(slot_dict.get("confirmado") or 0) == 1:
+        return False
+    if int(slot_dict.get("pago_moedas") or 0) != 1:
+        return False
+    valor_moedas = arredondar(slot_dict.get("valor_moedas") or 0)
+    if valor_moedas <= 0:
+        return False
+    comprador_id = int(slot_dict["comprador_id"])
+    guild_id = int(slot_dict["guild_id"])
+    slot_id = int(slot_dict["id"])
+    novo = await creditar_saldo(
+        comprador_id,
+        guild_id,
+        valor_moedas,
+        "estorno",
+        f"Estorno de moedas — {motivo} (reserva #{slot_id})",
+        ref=f"slot-estorno:{slot_id}",
+    )
+    if guild:
+        await registrar_log(
+            guild,
+            "↩️ ESTORNO MOEDAS",
+            "↩️ Moedas devolvidas (reserva não aprovada)",
+            f"{mencao(comprador_id)} recebeu de volta **{formatar_moeda(valor_moedas)}** na carteira pessoal.\n"
+            f"> 📝 Motivo: {motivo}\n> 💰 Saldo atual: `{formatar_moeda(novo)}`",
+            "Amarelo",
+        )
+    return True
+
+
 class PagamentoAcaoView(discord.ui.View):
-    """Botões da equipe. Nada de vaga e nada de acesso antes do ✅."""
+    """Botões da equipe e do jogador. A vaga só é liberada quando o ADM confirma."""
 
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Confirmar Pagamento", style=discord.ButtonStyle.green, emoji="✅", custom_id="ff_pagok")
+    @discord.ui.button(label="Liberar Vaga / Confirmar", style=discord.ButtonStyle.green, emoji="✅", custom_id="ff_pagok")
     async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._aprovar(interaction)
 
@@ -2283,7 +2825,7 @@ class PagamentoAcaoView(discord.ui.View):
                     )
                 if (not slot["assumido_por"] or slot["assumido_por"] != interaction.user.id) and not await e_gerencia(interaction.user):
                     return await interaction.response.send_message(
-                        embed=criar_embed("🔒 Só quem assumiu ou gerência", "Assuma este pagamento ou peça ao dono/gerente para confirmar.", "Vermelho"), ephemeral=True)
+                        embed=criar_embed("🔒 Só quem assumiu ou gerência", "Assuma este pagamento primeiro (para registrar o recebimento no seu PIX) ou peça ao dono/gerente.", "Vermelho"), ephemeral=True)
 
                 horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (slot["horario_id"],))).fetchone()
                 if not horario:
@@ -2301,7 +2843,7 @@ class PagamentoAcaoView(discord.ui.View):
                     return await interaction.response.send_message(
                         embed=criar_embed(
                             "❌ Sala lotada",
-                            f"A sala já está lotada ({total_vagas}/{total_vagas}).\nUse **Recusar** para liberar este pagamento.",
+                            f"A sala já está lotada ({total_vagas}/{total_vagas}).\nUse **Recusar / Cancelar** para encerrar esta reserva (se houve pagamento em moedas, elas serão estornadas automaticamente).",
                             "Vermelho"
                         ),
                         ephemeral=True
@@ -2312,38 +2854,36 @@ class PagamentoAcaoView(discord.ui.View):
                 await db.execute("UPDATE horarios SET lotes_usados = ? WHERE id = ?", (numero_final, slot["horario_id"]))
                 await db.commit()
 
-        # 🙋 ninguém assumiu? quem confirmou assume (e leva a comissão)
-        if not slot["assumido_por"]:
+        slot_dict = dict(slot)
+        slot_dict["numero"] = numero_final
+        if not slot_dict.get("assumido_por"):
             async with aiosqlite.connect(DATABASE_FILE) as db:
                 await db.execute("UPDATE slots SET assumido_por = ? WHERE id = ?",
-                                 (interaction.user.id, slot["id"]))
+                                 (interaction.user.id, slot_dict["id"]))
                 await db.commit()
-            slot = dict(slot)
-            slot["assumido_por"] = interaction.user.id
+            slot_dict["assumido_por"] = interaction.user.id
 
-        # 💰 receita no caixa + comissão de quem assumiu (carteira de trabalho) + logs
+        origem_aprovacao = "moedas_adm" if int(slot_dict.get("pago_moedas") or 0) == 1 else "staff"
         try:
-            await pos_aprovacao(interaction.guild, dict(slot), dict(horario),
-                                staff_id=slot["assumido_por"], origem="staff")
+            await pos_aprovacao(interaction.guild, slot_dict, dict(horario),
+                                staff_id=slot_dict["assumido_por"], origem=origem_aprovacao)
         except Exception as erro:
             print("Erro no pós-aprovação:", erro)
 
         rotulo = texto_slot(horario["tipo"])
 
-        # ---- só agora a vaga existe: cria o canal do diário (se for a 1ª venda),
-        #      libera o acesso do comprador e publica/atualiza a tabela ----
         try:
-            canal_tabela_id = await criar_canal_tabela(interaction.guild, slot["horario_id"])
+            canal_tabela_id = await criar_canal_tabela(interaction.guild, slot_dict["horario_id"])
         except Exception as erro:
             canal_tabela_id = None
             print("Erro ao criar canal do diário:", erro)
 
-        comprador = await membro_do_guild(interaction.guild, slot["comprador_id"])
+        comprador = await membro_do_guild(interaction.guild, slot_dict["comprador_id"])
         if comprador:
-            await add_jogador_canal_tabela(interaction.guild, slot["horario_id"], comprador)
+            await add_jogador_canal_tabela(interaction.guild, slot_dict["horario_id"], comprador)
 
         try:
-            await atualizar_tabela(interaction.guild, slot["horario_id"])
+            await atualizar_tabela(interaction.guild, slot_dict["horario_id"])
         except Exception as erro:
             print("Erro ao atualizar tabela:", erro)
         await rebuild_painel(interaction.guild, horario["painel_id"])
@@ -2356,12 +2896,20 @@ class PagamentoAcaoView(discord.ui.View):
         canal_tabela = interaction.guild.get_channel(canal_tabela_id) if canal_tabela_id else None
         acesso_txt = f"\n> 📊 Acompanhe no canal {canal_tabela.mention} — seu acesso já foi liberado!" if canal_tabela else ""
 
-        jogadores_do_slot = await _jogadores_do_slot(slot["id"])
+        jogadores_do_slot = await _jogadores_do_slot(slot_dict["id"])
         nicks_txt = ", ".join("`" + (j["ff_nome"] or "???") + "`" for j in jogadores_do_slot) or "`???`"
 
+        detalhe_pag = (
+            f"**Modalidade de pagamento:** Moedas (`{formatar_moeda(slot_dict.get('valor_moedas') or slot_dict['valor_cobrado'])}`) "
+            f"+ PIX ao ADM (`{formatar_moeda(slot_dict.get('taxa_adm_pix') or TAXA_MOEDAS_ADM_PIX)}`)\n"
+            if origem_aprovacao == "moedas_adm"
+            else f"**Modalidade de pagamento:** PIX direto ao ADM (`{formatar_moeda(slot_dict['valor_cobrado'])}`)\n"
+        )
+
         embed_sucesso = criar_embed(
-            titulo="✅ Pagamento Aprovado!",
-            descricao=f"**Aprovado por:** {interaction.user.mention}\n"
+            titulo="✅ Vaga Liberada e Pagamento Aprovado!",
+            descricao=f"**Liberado por:** {interaction.user.mention}\n"
+                      f"{detalhe_pag}"
                       f"**{rotulo}:** `#{numero_final}`\n"
                       f"**Jogador(es):** {nicks_txt}\n\n"
                       f"🔓 Vaga liberada e acesso concedido."
@@ -2371,21 +2919,19 @@ class PagamentoAcaoView(discord.ui.View):
             footer=f"Fire Force • {rotulo} #{numero_final}"
         )
         await interaction.response.send_message(
-            content=mencao(slot["comprador_id"]), embed=embed_sucesso
+            content=mencao(slot_dict["comprador_id"]), embed=embed_sucesso
         )
 
         try:
-            async for msg in interaction.channel.history(limit=6):
+            async for msg in interaction.channel.history(limit=10):
                 if msg.author == interaction.guild.me and msg.components:
                     await msg.edit(view=None)
-                    break
         except Exception:
             pass
 
-
     @discord.ui.button(label="Assumir", style=discord.ButtonStyle.gray, emoji="🙋", custom_id="ff_pagassumir")
     async def assumir_pagamento(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Primeiro staff que clicar assume o pagamento — e leva a comissão."""
+        """ADM assume o pagamento e exibe sua chave PIX + QR Code direto para o jogador."""
         if not await e_staff(interaction.user) or not await atendente_autorizado("mediador", interaction.user):
             return await interaction.response.send_message(
                 embed=criar_embed("❌ Sem Permissão", "Só mediador, gerente ou dono pode assumir pagamentos.", "Vermelho"), ephemeral=True)
@@ -2401,26 +2947,63 @@ class PagamentoAcaoView(discord.ui.View):
         if slot["assumido_por"] and slot["assumido_por"] != interaction.user.id:
             return await interaction.response.send_message(
                 embed=criar_embed("🙋 Já foi assumido",
-                                  f"{mencao(slot['assumido_por'])} está mediando este pagamento.", "Amarelo"),
+                                  f"{mencao(slot['assumido_por'])} já assumiu este pagamento.", "Amarelo"),
                 ephemeral=True)
+
+        pix_adm = await obter_pix_adm(interaction.user.id, interaction.guild.id)
+        if not pix_adm:
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "🏦 Cadastre sua chave PIX primeiro",
+                    "O pagamento do diário vai **direto para o seu PIX**.\n"
+                    "Selecione o tipo da sua chave abaixo (ou use `/pix`) e depois clique em **🙋 Assumir** novamente!",
+                    "Amarelo",
+                ),
+                view=PixAdmTipoView(),
+                ephemeral=True,
+            )
+
         async with aiosqlite.connect(DATABASE_FILE) as db:
             await db.execute("UPDATE slots SET assumido_por = ? WHERE id = ?", (interaction.user.id, slot["id"]))
             await db.commit()
         marcar_sujo()
-        await interaction.response.send_message(
-            embed=criar_embed("🙋 Pagamento assumido",
-                              f"{interaction.user.mention} assumiu este pagamento.\n"
-                              f"> 💸 A comissão de aprovação é dele.\n"
-                              f"> Confirme quando o PIX cair (ou deixe o bot detectar sozinho).", "Esmeralda"))
+
+        slot_dict = dict(slot)
+        pago_moedas = int(slot_dict.get("pago_moedas") or 0) == 1
+        valor_pix = (
+            arredondar(slot_dict.get("taxa_adm_pix") or TAXA_MOEDAS_ADM_PIX)
+            if pago_moedas
+            else arredondar(slot_dict["valor_cobrado"])
+        )
+        embed_pix, arquivo_qr, payload_pix = await montar_cobranca_pix_adm_embed(
+            adm_id=interaction.user.id,
+            comprador_id=slot_dict["comprador_id"],
+            pix_adm=pix_adm,
+            valor_pix=valor_pix,
+            slot_id=slot_dict["id"],
+            pago_moedas=pago_moedas,
+            valor_moedas=arredondar(slot_dict.get("valor_moedas") or slot_dict["valor_cobrado"]),
+        )
+        kwargs_envio = {
+            "content": mencao(slot_dict["comprador_id"]),
+            "embed": embed_pix,
+            "view": CopiarPixAdmView(payload_pix),
+        }
+        if arquivo_qr:
+            kwargs_envio["file"] = arquivo_qr
+        await interaction.response.send_message(**kwargs_envio)
+
         await registrar_log_suporte(
-            interaction.guild, "💳 PAGAMENTO", "🙋 Pagamento assumido",
-            f"{mencao(interaction.user.id)} assumiu o pagamento de {mencao(slot['comprador_id'])} "
-            f"(vaga reservada, `{formatar_moeda(slot['valor_cobrado'])}`).", "Verde")
+            interaction.guild, "💳 PAGAMENTO", "🙋 Pagamento assumido (PIX direto ADM)",
+            f"{mencao(interaction.user.id)} assumiu o pagamento de {mencao(slot_dict['comprador_id'])} "
+            f"(PIX ao ADM: `{formatar_moeda(valor_pix)}`"
+            + (f" • moedas já pagas: `{formatar_moeda(slot_dict.get('valor_moedas') or 0)}`" if pago_moedas else "")
+            + ").", "Verde")
 
     @discord.ui.button(label="Pedir comprovante", style=discord.ButtonStyle.gray, emoji="📄",
                        custom_id="ff_pagcomp")
     async def pedir_comprovante(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """2ª opção da equipe: em vez de confirmar no financeiro, pede o print do PIX pro pagador."""
+        """Solicita o comprovante do PIX enviado ao ADM."""
         if not await e_staff(interaction.user) or not await atendente_autorizado("mediador", interaction.user):
             return await interaction.response.send_message(
                 embed=criar_embed("❌ Sem Permissão", "Só mediador, gerente ou dono pode solicitar comprovante neste pagamento.", "Vermelho"), ephemeral=True)
@@ -2437,24 +3020,33 @@ class PagamentoAcaoView(discord.ui.View):
         if (not slot["assumido_por"] or slot["assumido_por"] != interaction.user.id) and not await e_gerencia(interaction.user):
             return await interaction.response.send_message(embed=criar_embed("🔒 Só quem assumiu ou gerência","Assuma este pagamento ou peça ao dono/gerente.","Vermelho"),ephemeral=True)
 
+        slot_dict = dict(slot)
+        pago_moedas = int(slot_dict.get("pago_moedas") or 0) == 1
+        valor_esperado = (
+            arredondar(slot_dict.get("taxa_adm_pix") or TAXA_MOEDAS_ADM_PIX)
+            if pago_moedas
+            else arredondar(slot_dict["valor_cobrado"])
+        )
+        aviso_extra = f"\n> 🪙 *(Inscrição paga com moedas — comprovante referente ao **+{formatar_moeda(valor_esperado)}** do ADM)*" if pago_moedas else ""
+
         embed = criar_embed(
             "📄 COMPROVANTE DO PIX",
-            f"{mencao(slot['comprador_id'])}, falta só uma coisa pra liberar sua vaga:\n\n"
-            f"> 📸 Mande **aqui neste canal** o **print do PIX** (com data, valor e quem pagou).\n"
-            f"> 💰 Valor esperado: `{formatar_moeda(slot['valor_cobrado'])}`\n\n"
-            f"🙋 **Equipe:** deu tudo certo no print? Use **✅ Confirmar Pagamento** aqui em cima.\n"
-            f"> ❌ Não bateu (valor, data ou nome)? Use **Recusar / Cancelar**.",
+            f"{mencao(slot_dict['comprador_id'])}, falta só uma coisa pra liberar sua vaga:\n\n"
+            f"> 📸 Mande **aqui neste canal** o **print do PIX** enviado ao ADM (com data, valor e destinatário).\n"
+            f"> 💰 Valor esperado no PIX: `{formatar_moeda(valor_esperado)}`{aviso_extra}\n\n"
+            f"🙋 **ADM:** conferiu o recebimento no seu PIX? Clique em **✅ Liberar Vaga / Confirmar**.\n"
+            f"> ❌ Não bateu? Use **Recusar / Cancelar**.",
             "Azul")
-        await interaction.response.send_message(content=mencao(slot["comprador_id"]), embed=embed,
-                                                view=ComprovanteAcaoView(slot["id"]))
+        await interaction.response.send_message(content=mencao(slot_dict["comprador_id"]), embed=embed,
+                                                view=ComprovanteAcaoView(slot_dict["id"]))
         await registrar_log_suporte(
             interaction.guild, "💳 PAGAMENTO", "📄 Comprovante solicitado",
-            f"{mencao(interaction.user.id)} pediu o comprovante para {mencao(slot['comprador_id'])} "
-            f"(`{formatar_moeda(slot['valor_cobrado'])}`).", "Azul")
+            f"{mencao(interaction.user.id)} pediu o comprovante para {mencao(slot_dict['comprador_id'])} "
+            f"(`{formatar_moeda(valor_esperado)}`).", "Azul")
 
-    @discord.ui.button(label="Pagar com saldo", style=discord.ButtonStyle.blurple, emoji="💰", custom_id="ff_pagarsaldo")
+    @discord.ui.button(label="Pagar com moedas", style=discord.ButtonStyle.blurple, emoji="🪙", custom_id="ff_pagarsaldo")
     async def pagar_com_saldo_botao(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """O próprio jogador paga a reserva com o saldo da carteira — vaga na hora."""
+        """O jogador debita o valor da vaga em moedas do bot e fica aguardando +R$ 1,00 via PIX ao ADM."""
         async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory = aiosqlite.Row
             slot = await (await db.execute(
@@ -2469,14 +3061,20 @@ class PagamentoAcaoView(discord.ui.View):
         if int(slot["comprador_id"]) != interaction.user.id:
             return await interaction.response.send_message(
                 embed=criar_embed("❌ Só o dono da reserva",
-                                  f"Quem paga com saldo é quem reservou: {mencao(slot['comprador_id'])}.", "Vermelho"),
+                                  f"Quem paga com moedas é quem reservou: {mencao(slot['comprador_id'])}.", "Vermelho"),
+                ephemeral=True
+            )
+        slot_dict = dict(slot)
+        if int(slot_dict.get("pago_moedas") or 0) == 1:
+            return await interaction.response.send_message(
+                embed=criar_embed("🪙 Moedas já debitadas", AVISO_MOEDAS_ADM_PIX, "Amarelo"),
                 ephemeral=True
             )
 
-        ok, mensagem, numero = await pagar_com_saldo(interaction.guild, slot["id"], interaction.user.id)
+        ok, mensagem, _ = await pagar_com_saldo(interaction.guild, slot_dict["id"], interaction.user.id)
         await interaction.response.send_message(
-            embed=criar_embed("✅ Pago com saldo" if ok else "❌ Não foi possível",
-                              mensagem, "Esmeralda" if ok else "Vermelho"),
+            embed=criar_embed("🪙 Pagamento em moedas registrado" if ok else "❌ Não foi possível",
+                              mensagem, "Dourado" if ok else "Vermelho"),
             ephemeral=True
         )
 
@@ -2488,6 +3086,7 @@ class PagamentoAcaoView(discord.ui.View):
         if not await aviso_fora_de_servico(interaction):
             return
 
+        slot_cancelado = None
         async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory = aiosqlite.Row
             slot = await (await db.execute(
@@ -2497,6 +3096,7 @@ class PagamentoAcaoView(discord.ui.View):
                 return await interaction.response.send_message(embed=criar_embed("🔒 Só quem assumiu ou gerência","Assuma este pagamento ou peça ao dono/gerente.","Vermelho"),ephemeral=True)
             horario = None
             if slot:
+                slot_cancelado = dict(slot)
                 if slot["cupom_id"]:
                     await db.execute("UPDATE cupons SET usos_atuais = usos_atuais - 1 WHERE id = ?", (slot["cupom_id"],))
                     await db.execute("UPDATE cupons_usados SET usos = usos - 1 WHERE cupom_id = ? AND user_id = ?",
@@ -2511,11 +3111,22 @@ class PagamentoAcaoView(discord.ui.View):
                     await db.execute("UPDATE horarios SET lotes_usados = ? WHERE id = ?", (confirmados, slot["horario_id"]))
                 await db.commit()
 
+        estornou = False
+        if slot_cancelado:
+            estornou = await estornar_moedas_reserva_se_necessario(
+                interaction.guild, slot_cancelado, f"reserva recusada por {interaction.user.display_name}"
+            )
+
         if horario:
             await rebuild_painel(interaction.guild, horario["painel_id"])
 
+        texto_cancel = (
+            "Reserva cancelada e as moedas utilizadas foram devolvidas à carteira do jogador. Este canal será excluído em 10s."
+            if estornou
+            else "Nada foi cobrado e a vaga continua livre. Este canal será excluído em 10s."
+        )
         await interaction.response.send_message(
-            embed=criar_embed("❌ Reserva Cancelada", "Nada foi cobrado e a vaga continua livre. Este canal será excluído em 10s.", "Vermelho Escuro")
+            embed=criar_embed("❌ Reserva Cancelada", texto_cancel, "Vermelho Escuro")
         )
         await asyncio.sleep(10)
         try:
@@ -2775,10 +3386,12 @@ class PainelAdminView(discord.ui.View):
 
     @discord.ui.button(label="Listar Tudo", style=discord.ButtonStyle.blurple, emoji="📋", row=1)
     async def listar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bloqueio_min = await obter_bloqueio_compra_min(interaction.guild.id)
         async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory = aiosqlite.Row
             horarios = await (await db.execute(
-                "SELECT h.*, p.tipo as pt, p.categoria as pc FROM horarios h JOIN paineis p ON h.painel_id = p.id WHERE h.guild_id = ? AND h.ativo = 1 ORDER BY h.horario",
+                "SELECT h.*, p.tipo as pt, p.categoria as pc, COALESCE(p.repetir_diario, 0) as rep "
+                "FROM horarios h JOIN paineis p ON h.painel_id = p.id WHERE h.guild_id = ? AND h.ativo = 1 ORDER BY h.horario",
                 (interaction.guild.id,)
             )).fetchall()
 
@@ -2788,16 +3401,27 @@ class PainelAdminView(discord.ui.View):
                 ephemeral=True
             )
 
-        embed = criar_embed("📋 Horários Ativos", "", "Fire Force")
+        embed = criar_embed(
+            "📋 Horários Ativos",
+            f"> ⏱️ **Bloqueio de compra atual:** `{bloqueio_min} min` antes do início",
+            "Fire Force",
+        )
         for h in horarios:
-            pode, _ = pode_comprar_vaga(h["horario"], h["lotes_usados"], LOTES_POR_MODO[h["pt"]])
-            icon = "🟢" if pode else "🔴"
+            h_dict = dict(h)
+            repetir = bool(h_dict.get("rep", 0))
+            pode, _ = pode_comprar_vaga(
+                h["horario"], h["lotes_usados"], LOTES_POR_MODO[h["pt"]],
+                bloqueio_min=bloqueio_min, repetir=repetir,
+                encerrado_hoje=bool(h_dict.get("encerrado_hoje", 0))
+            )
+            icon = "🟢" if pode else "🔒"
             rot = texto_slots_plural(h["pt"])
-            restantes = LOTES_POR_MODO[h["pt"]] - h["lotes_usados"]
+            restantes = max(0, LOTES_POR_MODO[h["pt"]] - h["lotes_usados"])
+            rep_txt = "🔄 Sim (todos os dias)" if repetir else "⏸️ Não"
 
             embed.add_field(
                 name=f"{icon} ID:{h['id']} — {formatar_rotulo_diario(h['pt'], h['pc'])} — {h['horario']}",
-                value=f"> Valor: `{formatar_moeda(h['valor'])}`\n"
+                value=f"> Valor: `{formatar_moeda(h['valor'])}` • Repetição: `{rep_txt}`\n"
                       f"> {rot}: `{restantes}` disponíveis\n"
                       f"> Premiação: `{h['premiacao']}`",
                 inline=False
@@ -2813,6 +3437,240 @@ class PainelAdminView(discord.ui.View):
                 ephemeral=True
             )
         await interaction.response.send_modal(AlterarPremiacaoModal())
+
+    @discord.ui.button(label="Repetição Diária", style=discord.ButtonStyle.green, emoji="🔄", row=1)
+    async def repeticao_diaria(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente.", "Vermelho"),
+                ephemeral=True
+            )
+
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            paineis = await (await db.execute(
+                "SELECT * FROM paineis WHERE guild_id = ? ORDER BY categoria, tipo",
+                (interaction.guild.id,)
+            )).fetchall()
+
+        if not paineis:
+            return await interaction.response.send_message(
+                embed=criar_embed("⚠️ Nenhum Painel", "Crie um painel com `/diario` antes de configurar a repetição diária.", "Amarelo"),
+                ephemeral=True
+            )
+
+        linhas_status = []
+        opcoes = []
+        for p in paineis:
+            p_dict = dict(p)
+            ativo_rep = bool(p_dict.get("repetir_diario", 0))
+            rot = formatar_rotulo_diario(p["tipo"], p["categoria"])
+            status_txt = "🔄 Repetindo todo dia" if ativo_rep else "⏸️ Desativada"
+            linhas_status.append(f"> {rot}: **{status_txt}**")
+            opcoes.append(discord.SelectOption(
+                label=f"{rot} ({'Ativa' if ativo_rep else 'Desativada'})"[:100],
+                value=str(p["id"]),
+                description="Clique para ativar ou desativar a repetição diária deste painel",
+                emoji="🔄" if ativo_rep else "⏸️"
+            ))
+
+        embed = criar_embed(
+            "🔄 Repetição Diária dos Painéis",
+            "Selecione abaixo o painel (**Premium** / **Básico**) para ativar ou desativar a repetição automática.\n"
+            "Quando ativada, todos os diários do painel se repetem automaticamente todos os dias nos mesmos horários!\n\n"
+            + "\n".join(linhas_status),
+            "Esmeralda"
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=RepeticaoPainelSelectView(opcoes),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Bloqueio de Compra", style=discord.ButtonStyle.blurple, emoji="⏱️", row=2)
+    async def bloqueio_compra(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente.", "Vermelho"),
+                ephemeral=True
+            )
+        atual = await obter_bloqueio_compra_min(interaction.guild.id)
+        await interaction.response.send_modal(ConfigurarBloqueioCompraModal(atual))
+
+
+class ConfigurarBloqueioCompraModal(discord.ui.Modal, title="⏱️ Regra de Bloqueio de Compra"):
+    minutos = discord.ui.TextInput(
+        label="Bloquear compra faltando quantos minutos?",
+        placeholder="Ex: 5, 10, 20",
+        max_length=4,
+        required=True,
+    )
+
+    def __init__(self, atual: int = BLOQUEIO_COMPRA_PADRAO_MIN):
+        super().__init__()
+        self.minutos.default = str(atual)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente.", "Vermelho"),
+                ephemeral=True,
+            )
+        try:
+            novo_min = int(self.minutos.value.strip())
+            if novo_min < 0 or novo_min > 720:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Valor inválido", "Informe um número inteiro de minutos entre `0` e `720` (ex: `5`, `10`, `20`).", "Vermelho"),
+                ephemeral=True,
+            )
+
+        await salvar_config(interaction.guild.id, bloqueio_compra_min=novo_min)
+        marcar_sujo()
+
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            paineis_rows = await (await db.execute(
+                "SELECT id FROM paineis WHERE guild_id = ?", (interaction.guild.id,)
+            )).fetchall()
+        for pr in paineis_rows:
+            try:
+                await rebuild_painel(interaction.guild, int(pr[0]))
+            except Exception:
+                pass
+
+        await registrar_log(
+            interaction.guild,
+            "⚙️ CONFIG",
+            "⏱️ Regra de bloqueio de compra atualizada",
+            f"Por {interaction.user.mention}: compras de diário agora bloqueiam faltando **{novo_min} minuto(s) ou menos** para o início.",
+            "Azul",
+        )
+        await interaction.response.send_message(
+            embed=criar_embed(
+                "✅ Bloqueio de Compra Atualizado",
+                f"Quando faltar **{novo_min} minuto(s) ou menos** para o início do diário:\n"
+                f"> 🔒 A compra será bloqueada automaticamente (o diário continua visível no painel, mas não clicável).\n"
+                f"> 👥 Jogadores que já compraram permanecem normalmente na fila/tabela de espera.\n"
+                f"> 🔄 Em painéis com repetição diária, a compra libera novamente no próximo dia!",
+                "Esmeralda",
+            ),
+            ephemeral=True,
+        )
+
+
+class RepeticaoAcaoPainelView(discord.ui.View):
+    def __init__(self, painel_id: int, rotulo: str, ativo_atual: bool):
+        super().__init__(timeout=180)
+        self.painel_id = int(painel_id)
+        self.rotulo = rotulo
+        self.ativo_atual = ativo_atual
+
+    async def _aplicar(self, interaction: discord.Interaction, ativar: bool):
+        if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente.", "Vermelho"),
+                ephemeral=True,
+            )
+        hoje = agora_brt().strftime("%Y-%m-%d")
+        agora = agora_brt()
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute(
+                "UPDATE paineis SET repetir_diario = ? WHERE id = ? AND guild_id = ?",
+                (1 if ativar else 0, self.painel_id, interaction.guild.id),
+            )
+            horarios = await (await db.execute(
+                "SELECT * FROM horarios WHERE painel_id = ? AND ativo = 1",
+                (self.painel_id,),
+            )).fetchall()
+            for h in horarios:
+                ja_passou = (horario_para_datetime(h["horario"]) - agora).total_seconds() < 0
+                if ativar:
+                    await db.execute(
+                        "UPDATE horarios SET data_ciclo = ?, encerrado_hoje = ? WHERE id = ?",
+                        (hoje, 1 if ja_passou else 0, h["id"]),
+                    )
+                else:
+                    if ja_passou or bool(dict(h).get("encerrado_hoje", 0)):
+                        await db.execute("UPDATE horarios SET ativo = 0 WHERE id = ?", (h["id"],))
+            await db.commit()
+        marcar_sujo()
+
+        await rebuild_painel(interaction.guild, self.painel_id)
+        await registrar_log(
+            interaction.guild,
+            "🔄 REPETIÇÃO DIÁRIA",
+            f"🔄 Repetição diária {'ativada' if ativar else 'desativada'}",
+            f"{interaction.user.mention} {'ativou' if ativar else 'desativou'} a repetição diária no painel **{self.rotulo}**.",
+            "Esmeralda" if ativar else "Amarelo",
+        )
+        await interaction.response.edit_message(
+            embed=criar_embed(
+                f"{'✅ Repetição Diária Ativada' if ativar else '⏸️ Repetição Diária Desativada'}",
+                f"Painel **{self.rotulo}** atualizado!\n\n"
+                + (
+                    "> 🔄 Todos os diários disponíveis neste painel agora se repetem automaticamente **todos os dias** nos mesmos horários.\n"
+                    "> 🔒 Quando faltar o tempo de bloqueio configurado (ou após iniciar), o horário fica visível porém bloqueado, liberando novamente no próximo dia."
+                    if ativar
+                    else "> ⏸️ Os horários deste painel não se repetirão automaticamente nos próximos dias."
+                ),
+                "Esmeralda" if ativar else "Amarelo",
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="Ativar Repetição Diária", style=discord.ButtonStyle.green, emoji="🔄")
+    async def btn_ativar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._aplicar(interaction, True)
+
+    @discord.ui.button(label="Desativar Repetição", style=discord.ButtonStyle.red, emoji="⏸️")
+    async def btn_desativar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._aplicar(interaction, False)
+
+
+class RepeticaoPainelSelect(discord.ui.Select):
+    def __init__(self, opcoes: list):
+        super().__init__(placeholder="Selecione o painel para configurar repetição...", options=opcoes[:25])
+
+    async def callback(self, interaction: discord.Interaction):
+        painel_id = int(self.values[0])
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            painel = await (await db.execute(
+                "SELECT * FROM paineis WHERE id = ? AND guild_id = ?",
+                (painel_id, interaction.guild.id),
+            )).fetchone()
+            horarios = await (await db.execute(
+                "SELECT horario, valor FROM horarios WHERE painel_id = ? AND ativo = 1 ORDER BY horario",
+                (painel_id,),
+            )).fetchall()
+        if not painel:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Erro", "Painel não encontrado.", "Vermelho"),
+                ephemeral=True,
+            )
+        p_dict = dict(painel)
+        ativo_atual = bool(p_dict.get("repetir_diario", 0))
+        rot = formatar_rotulo_diario(painel["tipo"], painel["categoria"])
+        lista_h = "\n".join(f"> • `{h['horario']}` — `{formatar_moeda(h['valor'])}`" for h in horarios[:15]) or "> *Nenhum horário ativo ainda.*"
+        embed = criar_embed(
+            f"🔄 Repetição Diária — {rot}",
+            f"**Status atual:** {'🟢 **ATIVA** (repete todo dia)' if ativo_atual else '⚪ **DESATIVADA**'}\n\n"
+            f"**Horários do painel:**\n{lista_h}\n\n"
+            f"Escolha abaixo se deseja ativar ou desativar a repetição diária para **{rot}**:",
+            "Azul",
+        )
+        await interaction.response.edit_message(
+            embed=embed,
+            view=RepeticaoAcaoPainelView(painel_id, rot, ativo_atual),
+        )
+
+
+class RepeticaoPainelSelectView(discord.ui.View):
+    def __init__(self, opcoes: list):
+        super().__init__(timeout=180)
+        self.add_item(RepeticaoPainelSelect(opcoes))
 
 
 class SelecionarPainelSelect(discord.ui.Select):
@@ -2847,7 +3705,10 @@ class AdicionarHorarioModal(discord.ui.Modal, title="➕ Adicionar Novo Horário
     async def on_submit(self, interaction: discord.Interaction):
         try:
             hp = self.horario.value.strip().split(":")
-            horario_fmt = f"{int(hp[0]):02d}:{int(hp[1]):02d}"
+            hr_i, mn_i = int(hp[0]), int(hp[1])
+            if not (0 <= hr_i <= 23 and 0 <= mn_i <= 59):
+                raise ValueError
+            horario_fmt = f"{hr_i:02d}:{mn_i:02d}"
             val = float(self.valor.value.replace(",", "."))
         except ValueError:
             return await interaction.response.send_message(
@@ -2855,13 +3716,10 @@ class AdicionarHorarioModal(discord.ui.Modal, title="➕ Adicionar Novo Horário
                 ephemeral=True
             )
 
-        if (horario_para_datetime(horario_fmt) - agora_brt()).total_seconds() < 600:
-            return await interaction.response.send_message(
-                embed=criar_embed("❌ Erro", "Não é possível cadastrar horários com menos de 10 minutos de antecedência.", "Vermelho"),
-                ephemeral=True
-            )
-
+        bloqueio_min = await obter_bloqueio_compra_min(interaction.guild.id)
         prem = self.premiacao.value.strip() or "Por Kill"
+        hoje_ciclo = agora_brt().strftime("%Y-%m-%d")
+        seg_restantes = (horario_para_datetime(horario_fmt) - agora_brt()).total_seconds()
 
         async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory = aiosqlite.Row
@@ -2872,15 +3730,31 @@ class AdicionarHorarioModal(discord.ui.Modal, title="➕ Adicionar Novo Horário
                     ephemeral=True
                 )
 
+            repetir_painel = bool(dict(painel).get("repetir_diario", 0))
+            if not repetir_painel and seg_restantes <= bloqueio_min * 60:
+                return await interaction.response.send_message(
+                    embed=criar_embed(
+                        "❌ Horário muito próximo ou já passou",
+                        f"Este painel está sem repetição diária e o bloqueio atual é de **{bloqueio_min} min** antes do início.\n"
+                        f"Ative a **🔄 Repetição Diária** em `/painel` ou cadastre um horário com mais de `{bloqueio_min}` min de antecedência.",
+                        "Vermelho"
+                    ),
+                    ephemeral=True
+                )
+
+            encerrado_hoje = 1 if (repetir_painel and seg_restantes < 0) else 0
             await db.execute(
-                "INSERT INTO horarios (guild_id, painel_id, tipo, categoria, horario, valor, premiacao, vagas_total) VALUES (?, ?, ?, ?, ?, ?, ?, 48)",
-                (interaction.guild.id, self.painel_id, painel["tipo"], painel["categoria"], horario_fmt, val, prem)
+                "INSERT INTO horarios (guild_id, painel_id, tipo, categoria, horario, valor, premiacao, vagas_total, data_ciclo, encerrado_hoje) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 48, ?, ?)",
+                (interaction.guild.id, self.painel_id, painel["tipo"], painel["categoria"], horario_fmt, val, prem, hoje_ciclo, encerrado_hoje)
             )
             await db.commit()
+        marcar_sujo()
 
         await rebuild_painel(interaction.guild, self.painel_id)
+        obs = "\n> 🔒 *(O horário já passou hoje e ficará bloqueado no painel até reabrir amanhã.)*" if encerrado_hoje else ""
         await interaction.response.send_message(
-            embed=criar_embed("✅ Horário Cadastrado", f"Horário `{horario_fmt}` adicionado no valor de `{formatar_moeda(val)}`!", "Esmeralda"),
+            embed=criar_embed("✅ Horário Cadastrado", f"Horário `{horario_fmt}` adicionado no valor de `{formatar_moeda(val)}`!{obs}", "Esmeralda"),
             ephemeral=True
         )
 
@@ -3218,7 +4092,24 @@ class SetupMainView(discord.ui.View):
             cats_str += f"> **{nome}:** {canal.mention if canal else '`Não definida`'}\n"
         embed.add_field(name="📂 Categorias", value=cats_str, inline=False)
 
+        bloq = await obter_bloqueio_compra_min(interaction.guild.id)
+        embed.add_field(
+            name="⏱️ Diários",
+            value=f"> **Bloqueio de compra:** `{bloq} min` antes do início",
+            inline=False,
+        )
+
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Bloqueio Diário", style=discord.ButtonStyle.green, emoji="⏱️", row=1)
+    async def bloqueio_diario_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.user.guild_permissions.administrator and not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas Dono, Gerente ou Administrador.", "Vermelho"),
+                ephemeral=True,
+            )
+        atual = await obter_bloqueio_compra_min(interaction.guild.id)
+        await interaction.response.send_modal(ConfigurarBloqueioCompraModal(atual))
 
     @discord.ui.button(label="Diagnóstico", style=discord.ButtonStyle.blurple, emoji="🩺", row=1)
     async def diagnostico(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3414,7 +4305,7 @@ async def enviar_sala(guild: discord.Guild, tipo: str, categoria: str, horario: 
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         horarios = await (await db.execute(
-            "SELECT * FROM horarios WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ?",
+            "SELECT * FROM horarios WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? AND ativo = 1",
             (guild.id, tipo, categoria, horario)
         )).fetchall()
 
@@ -3493,26 +4384,139 @@ RESERVA_MINUTOS = 30          # reserva sem pagamento confirmado expira nesse te
 LOOP_VERIFICACAO = 30         # de quanto em quanto tempo roda a checagem
 
 
+async def processar_repeticao_diaria() -> list[tuple[int, int]]:
+    """Vira o ciclo diário (após 00:00 BRT) nos painéis com Repetição Diária ativa.
+
+    Preserva o histórico de horários que tiveram jogadores confirmados (arquivando a
+    edição anterior como `ativo = 0`, sem apagar o canal privado da partida — que é
+    removido manualmente pelo Dono/Gerente) e libera uma nova edição limpa para hoje.
+    """
+    paineis_atualizar = set()
+    avisos_fechar = []
+    estornos = []
+    hoje = agora_brt().strftime("%Y-%m-%d")
+
+    async with _lock_repeticao_diaria:
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            linhas = await (await db.execute(
+                "SELECT h.*, COALESCE(p.repetir_diario, 0) AS repetir_diario "
+                "FROM horarios h JOIN paineis p ON h.painel_id = p.id "
+                "WHERE h.ativo = 1 AND COALESCE(p.repetir_diario, 0) = 1"
+            )).fetchall()
+
+            alterou = False
+            for row in linhas:
+                h = dict(row)
+                ciclo = (h.get("data_ciclo") or "").strip()
+                if not ciclo:
+                    await db.execute("UPDATE horarios SET data_ciclo = ? WHERE id = ?", (hoje, h["id"]))
+                    alterou = True
+                    continue
+                if ciclo >= hoje:
+                    continue
+
+                # Virada de dia! Cancela reservas não aprovadas que sobraram de ontem
+                pendentes = await (await db.execute(
+                    "SELECT * FROM slots WHERE horario_id = ? AND confirmado = 0", (h["id"],)
+                )).fetchall()
+                for p in pendentes:
+                    p_dict = dict(p)
+                    if int(p_dict.get("pago_moedas") or 0) == 1:
+                        estornos.append(p_dict)
+                    await db.execute("DELETE FROM slot_jogadores WHERE slot_id = ?", (p["id"],))
+                    await db.execute("DELETE FROM slots WHERE id = ?", (p["id"],))
+                    guild_p = bot.get_guild(int(p["guild_id"]))
+                    canal_p = guild_p.get_channel(int(p["canal_pag"])) if guild_p and p["canal_pag"] else None
+                    if canal_p:
+                        avisos_fechar.append((canal_p, "⌛ Reserva Encerrada", "O ciclo anterior deste diário encerrou."))
+
+                confirmadas = (await (await db.execute(
+                    "SELECT COUNT(*) FROM slots WHERE horario_id = ? AND confirmado = 1", (h["id"],)
+                )).fetchone())[0]
+
+                if confirmadas > 0 or h.get("canal_tabela"):
+                    await db.execute(
+                        "UPDATE horarios SET ativo = 0, lotes_usados = ? WHERE id = ?",
+                        (confirmadas, h["id"]),
+                    )
+                    ja_existe_hoje = await (await db.execute(
+                        "SELECT 1 FROM horarios WHERE painel_id = ? AND horario = ? AND ativo = 1 AND data_ciclo = ?",
+                        (h["painel_id"], h["horario"], hoje),
+                    )).fetchone()
+                    if not ja_existe_hoje:
+                        await db.execute(
+                            "INSERT INTO horarios (guild_id, painel_id, tipo, categoria, horario, valor, premiacao, "
+                            "vagas_total, lotes_usados, ativo, data_ciclo, encerrado_hoje) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 0)",
+                            (
+                                h["guild_id"], h["painel_id"], h["tipo"], h["categoria"],
+                                h["horario"], h["valor"], h["premiacao"], h.get("vagas_total") or 48, hoje,
+                            ),
+                        )
+                else:
+                    await db.execute(
+                        "UPDATE horarios SET data_ciclo = ?, lotes_usados = 0, encerrado_hoje = 0, "
+                        "sala_id = NULL, sala_senha = NULL, canal_tabela = NULL, msg_tabela = NULL "
+                        "WHERE id = ?",
+                        (hoje, h["id"]),
+                    )
+
+                paineis_atualizar.add((int(h["guild_id"]), int(h["painel_id"])))
+                alterou = True
+
+            # Descarta agendamentos de /ish não enviados de dias anteriores
+            cur_salas = await db.execute(
+                "UPDATE salas SET enviado = 1 WHERE enviado = 0 AND substr(COALESCE(criado_em, ''), 1, 10) < ?",
+                (hoje,),
+            )
+            if cur_salas.rowcount:
+                alterou = True
+
+            if alterou:
+                await db.commit()
+                marcar_sujo()
+
+    for p_dict in estornos:
+        guild_e = bot.get_guild(int(p_dict["guild_id"]))
+        await estornar_moedas_reserva_se_necessario(guild_e, p_dict, "virada do ciclo diário sem aprovação")
+
+    for canal, titulo, msg in avisos_fechar:
+        asyncio.create_task(_fechar_canal_reserva(canal, msg, titulo))
+
+    return list(paineis_atualizar)
+
+
 async def loop_expirar():
-    """Encerra diários que já passaram, cancela reservas sem pagamento e
-    fecha os canais de pagamento pendentes."""
+    """Encerra diários que já passaram, processa repetição diária, cancela reservas
+    sem pagamento e fecha os canais de pagamento pendentes."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
+            paineis_virada = await processar_repeticao_diaria()
             agora = agora_brt()
+            hoje = agora.strftime("%Y-%m-%d")
             avisos = []          # (canal, titulo, mensagem)
-            paineis_para_atualizar = []
+            estornos_moedas = []
+            paineis_para_atualizar = list(paineis_virada)
 
             async with aiosqlite.connect(DATABASE_FILE) as db:
                 db.row_factory = aiosqlite.Row
 
-                # ---------- 1) reservas pendentes antigas (pagamento não confirmado) ----------
+                # ---------- 1) reservas pendentes antigas (sem pagamento e sem moedas debitadas) ----------
                 limite = (agora - datetime.timedelta(minutes=RESERVA_MINUTOS)).isoformat()
                 pendentes_antigas = await (await db.execute(
-                    "SELECT * FROM slots WHERE confirmado = 0 AND criado_em < ?", (limite,)
+                    "SELECT * FROM slots WHERE confirmado = 0 AND COALESCE(pago_moedas, 0) = 0 AND criado_em < ?",
+                    (limite,),
                 )).fetchall()
 
                 for p in pendentes_antigas:
+                    if p["cupom_id"]:
+                        await db.execute("UPDATE cupons SET usos_atuais = MAX(0, usos_atuais - 1) WHERE id = ?", (p["cupom_id"],))
+                        await db.execute(
+                            "UPDATE cupons_usados SET usos = MAX(0, usos - 1) WHERE cupom_id = ? AND user_id = ?",
+                            (p["cupom_id"], p["comprador_id"]),
+                        )
                     await db.execute("DELETE FROM slot_jogadores WHERE slot_id = ?", (p["id"],))
                     await db.execute("DELETE FROM slots WHERE id = ?", (p["id"],))
                     guild = bot.get_guild(p["guild_id"])
@@ -3528,35 +4532,73 @@ async def loop_expirar():
                     await db.commit()
 
                 # ---------- 2) diários que já começaram ----------
-                horarios = await (await db.execute("SELECT * FROM horarios WHERE ativo = 1")).fetchall()
+                horarios = await (await db.execute(
+                    "SELECT h.*, COALESCE(p.repetir_diario, 0) AS repetir_diario "
+                    "FROM horarios h LEFT JOIN paineis p ON h.painel_id = p.id WHERE h.ativo = 1"
+                )).fetchall()
                 for h in horarios:
+                    h_dict = dict(h)
                     if (horario_para_datetime(h["horario"]) - agora).total_seconds() >= 0:
                         continue
 
-                    await db.execute("UPDATE horarios SET ativo = 0 WHERE id = ?", (h["id"],))
+                    repetir = bool(h_dict.get("repetir_diario", 0))
+                    if repetir and bool(h_dict.get("encerrado_hoje", 0)) and (h_dict.get("data_ciclo") == hoje):
+                        continue
 
                     pendentes = await (await db.execute(
                         "SELECT * FROM slots WHERE horario_id = ? AND confirmado = 0", (h["id"],)
                     )).fetchall()
                     for p in pendentes:
+                        p_dict = dict(p)
+                        if int(p_dict.get("pago_moedas") or 0) == 1:
+                            estornos_moedas.append(p_dict)
+                        if p["cupom_id"]:
+                            await db.execute("UPDATE cupons SET usos_atuais = MAX(0, usos_atuais - 1) WHERE id = ?", (p["cupom_id"],))
+                            await db.execute(
+                                "UPDATE cupons_usados SET usos = MAX(0, usos - 1) WHERE cupom_id = ? AND user_id = ?",
+                                (p["cupom_id"], p["comprador_id"]),
+                            )
                         await db.execute("DELETE FROM slot_jogadores WHERE slot_id = ?", (p["id"],))
                         await db.execute("DELETE FROM slots WHERE id = ?", (p["id"],))
                         guild = bot.get_guild(p["guild_id"])
                         canal = guild.get_channel(p["canal_pag"]) if guild and p["canal_pag"] else None
                         if canal:
-                            avisos.append((canal, "⌛ Reserva Encerrada",
-                                           "O diário já começou e esta reserva foi cancelada."))
+                            msg_canc = (
+                                "O diário já começou sem a liberação do ADM. Sua reserva foi encerrada e as moedas foram estornadas para sua carteira."
+                                if int(p_dict.get("pago_moedas") or 0) == 1
+                                else "O diário já começou e esta reserva foi cancelada."
+                            )
+                            avisos.append((canal, "⌛ Reserva Encerrada", msg_canc))
 
                     confirmadas = (await (await db.execute(
                         "SELECT COUNT(*) FROM slots WHERE horario_id = ? AND confirmado = 1", (h["id"],)
                     )).fetchone())[0]
-                    await db.execute("UPDATE horarios SET lotes_usados = ? WHERE id = ?", (confirmadas, h["id"]))
+
+                    if repetir:
+                        # Mantém ativo=1 para permanecer visível no painel até liberar amanhã!
+                        await db.execute(
+                            "UPDATE horarios SET encerrado_hoje = 1, data_ciclo = ?, lotes_usados = ? WHERE id = ?",
+                            (hoje, confirmadas, h["id"]),
+                        )
+                    else:
+                        await db.execute(
+                            "UPDATE horarios SET ativo = 0, lotes_usados = ? WHERE id = ?",
+                            (confirmadas, h["id"]),
+                        )
                     paineis_para_atualizar.append((h["guild_id"], h["painel_id"]))
 
                 await db.commit()
 
+            for p_dict in estornos_moedas:
+                guild_e = bot.get_guild(int(p_dict["guild_id"]))
+                await estornar_moedas_reserva_se_necessario(guild_e, p_dict, "diário iniciou antes da liberação")
+
             # ---------- ações fora do banco ----------
+            vistos_paineis = set()
             for guild_id, painel_id in paineis_para_atualizar:
+                if (guild_id, painel_id) in vistos_paineis:
+                    continue
+                vistos_paineis.add((guild_id, painel_id))
                 guild = bot.get_guild(guild_id)
                 if guild:
                     try:
@@ -3600,6 +4642,7 @@ async def loop_tabelas():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
+            await processar_repeticao_diaria()
             async with aiosqlite.connect(DATABASE_FILE) as db:
                 db.row_factory = aiosqlite.Row
                 horarios = await (await db.execute("SELECT * FROM horarios WHERE ativo = 1 AND canal_tabela IS NOT NULL AND canal_tabela > 0")).fetchall()
@@ -3866,6 +4909,11 @@ async def cmd_cupom(interaction: discord.Interaction, codigo: str):
                 embed=criar_embed("⚠️ Cupom Já Usado", "Você já aplicou um cupom neste pagamento.", "Amarelo"),
                 ephemeral=True
             )
+        if int(dict(slot).get("pago_moedas") or 0) == 1:
+            return await interaction.followup.send(
+                embed=criar_embed("⚠️ Pagamento já iniciado", "As moedas desta reserva já foram debitadas. Aplique cupons sempre antes de pagar.", "Amarelo"),
+                ephemeral=True
+            )
 
         cupom = await (await db.execute("SELECT * FROM cupons WHERE guild_id = ? AND codigo = ?", (interaction.guild.id, cod))).fetchone()
         if not cupom:
@@ -3929,15 +4977,7 @@ embed=criar_embed(
         await db.commit()
 
     canal_pag = interaction.guild.get_channel(slot["canal_pag"])
-    link = await link_pagamento(interaction.guild.id, novo_valor, tipo="diario", alvo_id=slot["id"],
-                               user_id=slot["comprador_id"], nick="",
-                               horario_id=slot["horario_id"], canal_id=slot["canal_pag"] or 0)
-    if canal_pag and link:
-        arquivo_qr = None
-        try:
-            arquivo_qr = discord.File(gerar_qr_url(link), "pagamento.png")
-        except Exception:
-            arquivo_qr = None
+    if canal_pag:
         try:
             async for msg in canal_pag.history(limit=10, oldest_first=True):
                 if msg.author == interaction.guild.me and msg.embeds:
@@ -3948,25 +4988,199 @@ embed=criar_embed(
                         value=f"> Código: `{cod}`\n> Desconto: `{str_desc}`\n> **Novo Valor Total: {formatar_moeda(novo_valor)}**",
                         inline=False
                     )
-
                     for idx, campo in enumerate(emb.fields):
-                        if "PIX via LivePix" in campo.name or "Chave PIX" in campo.name or "Copia e Cola" in campo.name:
-                            emb.set_field_at(idx, name="💳 PIX via LivePix",
-                                             value=f"> **Valor exato:** `{formatar_moeda(novo_valor)}`\n> **Link:** {link}",
-                                             inline=False)
-
-                    if arquivo_qr:
-                        emb.set_image(url="attachment://pagamento.png")
-                        await msg.edit(embed=emb, attachments=[arquivo_qr])
-                    else:
-                        await msg.edit(embed=emb)
+                        if "Pagamento via PIX" in campo.name:
+                            emb.set_field_at(
+                                idx,
+                                name="💳 Pagamento via PIX (direto para o ADM)",
+                                value=(
+                                    f"> **Valor com desconto:** `{formatar_moeda(novo_valor)}`\n"
+                                    f"> Aguarde o ADM clicar em **🙋 Assumir** (ou confira o novo QR Code abaixo)."
+                                ),
+                                inline=False,
+                            )
+                    await msg.edit(embed=emb)
                     break
+
+            # Se um ADM já assumiu o canal, reenvia o QR Code / Copia e Cola dele já com o valor atualizado
+            slot_dict = dict(slot)
+            if slot_dict.get("assumido_por") and novo_valor > 0:
+                pix_adm = await obter_pix_adm(slot_dict["assumido_por"], interaction.guild.id)
+                if pix_adm:
+                    emb_pix, arq_qr, payload_pix = await montar_cobranca_pix_adm_embed(
+                        adm_id=slot_dict["assumido_por"],
+                        comprador_id=slot_dict["comprador_id"],
+                        pix_adm=pix_adm,
+                        valor_pix=novo_valor,
+                        slot_id=slot_dict["id"],
+                        pago_moedas=False,
+                    )
+                    kwargs_pix = {
+                        "content": f"{mencao(slot_dict['comprador_id'])} 🎟️ Valor atualizado com cupom `{cod}`!",
+                        "embed": emb_pix,
+                        "view": CopiarPixAdmView(payload_pix),
+                    }
+                    if arq_qr:
+                        kwargs_pix["file"] = arq_qr
+                    await canal_pag.send(**kwargs_pix)
         except Exception as e:
             print("Erro ao atualizar o pagamento com desconto:", e)
 
     await interaction.followup.send(
         embed=criar_embed("🎟️ Desconto Aplicado", f"Cupom `{cod}` validado! Novo valor a pagar: **{formatar_moeda(novo_valor)}**.\nConfira os dados atualizados no seu canal de pagamento.", "Esmeralda"),
         ephemeral=True
+    )
+
+
+@bot.tree.command(name="pix", description="🏦 Cadastrar, ver ou remover sua chave PIX de ADM para receber os diários")
+@app_commands.guild_only()
+@app_commands.describe(
+    acao="O que você deseja fazer com sua chave PIX",
+    tipo="Tipo da chave PIX (ao cadastrar direto pelo comando)",
+    chave="Sua chave PIX (CPF, celular, e-mail ou aleatória)",
+    titular="Nome do titular da conta PIX",
+)
+@app_commands.choices(
+    acao=[
+        app_commands.Choice(name="Cadastrar / Atualizar minha chave PIX", value="cadastrar"),
+        app_commands.Choice(name="Ver minha chave PIX atual", value="ver"),
+        app_commands.Choice(name="Remover minha chave PIX", value="remover"),
+    ],
+    tipo=[
+        app_commands.Choice(name="CPF", value="cpf"),
+        app_commands.Choice(name="CNPJ", value="cnpj"),
+        app_commands.Choice(name="Celular / Telefone", value="telefone"),
+        app_commands.Choice(name="E-mail", value="email"),
+        app_commands.Choice(name="Chave Aleatória (EVP)", value="aleatoria"),
+    ],
+)
+async def cmd_pix(
+    interaction: discord.Interaction,
+    acao: Optional[app_commands.Choice[str]] = None,
+    tipo: Optional[app_commands.Choice[str]] = None,
+    chave: Optional[str] = None,
+    titular: Optional[str] = None,
+):
+    if not await e_staff(interaction.user):
+        return await interaction.response.send_message(
+            embed=criar_embed("❌ Sem Permissão", "Apenas ADMs (Mediador, Gerente ou Dono) usam `/pix` para recebimento direto dos diários.", "Vermelho"),
+            ephemeral=True,
+        )
+
+    escolha = acao.value if acao else ("cadastrar" if chave else "ver")
+    atual = await obter_pix_adm(interaction.user.id, interaction.guild.id)
+
+    if escolha == "remover":
+        removido = await remover_pix_adm(interaction.user.id, interaction.guild.id)
+        if not removido:
+            return await interaction.response.send_message(
+                embed=criar_embed("ℹ️ Nenhuma chave salva", "Você ainda não tinha chave PIX cadastrada.", "Amarelo"),
+                ephemeral=True,
+            )
+        await registrar_log(
+            interaction.guild, "🏦 PIX ADM", "🗑️ Chave PIX removida",
+            f"{interaction.user.mention} removeu sua chave PIX cadastrada.", "Amarelo",
+        )
+        return await interaction.response.send_message(
+            embed=criar_embed("✅ Chave Removida", "Sua chave PIX foi removida com sucesso.", "Esmeralda"),
+            ephemeral=True,
+        )
+
+    if escolha == "ver" and not chave:
+        if not atual:
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "🏦 Nenhuma chave PIX cadastrada",
+                    "Você ainda não cadastrou sua chave PIX para receber o pagamento integral dos diários.\n"
+                    "Selecione o tipo da chave abaixo para cadastrar agora!",
+                    "Amarelo",
+                ),
+                view=PixAdmTipoView(),
+                ephemeral=True,
+            )
+        chave_norm = normalizar_chave_pix_emv(atual.get("tipo") or "aleatoria", atual["chave"])
+        payload_teste = gerar_payload_pix(
+            chave_norm, atual.get("tipo") or "aleatoria", atual.get("titular") or "FIRE FORCE", valor=1.00
+        )
+        emb_ver = criar_embed(
+            "🏦 Sua Chave PIX de ADM",
+            f"> 👤 **Titular:** `{atual.get('titular') or 'Não informado'}`\n"
+            f"> 🔑 **Tipo:** `{(atual.get('tipo') or 'aleatoria').upper()}`\n"
+            f"> 📋 **Chave (DICT):** `{chave_norm}`\n\n"
+            f"**🧪 QR Code / Copia e Cola de teste (`R$ 1,00`):**\n"
+            f"```\n{payload_teste}\n```\n"
+            f"Para trocar de chave, selecione um tipo abaixo ou use `/pix acao:Cadastrar`.",
+            "Esmeralda",
+        )
+        arq_qr = None
+        try:
+            arq_qr = discord.File(gerar_qr_url(payload_teste), "teste_pix_adm.png")
+            emb_ver.set_image(url="attachment://teste_pix_adm.png")
+        except Exception:
+            arq_qr = None
+        kwargs_ver = {
+            "embed": emb_ver,
+            "view": PixAdmTipoView(chave_norm, atual.get("titular") or ""),
+            "ephemeral": True,
+        }
+        if arq_qr:
+            kwargs_ver["file"] = arq_qr
+        return await interaction.response.send_message(**kwargs_ver)
+
+    # Cadastrar / atualizar
+    if chave:
+        tipo_escolhido = tipo.value if tipo else ""
+        ok_pix, tipo_norm, chave_dict, erro_pix = validar_e_normalizar_chave_pix(tipo_escolhido, chave)
+        if not ok_pix:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Chave PIX inválida", erro_pix, "Vermelho"),
+                ephemeral=True,
+            )
+        titular_val = (titular or interaction.user.display_name).strip()
+        await salvar_pix_adm(interaction.user.id, interaction.guild.id, tipo_norm, chave_dict, titular_val)
+        await registrar_log(
+            interaction.guild,
+            "🏦 PIX ADM",
+            "🏦 Chave PIX de ADM atualizada",
+            f"{interaction.user.mention} configurou sua chave PIX para recebimento direto dos diários.\n"
+            f"> 🔑 Tipo: `{tipo_norm.upper()}` • Chave: `{mascarar_chave(chave_dict)}`\n"
+            f"> 👤 Titular: `{titular_val}`",
+            "Esmeralda",
+        )
+        payload_teste = gerar_payload_pix(chave_dict, tipo_norm, titular_val, valor=1.00)
+        emb_salva = criar_embed(
+            "✅ Chave PIX Salva e Validada!",
+            f"> 👤 **Titular:** `{titular_val}`\n"
+            f"> 🔑 **Tipo:** `{tipo_norm.upper()}`\n"
+            f"> 📋 **Chave (DICT):** `{chave_dict}`\n\n"
+            f"**🧪 QR Code / Copia e Cola de teste (`R$ 1,00`) — pode escanear no banco para conferir:**\n"
+            f"```\n{payload_teste}\n```",
+            "Esmeralda",
+        )
+        arq_qr = None
+        try:
+            arq_qr = discord.File(gerar_qr_url(payload_teste), "teste_pix_adm.png")
+            emb_salva.set_image(url="attachment://teste_pix_adm.png")
+        except Exception:
+            arq_qr = None
+        kwargs_salva = {"embed": emb_salva, "view": CopiarPixAdmView(payload_teste), "ephemeral": True}
+        if arq_qr:
+            kwargs_salva["file"] = arq_qr
+        return await interaction.response.send_message(**kwargs_salva)
+
+    if tipo:
+        return await interaction.response.send_modal(
+            PixAdmModal(tipo.value, (atual or {}).get("chave", ""), (atual or {}).get("titular", ""))
+        )
+
+    await interaction.response.send_message(
+        embed=criar_embed(
+            "🏦 Cadastrar / Atualizar Chave PIX",
+            "Escolha abaixo o tipo da sua chave PIX para abrir o formulário:",
+            "Azul",
+        ),
+        view=PixAdmTipoView((atual or {}).get("chave", ""), (atual or {}).get("titular", "")),
+        ephemeral=True,
     )
 
 
@@ -3996,7 +5210,7 @@ async def cmd_ish(interaction: discord.Interaction, tipo: app_commands.Choice[st
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         horario_db = await (await db.execute(
-            "SELECT 1 FROM horarios WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ?",
+            "SELECT 1 FROM horarios WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? AND ativo = 1",
             (interaction.guild.id, tipo.value, categoria.value, horario_fmt)
         )).fetchone()
 
@@ -4231,16 +5445,17 @@ async def cmd_help(interaction: discord.Interaction):
         value="> `/evento` — Criar/encerrar eventos com bônus por kills ou top (gerência)\n"
               "> `/painelranking` — Publicar o painel de rankings\n"
               "> `/vitoria` — Registrar vitória (top 1) de um jogador\n"
-              "> `/trabalho` — Carteira de trabalho da equipe (fechamento semanal)",
+              "> `/trabalho` — Carteira de trabalho do Suporte (fechamento semanal)\n"
+              "> `/pix` — Cadastrar chave PIX do ADM (recebimento integral direto)",
         inline=False
     )
     embed.add_field(
         name="🛠️ Gestão (equipe)",
         value="> `/addsaldo` — Ajuste confirmado; autoajuste só com cargo Dono/Gerente\n"
-              "> `/financeiro` — Caixa, reserva, fila e comissões (Dono/Gerente)\n"
+              "> `/financeiro` — Caixa, reserva, fila e log de recebimentos PIX dos ADMs\n"
               "> `/payout` — 💸 Fila com PIX (Dono/Gerente; painel em canal privado)\n"
               "> `/logs` — Configurar logs e o canal financeiro privado\n"
-              "> `/config` — LivePix, canais (cupons/eventos/rankings/logs), reserva, comissão\n"
+              "> `/config` — LivePix, bloqueio dinâmico de compra, canais e reserva\n"
               "> `/backup` • `/restaurar` • `/dados` — ☁️ Supabase (sobrevive ao restart)",
         inline=False
     )
@@ -4793,8 +6008,13 @@ async def link_pagamento(guild_id: int, valor: float, referencia: str = "", tipo
 
 
 def gerar_qr_url(url: str):
-    """QR Code (PNG) que aponta pro link de pagamento."""
-    qr = qrcode.QRCode(version=None, box_size=8, border=2)
+    """Gera QR Code (PNG) com margem ISO de 4 módulos e correção de erro M (leitura instantânea em bancos)."""
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=4,
+    )
     qr.add_data(url)
     qr.make(fit=True)
     imagem = qr.make_image(fill_color="black", back_color="white")
@@ -5094,64 +6314,99 @@ async def disponibilidade_saque(guild_id: int) -> dict:
 # ---------- APROVAÇÃO (usada pelo staff, pela carteira e pela LivePix) ----------
 
 async def pos_aprovacao(guild, slot, horario, staff_id: Optional[int] = None, origem: str = "staff"):
-    """Receita no caixa + comissão do ADM + logs. Chamado depois da vaga criada."""
-    valor = arredondar(slot.get("valor_cobrado") if isinstance(slot, dict) else slot["valor_cobrado"])
-    comprador = slot.get("comprador_id") if isinstance(slot, dict) else slot["comprador_id"]
-    numero = slot.get("numero") if isinstance(slot, dict) else slot["numero"]
-    tipo = horario.get("tipo") if isinstance(horario, dict) else horario["tipo"]
-    categoria = horario.get("categoria") if isinstance(horario, dict) else horario["categoria"]
-    hora = horario.get("horario") if isinstance(horario, dict) else horario["horario"]
-    horario_id = horario.get("id") if isinstance(horario, dict) else horario["id"]
+    """Registra o log de recebimentos do ADM (sem carteira de trabalho) e anuncia a aprovação."""
+    slot_dict = slot if isinstance(slot, dict) else dict(slot)
+    hor_dict = horario if isinstance(horario, dict) else dict(horario)
 
-    await registrar_caixa(guild.id, "receita", valor,
-                          f"Diário {texto_slot(tipo)} {categoria} {hora} — vaga #{numero}",
-                          ref=f"slot:{slot.get('id') if isinstance(slot, dict) else slot['id']}") \
-        if origem in ("staff", "livepix") else None
-    # Obs.: no pagamento com SALDO o dinheiro real já entrou no depósito —
-    # registrar receita de novo contaria duas vezes.
+    valor = arredondar(slot_dict.get("valor_cobrado") or 0)
+    comprador = slot_dict["comprador_id"]
+    numero = slot_dict["numero"]
+    slot_id = slot_dict["id"]
+    tipo = hor_dict["tipo"]
+    categoria = hor_dict["categoria"]
+    hora = hor_dict["horario"]
+    horario_id = hor_dict["id"]
 
-    if origem == "staff" and staff_id:
-        pct = await cfgv(guild.id, "comissao_pct", CARTEIRA_COMISSAO_PCT)
-        comissao = arredondar(valor * float(pct) / 100.0)
-        if comissao > 0:
-            # 💼 comissão do ADM cai na CARTEIRA DE TRABALHO (fechada no domingo)
-            await creditar_trabalho(staff_id, guild.id, comissao, "comissao",
-                                    f"Comissão {pct:.0f}% — vaga #{numero} {texto_slot(tipo)} {hora}",
-                                    ref=f"slot:{slot.get('id') if isinstance(slot, dict) else slot['id']}")
-            async with aiosqlite.connect(DATABASE_FILE) as db:
-                await db.execute(
-                    "INSERT INTO comissoes (guild_id, staff_id, slot_id, horario_id, valor_base, comissao, dia, criado_em) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (guild.id, staff_id, slot.get("id") if isinstance(slot, dict) else slot["id"], horario_id,
-                     valor, comissao, agora_brt().strftime("%Y-%m-%d"), agora_brt().isoformat())
-                )
-                await db.commit()
-            # Comissão da equipe vai somente ao canal privado do cargo (nunca ao log público).
+    pago_em_moedas = (origem == "moedas_adm") or (int(slot_dict.get("pago_moedas") or 0) == 1)
+    valor_moedas = arredondar(slot_dict.get("valor_moedas") or valor) if pago_em_moedas else 0.0
+    valor_pix_adm = (
+        arredondar(slot_dict.get("taxa_adm_pix") or TAXA_MOEDAS_ADM_PIX)
+        if pago_em_moedas
+        else valor
+    )
+
+    # Auditoria / Log de recebimentos do ADM (ADM não tem carteira de trabalho; recebe direto no seu PIX)
+    if staff_id and origem in ("staff", "moedas_adm"):
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute(
+                "INSERT INTO comissoes (guild_id, staff_id, slot_id, horario_id, valor_base, comissao, dia, criado_em) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    guild.id,
+                    staff_id,
+                    slot_id,
+                    horario_id,
+                    valor_pix_adm,
+                    valor_pix_adm,
+                    agora_brt().strftime("%Y-%m-%d"),
+                    agora_brt().isoformat(),
+                ),
+            )
+            await db.commit()
+        marcar_sujo()
+
+        if pago_em_moedas:
             await anunciar_pagamento_equipe(
-                guild, staff_id, "💸 Comissão creditada — vaga assumida",
-                f"{mencao(staff_id)} recebeu **{formatar_moeda(comissao)}** pelo pagamento de {mencao(comprador)}.\n"
+                guild,
+                staff_id,
+                "🪙 Recebimento PIX do ADM (Inscrição em Moedas)",
+                f"{mencao(staff_id)} liberou a vaga de {mencao(comprador)} paga com moedas do bot.\n"
                 f"> 🎮 Modo: `{texto_slot(tipo)}` • Categoria: `{categoria.title()}`\n"
                 f"> ⏰ Diário: `{hora}` • Vaga: `#{numero}`\n"
-                f"> 💰 Valor recebido do jogador: `{formatar_moeda(valor)}` • Comissão: **{pct:.0f}%**\n"
-                f"> 💼 Valor creditado na carteira de trabalho: `{formatar_moeda(comissao)}`",
-                "Verde")
+                f"> 🪙 Pago em moedas do bot: `{formatar_moeda(valor_moedas)}` *(fora do repasse — ADM não recebe)*\n"
+                f"> 🏦 **Recebido direto no PIX do ADM:** **`{formatar_moeda(valor_pix_adm)}`**",
+                "Dourado",
+            )
+        else:
+            await anunciar_pagamento_equipe(
+                guild,
+                staff_id,
+                "🏦 Recebimento PIX integral — ADM",
+                f"{mencao(staff_id)} confirmou o recebimento integral direto no PIX pelo pagamento de {mencao(comprador)}.\n"
+                f"> 🎮 Modo: `{texto_slot(tipo)}` • Categoria: `{categoria.title()}`\n"
+                f"> ⏰ Diário: `{hora}` • Vaga: `#{numero}`\n"
+                f"> 💰 **Valor integral recebido no PIX do ADM:** **`{formatar_moeda(valor_pix_adm)}`**",
+                "Esmeralda",
+            )
 
-    titulo_origem = {"staff": "Aprovação manual", "carteira": "Pagamento com saldo",
-                     "livepix": "Confirmação automática (LivePix)"}.get(origem, origem)
+    titulo_origem = {
+        "staff": "PIX direto ao ADM",
+        "moedas_adm": f"Moedas + {formatar_moeda(valor_pix_adm)} PIX ao ADM",
+        "carteira": "Pagamento com moedas",
+        "livepix": "Confirmação automática (LivePix)",
+    }.get(origem, origem)
+
+    resumo_valores_log = (
+        f"> 🪙 Moedas do bot: `{formatar_moeda(valor_moedas)}` *(fora do ADM)*\n"
+        f"> 🏦 PIX direto ao ADM ({mencao(staff_id) if staff_id else 'ADM'}): `{formatar_moeda(valor_pix_adm)}`"
+        if pago_em_moedas
+        else f"> 🏦 Valor integral recebido no PIX do ADM ({mencao(staff_id) if staff_id else 'ADM'}): `{formatar_moeda(valor_pix_adm)}`"
+    )
+
     await anunciar(
         guild, "pagamento", "🎮 Vaga liberada — pagamento confirmado",
         f"{mencao(comprador)} garantiu a vaga **#{numero}** no diário `{hora}`.\n"
         f"> 🎮 Modo: `{texto_slot(tipo)}` • Categoria: `{categoria.title()}`\n"
-        f"> 💰 Valor: `{formatar_moeda(valor)}` • ✅ confirmado ({titulo_origem})\n"
-        f"> 🧑‍⚖️ Fale com a equipe no ticket se precisar de algo.",
+        f"> 💰 Inscrição: `{formatar_moeda(valor)}` • ✅ confirmado ({titulo_origem})\n"
+        f"> 🧑‍⚖️ Liberado por: {mencao(staff_id) if staff_id else 'Equipe'}",
         "Esmeralda", marcar=comprador)
 
     await registrar_log(
-        guild, "✅ PAGAMENTO", "✅ Pagamento aprovado",
+        guild, "✅ PAGAMENTO", "✅ Recebimento confirmado e vaga liberada",
         f"**{titulo_origem}** — {mencao(comprador)}\n"
         f"> 🎮 Modo: `{texto_slot(tipo)}` • Categoria: `{categoria.title()}`\n"
         f"> ⏰ Diário: `{hora}` • Vaga: `#{numero}`\n"
-        f"> 💰 Valor: `{formatar_moeda(valor)}`",
+        f"{resumo_valores_log}",
         "Esmeralda"
     )
 
@@ -5231,35 +6486,103 @@ async def aprovar_pagamento(guild, slot_id: int, staff_id: Optional[int] = None,
 
 
 async def pagar_com_saldo(guild, slot_id: int, user_id: int):
-    """Paga a reserva com o saldo da carteira. Devolve (ok, mensagem, numero)."""
+    """Debita as moedas do bot (fora do repasse ao ADM) e solicita +R$ 1,00 via PIX ao ADM para aprovar a vaga."""
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         slot = await (await db.execute("SELECT * FROM slots WHERE id = ?", (slot_id,))).fetchone()
-    if not slot or slot["confirmado"]:
-        return False, "Esta reserva não está mais aberta.", None
-    if int(slot["comprador_id"]) != int(user_id):
-        return False, "Só o dono desta reserva pode pagar com saldo.", None
+        if not slot or slot["confirmado"]:
+            return False, "Esta reserva não está mais aberta.", None
+        slot_dict = dict(slot)
+        if int(slot_dict["comprador_id"]) != int(user_id):
+            return False, "Só o dono desta reserva pode pagar com moedas.", None
+        if int(slot_dict.get("pago_moedas") or 0) == 1:
+            return False, AVISO_MOEDAS_ADM_PIX, None
 
-    valor = arredondar(slot["valor_cobrado"])
-    novo = await debitar_saldo(user_id, guild.id, valor, "compra",
-                               f"Diário — vaga reservada (slot {slot_id})", ref=f"slot:{slot_id}")
-    if novo is None:
-        return False, f"Saldo insuficiente. Você tem {formatar_moeda(await saldo_carteira(user_id, guild.id))} e a vaga custa {formatar_moeda(valor)}.", None
+        horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (slot_dict["horario_id"],))).fetchone()
+        if not horario or not horario["ativo"]:
+            return False, "Este diário já foi encerrado.", None
+        if (horario_para_datetime(horario["horario"]) - agora_brt()).total_seconds() <= 0:
+            return False, "Este diário já começou.", None
 
-    resultado = await aprovar_pagamento(guild, slot_id, staff_id=None, origem="carteira")
-    if not resultado:
-        await creditar_saldo(user_id, guild.id, valor, "estorno", "Estorno — vaga indisponível", ref=f"slot:{slot_id}")
-        return False, "A sala estava lotada — o saldo foi devolvido.", None
+        confirmados = (await (await db.execute(
+            "SELECT COUNT(*) FROM slots WHERE horario_id = ? AND confirmado = 1", (slot_dict["horario_id"],)
+        )).fetchone())[0]
+        if confirmados >= LOTES_POR_MODO.get(horario["tipo"], 48):
+            return False, "A sala já está com todas as vagas confirmadas.", None
 
-    numero, horario = resultado
-    await registrar_log(
-        guild, "💰 CARTEIRA", "💰 Vaga paga com saldo da carteira",
-        f"{mencao(user_id)} pagou **{formatar_moeda(valor)}** com saldo.\n"
-        f"> 🎮 Modo: `{texto_slot(horario['tipo'])}` • Categoria: `{horario['categoria'].title()}`\n"
-        f"> ⏰ Diário: `{horario['horario']}` • Vaga: `#{numero}` • Saldo agora: `{formatar_moeda(novo)}`",
-        "Verde"
+    valor = arredondar(slot_dict["valor_cobrado"])
+    novo = await debitar_saldo(
+        user_id, guild.id, valor, "compra",
+        f"Diário pago em moedas — reserva #{slot_id}", ref=f"slot:{slot_id}"
     )
-    return True, f"Pagamento com saldo aprovado! Vaga **#{numero}** liberada.", numero
+    if novo is None:
+        saldo_atual = await saldo_carteira(user_id, guild.id)
+        return (
+            False,
+            f"Saldo de moedas insuficiente. Você tem {formatar_moeda(saldo_atual)} e a vaga custa {formatar_moeda(valor)}.",
+            None,
+        )
+
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cur = await db.execute(
+            "UPDATE slots SET pago_moedas = 1, valor_moedas = ?, taxa_adm_pix = ? "
+            "WHERE id = ? AND confirmado = 0 AND COALESCE(pago_moedas, 0) = 0",
+            (valor, TAXA_MOEDAS_ADM_PIX, slot_id),
+        )
+        await db.commit()
+        if cur.rowcount != 1:
+            await creditar_saldo(user_id, guild.id, valor, "estorno", "Estorno — reserva já processada", ref=f"slot:{slot_id}")
+            return False, "Esta reserva já foi processada; suas moedas não foram cobradas.", None
+    marcar_sujo()
+
+    canal_pag = guild.get_channel(int(slot_dict["canal_pag"])) if slot_dict.get("canal_pag") else None
+    if canal_pag:
+        try:
+            adm_id = slot_dict.get("assumido_por")
+            pix_adm = await obter_pix_adm(adm_id, guild.id) if adm_id else None
+            if adm_id and pix_adm:
+                emb_pix, arq_qr, payload_pix = await montar_cobranca_pix_adm_embed(
+                    adm_id=adm_id,
+                    comprador_id=user_id,
+                    pix_adm=pix_adm,
+                    valor_pix=TAXA_MOEDAS_ADM_PIX,
+                    slot_id=slot_id,
+                    pago_moedas=True,
+                    valor_moedas=valor,
+                )
+                kwargs_env = {
+                    "content": f"{mencao(user_id)} {mencao(adm_id)}",
+                    "embed": emb_pix,
+                    "view": CopiarPixAdmView(payload_pix),
+                }
+                if arq_qr:
+                    kwargs_env["file"] = arq_qr
+                await canal_pag.send(**kwargs_env)
+            else:
+                emb_aviso = criar_embed(
+                    "🪙 Pagamento com Moedas Registrado!",
+                    f"{mencao(user_id)}, {AVISO_MOEDAS_ADM_PIX}\n\n"
+                    f"> 🪙 **Moedas debitadas:** `{formatar_moeda(valor)}` *(saldo restante: `{formatar_moeda(novo)}`)*\n"
+                    f"> 💸 **Falta enviar ao ADM:** **`{formatar_moeda(TAXA_MOEDAS_ADM_PIX)}` via Pix**\n"
+                    f"> ⏳ Assim que um ADM clicar em **🙋 Assumir**, a chave PIX e o QR Code dele de "
+                    f"**`{formatar_moeda(TAXA_MOEDAS_ADM_PIX)}`** aparecerão aqui para ele liberar sua vaga!",
+                    "Dourado",
+                    footer="Fire Force • A vaga só é liberada após o ADM aprovar o PIX de R$ 1,00",
+                )
+                await canal_pag.send(content=mencao(user_id), embed=emb_aviso)
+        except Exception as erro:
+            _log_arquivo(f"[MOEDAS] aviso canal_pag: {erro}")
+
+    await registrar_log(
+        guild,
+        "🪙 MOEDAS",
+        "🪙 Vaga paga em moedas (aguardando +R$ 1,00 PIX ao ADM)",
+        f"{mencao(user_id)} debitou **{formatar_moeda(valor)}** em moedas do bot *(valor fica fora do repasse ao ADM)*.\n"
+        f"> 🎮 Modo: `{texto_slot(horario['tipo'])}` • Categoria: `{horario['categoria'].title()}` • `{horario['horario']}`\n"
+        f"> 💸 Aguardando envio de **`{formatar_moeda(TAXA_MOEDAS_ADM_PIX)}`** via PIX ao ADM e liberação da vaga.",
+        "Dourado",
+    )
+    return True, AVISO_MOEDAS_ADM_PIX, None
 
 
 # ---------- DEPÓSITO (LivePix) ----------
@@ -5395,9 +6718,9 @@ class SaqueModal(discord.ui.Modal, title="💸 Sacar — PIX"):
         chave = self.campo_chave.value.strip()
         titular = self.campo_titular.value.strip()
         de_trabalho = (self.tipo_carteira == "trabalho")
-        if de_trabalho and not await usuario_equipe_com_suporte(interaction.user):
+        if de_trabalho and not await tem_carteira_trabalho(interaction.user):
             return await interaction.followup.send(
-                embed=criar_embed("🔒 Carteira de trabalho", "A carteira de trabalho é exclusiva da equipe.", "Vermelho"),
+                embed=criar_embed("🔒 Carteira de trabalho", "A carteira de trabalho é exclusiva do cargo Suporte (ADM recebe direto no PIX).", "Vermelho"),
                 ephemeral=True)
 
         saldo = (await saldo_trabalho(interaction.user.id, interaction.guild.id) if de_trabalho
@@ -5420,8 +6743,8 @@ class SaqueModal(discord.ui.Modal, title="💸 Sacar — PIX"):
                 embed=criar_embed("❌ Saldo insuficiente",
                                   f"Você tem **{formatar_moeda(saldo)}** {onde} e pediu "
                                   f"**{formatar_moeda(valor)}**.\n\n"
-                                  + ("> 💼 O saque da equipe sai sempre da **carteira de trabalho** "
-                                     "(as comissões e o pagamento dos atendimentos)." if de_trabalho else
+                                  + ("> 💼 O saque do Suporte sai sempre da **carteira de trabalho** "
+                                     "(pagamento das avaliações de atendimento)." if de_trabalho else
                                      "> 💰 Use **Depositar PIX** na carteira ou `/transferir` pra completar o valor."),
                                   "Vermelho"), ephemeral=True)
 
@@ -6053,45 +7376,9 @@ async def casar_pagamentos_livepix(guild_id: int, limite: int = LIVEPIX_PAGAMENT
                     f"(assumido por {mencao(deposito['assumido_por'])}).", "Esmeralda")
             break
 
-    # ---------- 3) RESERVAS DE DIÁRIO (nome + valor) ----------
-    limite_sql = (agora_brt() - datetime.timedelta(minutes=janela_nome)).isoformat()
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        reservas = await (await db.execute(
-            "SELECT * FROM slots WHERE guild_id = ? AND confirmado = 0 AND criado_em >= ?", (guild_id, limite_sql)
-        )).fetchall()
-
-    for reserva in reservas:
-        valor = arredondar(reserva["valor_cobrado"])
-        try:
-            criado_reserva = datetime.datetime.fromisoformat(reserva["criado_em"])
-        except Exception:
-            criado_reserva = None
-        for evento in eventos:
-            if not valor_bate(evento["centavos"], valor):
-                continue
-            candidatos = nomes_candidatos(reserva, reserva["comprador_nome"])
-            if not any(nome_do_pagamento_bate(evento, alvo) for alvo in candidatos):
-                continue
-            # 🩺 na reconferência, o PIX tem que ter caído depois da reserva
-            if not pagamento_depois_do_pedido(evento, criado_reserva, folga_min):
-                continue
-            if await _ja_visto(evento["id"]):
-                continue
-            if guild:
-                aprovado = await aprovar_pagamento(guild, reserva["id"], staff_id=None, origem="livepix")
-                if aprovado:
-                    resultado["reservas"] += 1
-                    await registrar_log(
-                        guild, "✅ PAGAMENTO", "⚡ Pagamento detectado na LivePix",
-                        f"PIX de **{formatar_moeda(valor)}** ({evento['nome'] or 'pagador'}) "
-                        f"casou com a reserva de {mencao(reserva['comprador_id'])}.\n"
-                        f"> Vaga `#{aprovado[0]}` liberada automaticamente.", "Esmeralda")
-            break
-
-    # ---------- 4) VALOR EXATO COM UMA ÚNICA RESERVA ABERTA ----------
-    if guild:
-        await casar_por_valor_unico(guild_id, eventos, resultado)
+    # ---------- 3) RESERVAS DE DIÁRIO ----------
+    # Pagamentos de diários agora vão direto para o PIX do ADM (/pix), então a LivePix
+    # permanece dedicada exclusivamente aos depósitos e saques da carteira!
 
     # ---------- 5) RETIRADA DA LIVEPIX (dinheiro saiu da conta) ----------
     try:
@@ -6226,12 +7513,12 @@ async def montar_embed_carteira(alvo, guild_id: int, tipo_carteira: str = "pesso
     return embed
 
 async def mostrar_menu_carteira(interaction: discord.Interaction, editar: bool = False):
-    pode_trabalho = await usuario_equipe_com_suporte(interaction.user)
+    pode_trabalho = await tem_carteira_trabalho(interaction.user)
     embed = criar_embed(
         "💳 Sua carteira",
         "Escolha qual conta quer abrir. **Saldo e movimentações aparecem só para você.**\n\n"
         "> 💰 **Pessoal:** depósitos PIX, saques e movimentações do jogo.\n"
-        + ("> 💼 **Trabalho:** comissões, avaliações e saldo da equipe.\n" if pode_trabalho else "")
+        + ("> 💼 **Trabalho (Suporte):** avaliações e saldo semanal do suporte.\n" if pode_trabalho else "")
         + "\nUse o botão **Atualizar** dentro da carteira para consultar os dados mais recentes.",
         "Fire Force"
     )
@@ -6243,10 +7530,10 @@ async def mostrar_menu_carteira(interaction: discord.Interaction, editar: bool =
 
 
 async def mostrar_carteira(interaction: discord.Interaction, tipo_carteira: str, editar: bool = True):
-    if tipo_carteira == "trabalho" and not await usuario_equipe_com_suporte(interaction.user):
+    if tipo_carteira == "trabalho" and not await tem_carteira_trabalho(interaction.user):
         return await responder_ephemeral(
             interaction,
-            embed=criar_embed("🔒 Carteira exclusiva da equipe", "A carteira de trabalho está disponível apenas para a equipe.", "Vermelho")
+            embed=criar_embed("🔒 Carteira exclusiva do Suporte", "A carteira de trabalho está disponível apenas para o cargo Suporte (ADM recebe direto no seu PIX via `/pix`).", "Vermelho")
         )
     embed = await montar_embed_carteira(interaction.user, interaction.guild.id, tipo_carteira)
     view = CarteiraDetalheView(interaction.user.id, tipo_carteira)
@@ -6460,9 +7747,9 @@ class ConfirmarAjusteSaldoView(discord.ui.View):
             return await interaction.edit_original_response(
                 embed=criar_embed("❌ Ajuste cancelado", "O jogador não está mais no servidor ou é um bot.", "Vermelho"),
                 view=None)
-        if self.tipo_carteira == "trabalho" and not await usuario_equipe_com_suporte(alvo):
+        if self.tipo_carteira == "trabalho" and not await tem_carteira_trabalho(alvo):
             return await interaction.edit_original_response(
-                embed=criar_embed("❌ Ajuste cancelado", "A carteira de trabalho só pode ser atribuída a alguém da equipe.", "Vermelho"),
+                embed=criar_embed("❌ Ajuste cancelado", "A carteira de trabalho é exclusiva do cargo Suporte (ADM não possui carteira de trabalho).", "Vermelho"),
                 view=None)
 
         descricao_auditoria = f"{self.motivo} — por {interaction.user.display_name}"
@@ -6538,9 +7825,9 @@ async def cmd_addsaldo(interaction: discord.Interaction, usuario: discord.Member
             ephemeral=True)
 
     tipo_carteira = carteira.value if carteira else "pessoal"
-    if tipo_carteira == "trabalho" and not await usuario_equipe_com_suporte(usuario):
+    if tipo_carteira == "trabalho" and not await tem_carteira_trabalho(usuario):
         return await interaction.response.send_message(
-            embed=criar_embed("❌ Carteira de trabalho", "O ajuste de carteira de trabalho só pode ser feito para alguém da equipe.", "Vermelho"),
+            embed=criar_embed("❌ Carteira de trabalho", "A carteira de trabalho pertence apenas ao cargo Suporte (ADM recebe direto no PIX).", "Vermelho"),
             ephemeral=True)
 
     motivo_limpo = " ".join((motivo or "").split())
@@ -6639,10 +7926,10 @@ async def abrir_saque(interaction: discord.Interaction, tipo_carteira: str = "pe
 
     tipo_interno = "jogador"
     if tipo_carteira == "trabalho":
-        if not await usuario_equipe_com_suporte(interaction.user):
+        if not await tem_carteira_trabalho(interaction.user):
             return await responder_ephemeral(
                 interaction,
-                embed=criar_embed("🔒 Carteira exclusiva da equipe", "A carteira de trabalho está disponível apenas para a equipe.", "Vermelho")
+                embed=criar_embed("🔒 Carteira exclusiva do Suporte", "A carteira de trabalho está disponível apenas para o cargo Suporte (ADM recebe direto no PIX).", "Vermelho")
             )
         saldo_trab = await saldo_trabalho(interaction.user.id, interaction.guild.id)
         if saldo_trab <= 0:
@@ -6747,10 +8034,10 @@ async def cmd_financeiro(interaction: discord.Interaction):
             (interaction.guild.id,)
         )).fetchone()
 
-    linhas_adm = "> *Nenhuma comissão hoje.*"
+    linhas_adm = "> *Nenhum recebimento de ADM registrado hoje.*"
     if comissoes["por_adm"]:
         linhas_adm = "\n".join(
-            f"> {mencao(l['staff_id'])} — `{formatar_moeda(l['total'])}` ({l['qtd']} venda(s), base `{formatar_moeda(l['base'])}`)"
+            f"> {mencao(l['staff_id'])} — `{formatar_moeda(l['total'])}` ({l['qtd']} vaga(s) liberada(s))"
             for l in comissoes["por_adm"]
         )
 
@@ -6765,13 +8052,12 @@ async def cmd_financeiro(interaction: discord.Interaction):
     )
     embed.add_field(
         name="📅 Hoje",
-        value=f"> 🎮 Receita dos diários: `{formatar_moeda(resumo['dia_receitas'])}` ({resumo['dia_movimentos']} vaga(s))\n"
-              f"> ⬆️ Depósitos: `{formatar_moeda(depositos_dia['total'])}` ({depositos_dia['qtd']}x)\n"
-              f"> ⬇️ Saques pagos: `{formatar_moeda(saques_dia['total'])}` ({saques_dia['qtd']}x)\n"
-              f"> 💸 Comissões: `{formatar_moeda(comissoes['total'])}` ({comissoes['vendas']} venda(s))",
+        value=f"> 🏦 Recebido no PIX direto dos ADMs: `{formatar_moeda(comissoes['total'])}` ({comissoes['vendas']} vaga(s))\n"
+              f"> ⬆️ Depósitos na carteira: `{formatar_moeda(depositos_dia['total'])}` ({depositos_dia['qtd']}x)\n"
+              f"> ⬇️ Saques pagos: `{formatar_moeda(saques_dia['total'])}` ({saques_dia['qtd']}x)",
         inline=False
     )
-    embed.add_field(name="🏅 Comissões de hoje por ADM", value=linhas_adm, inline=False)
+    embed.add_field(name="🏅 Log de recebimentos PIX por ADM (hoje)", value=linhas_adm, inline=False)
     embed.add_field(
         name="👛 Carteiras",
         value=f"> Saldo total dos jogadores: `{formatar_moeda(carteiras['total'])}`\n"
@@ -6830,7 +8116,7 @@ async def cmd_logs(interaction: discord.Interaction, acao: app_commands.Choice[s
             ephemeral=True)
         await registrar_log(interaction.guild, "⚙️ CONFIG", "🧾 Canal de logs configurado",
                             f"Os registros passam a sair em {canal.mention}.\n"
-                            f"> Comandos: aprovações, comissões, depósitos, saques, transferências, ajustes.",
+                            f"> Eventos: aprovações, recebimentos PIX de ADM, pagamentos do suporte, depósitos, saques, transferências e ajustes.",
                             "Azul")
         return
 
@@ -6978,7 +8264,8 @@ async def cmd_saude(interaction: discord.Interaction):
         name="☁️ Supabase",
         value=(f"> {'✅ configurado' if supabase_configurado() else '❌ não configurado'}\n"
                f"> Backup completo: {_ha(_sync_ultimo)}\n"
-               f"> Tempo real (config/rankings): {_ha(_sql_ultimo)}"
+               f"> Tempo real (config/rankings): {_ha(_sql_ultimo)}\n"
+               f"> Keep-alive (a cada 2 dias): {await _ha_iso(await _meta_ler('ultimo_ping_supabase'))}"
                + (f"\n> ⚠️ Último erro: `{str(_sync_erro or _sql_erro)[:110]}`"
                   if (_sync_erro or _sql_erro) else "")),
         inline=False)
@@ -7003,20 +8290,20 @@ async def cmd_saude(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="config", description="⚙️ Ajustes financeiros, canais de log e rodízio da equipe")
+@bot.tree.command(name="config", description="⚙️ Ajustes financeiros, bloqueio de diário, canais de log e rodízio do suporte")
 @app_commands.guild_only()
 @app_commands.describe(link_livepix="Link fixo de pagamento da LivePix",
                        reserva="Reserva mínima protegida (padrão 200)",
-                       comissao="% de comissão do ADM (padrão 25)",
                        saque_min="Saque mínimo (padrão 5)",
                        deposito_min="Depósito mínimo (padrão 1)",
                        janela="Minutos da confirmação automática (padrão 5)",
+                       bloqueio_diario="Minutos antes do início para bloquear a compra do diário (ex: 5, 10, 20)",
                        canal_logs="Canal de logs geral (pagamentos, depósitos, saques)",
                        canal_logs_suporte="Canal de logs do atendimento (tickets e avaliações)",
                        canal_cupons="Canal que anuncia os cupons automaticamente",
                        canal_eventos="Canal que anuncia os eventos",
                        canal_rankings="Canal do painel de rankings",
-                       dia_fechamento="Dia do fechamento semanal da equipe")
+                       dia_fechamento="Dia do fechamento semanal do suporte")
 @app_commands.choices(dia_fechamento=[
     app_commands.Choice(name="Domingo (recomendado)", value=6),
     app_commands.Choice(name="Segunda", value=0),
@@ -7024,8 +8311,9 @@ async def cmd_saude(interaction: discord.Interaction):
 ])
 async def cmd_config(interaction: discord.Interaction,
                      link_livepix: Optional[str] = None, reserva: Optional[str] = None,
-                     comissao: Optional[str] = None, saque_min: Optional[str] = None,
+                     saque_min: Optional[str] = None,
                      deposito_min: Optional[str] = None, janela: Optional[int] = None,
+                     bloqueio_diario: Optional[int] = None,
                      canal_logs: Optional[discord.TextChannel] = None,
                      canal_logs_suporte: Optional[discord.TextChannel] = None,
                      canal_cupons: Optional[discord.TextChannel] = None,
@@ -7041,7 +8329,7 @@ async def cmd_config(interaction: discord.Interaction,
     if link_livepix is not None:
         novos["livepix_link"] = link_livepix.strip()
         mudancas.append(f"> 🔗 Link LivePix: `{link_livepix.strip()[:80]}`")
-    for nome_campo, valor, chave in (("Reserva", reserva, "reserva"), ("Comissão %", comissao, "comissao_pct"),
+    for nome_campo, valor, chave in (("Reserva", reserva, "reserva"),
                                      ("Saque mínimo", saque_min, "saque_min"),
                                      ("Depósito mínimo", deposito_min, "deposito_min")):
         if valor is None:
@@ -7055,6 +8343,9 @@ async def cmd_config(interaction: discord.Interaction,
     if janela is not None:
         novos["janela_min"] = max(1, min(int(janela), 60))
         mudancas.append(f"> ⏱️ Janela de confirmação: `{novos['janela_min']} min`")
+    if bloqueio_diario is not None:
+        novos["bloqueio_compra_min"] = max(0, min(int(bloqueio_diario), 720))
+        mudancas.append(f"> 🔒 Bloqueio de compra do diário: `{novos['bloqueio_compra_min']} min` antes do início")
     for nome_campo, canal, chave in (("Logs gerais", canal_logs, "canal_logs"),
                                      ("Logs do atendimento", canal_logs_suporte, "canal_logs_suporte"),
                                      ("Canal de cupons", canal_cupons, "canal_cupons"),
@@ -7076,20 +8367,21 @@ async def cmd_config(interaction: discord.Interaction,
             return f"<#{valor}>" if valor else "`não definido`"
 
         dias = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
+        bloq_atual = await obter_bloqueio_compra_min(interaction.guild.id)
         embed = criar_embed(
             "⚙️ Configuração atual",
             f"> 🔗 Link LivePix: `{cfg.get('livepix_link') or 'não definido'}`\n"
             f"> 🏦 Reserva: `{formatar_moeda(await cfgv(interaction.guild.id, 'reserva', CARTEIRA_RESERVA))}`\n"
-            f"> 💸 Comissão: `{await cfgv(interaction.guild.id, 'comissao_pct', CARTEIRA_COMISSAO_PCT)}%`\n"
             f"> 💸 Saque mínimo: `{formatar_moeda(await cfgv(interaction.guild.id, 'saque_min', CARTEIRA_SAQUE_MIN))}`\n"
             f"> 💰 Depósito mínimo: `{formatar_moeda(await cfgv(interaction.guild.id, 'deposito_min', CARTEIRA_DEPOSITO_MIN))}`\n"
-            f"> ⏱️ Janela de confirmação: `{await cfgv(interaction.guild.id, 'janela_min', CARTEIRA_JANELA_MIN)} min`\n"
+            f"> ⏱️ Janela de confirmação LivePix: `{await cfgv(interaction.guild.id, 'janela_min', CARTEIRA_JANELA_MIN)} min`\n"
+            f"> 🔒 Bloqueio de compra do diário: `{bloq_atual} min` antes do início\n"
             f"> 🧾 Logs gerais: {_canal(cfg.get('canal_logs'))}\n"
             f"> 🎧 Logs do atendimento: {_canal(cfg.get('canal_logs_suporte'))}\n"
             f"> 🎟️ Canal de cupons: {_canal(cfg.get('canal_cupons'))}\n"
             f"> 🎉 Canal de eventos: {_canal(cfg.get('canal_eventos'))}\n"
             f"> 🏆 Canal de rankings: {_canal(cfg.get('canal_rankings'))}\n"
-            f"> 📅 Fechamento da equipe: `{dias[int(await cfgv(interaction.guild.id, 'dia_fechamento', 0))]}` à meia-noite\n"
+            f"> 📅 Fechamento do suporte: `{dias[int(await cfgv(interaction.guild.id, 'dia_fechamento', 0))]}` à meia-noite\n"
             f"> 💳 LivePix API: `{'conectada' if livepix.configurado else 'sem credenciais (modo manual)'}`\n"
             f"> ☁️ Supabase: `{'conectado' if supabase_configurado() else 'não configurado'}`",
             "Azul")
@@ -7098,6 +8390,16 @@ async def cmd_config(interaction: discord.Interaction,
     if novos:
         await salvar_config(interaction.guild.id, **novos)
         marcar_sujo()
+        if "bloqueio_compra_min" in novos:
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                prs = await (await db.execute(
+                    "SELECT id FROM paineis WHERE guild_id = ?", (interaction.guild.id,)
+                )).fetchall()
+            for pr in prs:
+                try:
+                    await rebuild_painel(interaction.guild, int(pr[0]))
+                except Exception:
+                    pass
     await interaction.response.send_message(
         embed=criar_embed("⚙️ Config atualizada", "\n".join(mudancas + erros) or "> Nada mudou.", "Esmeralda"),
         ephemeral=True)
@@ -8017,20 +9319,18 @@ async def enviar_relatorio_diario(guild, dia: str):
 
     disp = await disponibilidade_saque(guild.id)
     linhas_adm = "\n".join(
-        f"> {mencao(l['staff_id'])} — `{formatar_moeda(l['total'])}` ({l['qtd']} venda(s))"
+        f"> {mencao(l['staff_id'])} — `{formatar_moeda(l['total'])}` ({l['qtd']} vaga(s) liberada(s))"
         for l in comissoes["por_adm"]
-    ) or "> *Nenhuma comissão hoje.*"
+    ) or "> *Nenhum recebimento de ADM registrado hoje.*"
 
     embed = criar_embed(
         f"📊 Relatório do dia — {dia[8:10]}/{dia[5:7]}",
-        f"**🎮 Receita dos diários:** `{formatar_moeda(resumo['dia_receitas'])}` "
-        f"({resumo['dia_movimentos']} vaga(s))\n"
+        f"**🏦 Recebido no PIX direto dos ADMs:** `{formatar_moeda(comissoes['total'])}` ({comissoes['vendas']} vaga(s))\n"
         f"**⬆️ Depósitos na carteira:** `{formatar_moeda(depositos['total'])}` ({depositos['qtd']}x)\n"
-        f"**⬇️ Saques pagos:** `{formatar_moeda(saques['total'])}` ({saques['qtd']}x)\n"
-        f"**💰 Comissões:** `{formatar_moeda(comissoes['total'])}` ({comissoes['vendas']} venda(s))",
+        f"**⬇️ Saques pagos:** `{formatar_moeda(saques['total'])}` ({saques['qtd']}x)",
         "Dourado"
     )
-    embed.add_field(name="🏅 Comissões por ADM", value=linhas_adm, inline=False)
+    embed.add_field(name="🏅 Log de recebimentos PIX por ADM", value=linhas_adm, inline=False)
     embed.add_field(
         name="🏦 Caixa",
         value=f"> Saldo da org: `{formatar_moeda(disp['saldo'])}` (fonte: {disp['fonte']})\n"
@@ -8515,8 +9815,67 @@ async def _banco_vazio() -> bool:
     return True
 
 
+async def ping_supabase_keepalive(forcar: bool = False) -> tuple[bool, str]:
+    """Envia sinal/ping ao Supabase a cada 2 dias para mantê-lo sempre ativo
+    e atualizar o carimbo de presença do bot (evitando status offline)."""
+    if not supabase_configurado():
+        return False, "Supabase não configurado"
+
+    agora = agora_brt()
+    ultimo_iso = await _meta_ler("ultimo_ping_supabase")
+    if not forcar and ultimo_iso:
+        try:
+            dt_ult = datetime.datetime.fromisoformat(ultimo_iso)
+            if dt_ult.tzinfo is None:
+                dt_ult = dt_ult.replace(tzinfo=TZ_BRASILIA)
+            if (agora - dt_ult).total_seconds() < SUPABASE_KEEPALIVE_SEGUNDOS:
+                return True, f"Keep-alive em dia ({ultimo_iso[:19]})"
+        except Exception:
+            pass
+
+    agora_iso = agora.isoformat()
+    await _meta_gravar("ultimo_ping_supabase", agora_iso)
+    await _meta_gravar("ultimo_pulso", agora_iso)
+
+    sessao = await _ff_sessao()
+    status_get, _ = await _supabase_req(
+        sessao,
+        "GET",
+        f"/rest/v1/{SUPABASE_TABELA}?id=eq.{SUPABASE_ID}&select=id,atualizado_em",
+    )
+    resultado_salvar = await salvar_estado()
+    await sincronizar_estruturado(silencioso=True)
+
+    # Garante presença online visível no Discord
+    try:
+        if bot.is_ready() and not bot.is_closed():
+            await bot.change_presence(
+                status=discord.Status.online,
+                activity=discord.Game(name="🔥 Fire Force • Diários FF"),
+            )
+    except Exception:
+        pass
+
+    ok = (200 <= int(status_get or 0) < 300) and not str(resultado_salvar).startswith("❌")
+    detalhe = f"HTTP {status_get} • {resultado_salvar}"
+    _log_arquivo(f"[SUPABASE KEEP-ALIVE] {'OK' if ok else 'AVISO'} — {detalhe}")
+    return ok, detalhe
+
+
+async def loop_supabase_keepalive():
+    """Job interno que verifica regularmente e garante o sinal ao Supabase a cada 2 dias."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            if supabase_configurado():
+                await ping_supabase_keepalive(forcar=False)
+        except Exception as erro:
+            _log_arquivo(f"[SUPABASE KEEP-ALIVE] erro: {erro}")
+        await asyncio.sleep(3600)  # checa de hora em hora e dispara ao completar 2 dias (48h)
+
+
 async def loop_sync():
-    """Envia sozinho: a cada SYNC_SEGUNDOS quando algo mudou.
+    """Envia sozinho: a cada SYNC_SEGUNDOS quando algo mudou (ou a cada 1h para manter pulso online).
 
     A restauração inicial acontece antes de registrar views, em _inicializar_bot;
     não repete a carga em segundo plano após os componentes já estarem ativos.
@@ -8525,11 +9884,13 @@ async def loop_sync():
     if supabase_configurado():
         try:
             print(f"  🧱 {await sincronizar_estruturado(silencioso=True)}")
+            await ping_supabase_keepalive(forcar=False)
         except Exception as erro:
             print(f"  🧱 Supabase: falha ao criar as estruturas ({erro})")
     while not bot.is_closed():
         try:
-            if supabase_configurado() and _sync_sujo:
+            precisa_pulso = bool(_sync_ultimo and (time.time() - _sync_ultimo >= 3600))
+            if supabase_configurado() and (_sync_sujo or precisa_pulso):
                 resultado = await salvar_estado()
                 if resultado.startswith("❌"):
                     _log_arquivo(f"[SYNC] {resultado}")
@@ -8612,10 +9973,27 @@ async def em_servico(user_id: int, guild_id: int) -> bool:
 
 
 async def usuario_equipe_com_suporte(member) -> bool:
-    """Inclui suporte e os cargos de ADM/mediador/gerência nos fluxos de equipe."""
+    """Inclui suporte e os cargos de ADM/mediador/gerência nos fluxos de serviço (/staff)."""
     if not getattr(member, "guild", None):
         return False
     return await e_staff(member) or await e_suporte(member)
+
+
+async def tem_carteira_trabalho(member) -> bool:
+    """Único cargo com carteira de trabalho: Suporte.
+    ADM (Mediador, Gerente, Dono ou Administrador) não possui carteira de trabalho e recebe direto no PIX."""
+    guild = getattr(member, "guild", None)
+    if not guild:
+        return False
+    cfg = await obter_config(guild.id)
+    cargo_sup = cfg.get("cargo_suporte")
+    if not cargo_sup:
+        return False
+    ids = {r.id for r in getattr(member, "roles", []) if r.id}
+    chefia = {int(cfg[k]) for k in ("cargo_dono", "cargo_gerente", "cargo_mediador") if cfg.get(k)}
+    if (chefia & ids) or (getattr(member, "guild_permissions", None) and member.guild_permissions.administrator):
+        return False
+    return int(cargo_sup) in ids
 
 
 async def usuario_staff_em_servico(member) -> bool:
@@ -8675,28 +10053,29 @@ async def canal_pagamento_equipe(guild, staff_id: int):
 
 async def anunciar_pagamento_equipe(guild, staff_id: int, titulo: str, descricao: str,
                                     cor: str = "Esmeralda") -> bool:
-    """Comprovante de pagamento da EQUIPE (privado): canal do suporte ou do ADM."""
+    """Log privado de recebimento/pagamento: canal do suporte (carteira) ou canal do ADM (PIX direto)."""
     try:
         canal, qual = await canal_pagamento_equipe(guild, staff_id)
         if not canal:
             return False
         rotulo = "🎧 SUPORTE" if qual == "suporte" else "🛡️ ADM"
-        extra=''
-        try:
-            async with aiosqlite.connect(DATABASE_FILE) as db:
-                db.row_factory = aiosqlite.Row
-                hoje=agora_brt().strftime('%Y-%m-%d')
-                dia=await (await db.execute("SELECT COUNT(*) n FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND substr(criado_em,1,10)=?",(guild.id,staff_id,hoje))).fetchone()
-                semana=(agora_brt()-datetime.timedelta(days=agora_brt().weekday())).replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
-                sem=await (await db.execute("SELECT COUNT(*) n, AVG(nota) media FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND criado_em>=?",(guild.id,staff_id,semana))).fetchone()
-            saldo=await saldo_trabalho(staff_id,guild.id)
-            extra=(f"\n\n> 🎫 Tickets avaliados hoje: **{dia['n'] or 0}**"
-                   f"\n> ⭐ Média desta semana: **{float(sem['media'] or 0):.2f}/5** ({sem['n'] or 0} avaliações)"
-                   f"\n> 💼 Total disponível na carteira: **{formatar_moeda(saldo)}**")
-        except Exception:
-            pass
-        embed = criar_embed(titulo, f"> 👤 **Cargo:** {rotulo}\n{descricao}{extra}", cor,
-                            footer="Fire Force • Pagamento da equipe")
+        extra = ""
+        if qual == "suporte":
+            try:
+                async with aiosqlite.connect(DATABASE_FILE) as db:
+                    db.row_factory = aiosqlite.Row
+                    hoje = agora_brt().strftime('%Y-%m-%d')
+                    dia = await (await db.execute("SELECT COUNT(*) n FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND substr(criado_em,1,10)=?", (guild.id, staff_id, hoje))).fetchone()
+                    semana = (agora_brt() - datetime.timedelta(days=agora_brt().weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                    sem = await (await db.execute("SELECT COUNT(*) n, AVG(nota) media FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND criado_em>=?", (guild.id, staff_id, semana))).fetchone()
+                saldo = await saldo_trabalho(staff_id, guild.id)
+                extra = (f"\n\n> 🎫 Tickets avaliados hoje: **{dia['n'] or 0}**"
+                         f"\n> ⭐ Média desta semana: **{float(sem['media'] or 0):.2f}/5** ({sem['n'] or 0} avaliações)"
+                         f"\n> 💼 Total disponível na carteira: **{formatar_moeda(saldo)}**")
+            except Exception:
+                pass
+        rodape = "Fire Force • Carteira de trabalho (Suporte)" if qual == "suporte" else "Fire Force • Log de recebimentos do ADM"
+        embed = criar_embed(titulo, f"> 👤 **Cargo:** {rotulo}\n{descricao}{extra}", cor, footer=rodape)
         await canal.send(embed=embed)
         return True
     except Exception as erro:
@@ -8763,33 +10142,24 @@ async def extrato_trabalho(user_id: int, guild_id: int, quantidade: int = 8) -> 
     )
 
 
-async def pagar_comissao(guild, staff_id: int, valor: float, descricao: str, ref: str = ""):
-    """Comissão do ADM/mediador vai pra CARTEIRA DE TRABALHO (fecha no domingo)."""
-    if not staff_id or valor <= 0:
-        return 0.0
-    await creditar_trabalho(staff_id, guild.id, valor, "comissao", descricao, ref=ref)
-    _log_arquivo(f"[COMISSÃO PRIVADA] {staff_id} recebeu {formatar_moeda(valor)} — {descricao}")
-    await anunciar_pagamento_equipe(
-        guild, staff_id, "💰 Comissão creditada — equipe",
-        f"{mencao(staff_id)} recebeu **{formatar_moeda(valor)}**.\n> {descricao}\n"
-        f"> 💼 Cai na **carteira de trabalho** (saque no domingo).", "Verde")
-    return valor
-
-
 async def avisar_abandono_saldo(guild) -> int:
-    """Domingo à noite: última chamada para quem ainda tem salário na carteira de trabalho."""
+    """Domingo à noite: última chamada para o Suporte que ainda tem salário na carteira de trabalho."""
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         contas = await (await db.execute(
             "SELECT * FROM carteira_trabalho WHERE guild_id = ? AND saldo > 0", (guild.id,)
         )).fetchall()
-    if not contas:
+    contas_validas = []
+    for c in contas:
+        membro = await membro_do_guild(guild, c["user_id"])
+        if membro and await tem_carteira_trabalho(membro):
+            contas_validas.append(c)
+    if not contas_validas:
         return 0
 
-    linhas = [f"> {mencao(c['user_id'])}: `{formatar_moeda(c['saldo'])}`" for c in contas]
+    linhas = [f"> {mencao(c['user_id'])}: `{formatar_moeda(c['saldo'])}`" for c in contas_validas]
     cfg = await obter_config(guild.id)
-    marcas = [f"<@&{cfg.get(k)}>" for k in ("cargo_suporte", "cargo_mediador", "cargo_gerente", "cargo_dono")
-              if cfg.get(k)]
+    marcas = [f"<@&{cfg.get('cargo_suporte')}>"] if cfg.get("cargo_suporte") else []
     canal_id = await canal_de_logs(guild.id)
     canal = guild.get_channel(int(canal_id)) if canal_id else None
     if canal:
@@ -8797,18 +10167,18 @@ async def avisar_abandono_saldo(guild) -> int:
             await canal.send(
                 content=" ".join(marcas)[:180],
                 embed=criar_embed(
-                    "⏰ ÚLTIMA CHAMADA — carteira de trabalho",
+                    "⏰ ÚLTIMA CHAMADA — carteira de trabalho (Suporte)",
                     "O prazo acaba **hoje**. Quem não pedir o saque até **01:00 (horário de Brasília)** "
                     "considera **abandono de saldo**: o valor vira da **Org** e sai da carteira.\n\n"
-                    "**Ainda com saldo:**\n" + "\n".join(linhas) +
+                    "**Suporte ainda com saldo:**\n" + "\n".join(linhas) +
                     "\n\n> 💸 Pedir saque: painel **Carteira** → **Carteira de trabalho** → **Solicitar saque**.", "Vermelho"))
         except Exception:
             pass
     await registrar_log(
-        guild, "⏰ PRAZO", "⏰ Última chamada para sacar o salário (equipe)",
+        guild, "⏰ PRAZO", "⏰ Última chamada para sacar o salário (Suporte)",
         "Prazo: até **01:00 (Brasília)**. Depois disso o saldo vira **abandono de saldo** (fica com a Org).\n"
         + "\n".join(linhas), "Vermelho")
-    return len(contas)
+    return len(contas_validas)
 
 
 async def reset_semanal_trabalho(guild) -> dict:
@@ -8866,6 +10236,9 @@ async def fechar_notas_semanais(guild, data_ref=None) -> int:
     processados=0
     for row in staffs:
         uid=int(row['atendente_id'])
+        membro_staff = await membro_do_guild(guild, uid)
+        if not membro_staff or not await tem_carteira_trabalho(membro_staff):
+            continue
         async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory=aiosqlite.Row
             ev=await (await db.execute(
@@ -9235,10 +10608,8 @@ async def reconciliar_referencias(guild_id: int, pagamentos: list, resultado: di
                             "Esmeralda")
                 confirmados += 1
             elif co["tipo"] == "diario":
-                if await confirmar_diario_por_referencia(guild, co, valor_pago, prova, resultado):
-                    confirmados += 1
-                else:
-                    confirmados += 1
+                # Diários não usam mais checkout LivePix (PIX vai direto ao ADM)
+                pass
             elif co["tipo"] == "saque":
                 pass
         except Exception as erro:
@@ -9824,7 +11195,9 @@ class TicketNotaDescModal(discord.ui.Modal, title="⭐ Finalizar atendimento"):
 
 async def finalizar_ticket(interaction, ticket_id: int, atendente_id: int, nota: float, descricao: str):
     valores = await nota_valores(interaction.guild.id)
-    valor = arredondar(valores.get(nota, 0.0))
+    membro_atendente = await membro_do_guild(interaction.guild, atendente_id)
+    atendente_tem_carteira = bool(membro_atendente and await tem_carteira_trabalho(membro_atendente))
+    valor = arredondar(valores.get(nota, 0.0)) if atendente_tem_carteira else 0.0
     descricao = (descricao or "").strip()
 
     async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -9846,19 +11219,24 @@ async def finalizar_ticket(interaction, ticket_id: int, atendente_id: int, nota:
         await db.commit()
     marcar_sujo()
 
-    if valor > 0:
+    if atendente_tem_carteira and valor > 0:
         await creditar_trabalho(atendente_id, interaction.guild.id, valor, "avaliacao",
                                 f"Avaliação {_emoji_nota(nota)} do atendimento #{ticket_id}",
                                 ref=f"ticket:{ticket_id}")
         await registrar_caixa(interaction.guild.id, "despesa", valor,
                               f"Pagamento de atendimento #{ticket_id} (nota {nota:g})", ref=f"ticket:{ticket_id}")
 
-    saldo_atendente = await saldo_trabalho(atendente_id, interaction.guild.id)
+    saldo_atendente = await saldo_trabalho(atendente_id, interaction.guild.id) if atendente_tem_carteira else 0.0
+    bloco_carteira_msg = (
+        f"> 💰 Valor para o suporte: `{formatar_moeda(valor)}`\n"
+        f"> 💼 Carteira de trabalho dele agora: `{formatar_moeda(saldo_atendente)}`\n"
+        if atendente_tem_carteira
+        else ""
+    )
     embed = criar_embed(
         "✅ Atendimento finalizado",
         f"**{mencao(interaction.user.id)}** avaliou com {_emoji_nota(nota)} **({nota:g} estrela{'s' if nota != 1 else ''})**.\n"
-        f"> 💰 Valor para o atendente: `{formatar_moeda(valor)}`\n"
-        f"> 💼 Carteira de trabalho dele agora: `{formatar_moeda(saldo_atendente)}`\n"
+        f"{bloco_carteira_msg}"
         + (f"> 📝 *{descricao[:200]}*" if descricao else "> 📝 *(sem descrição)*"),
         "Esmeralda")
     await interaction.response.send_message(embed=embed)
@@ -9869,24 +11247,28 @@ async def finalizar_ticket(interaction, ticket_id: int, atendente_id: int, nota:
         f"> 👤 Cliente: {mencao(interaction.user.id)}\n"
         f"> 🙋 Atendente: {mencao(atendente_id)}\n"
         f"> ⭐ Nota: **{nota:g}** ({_emoji_nota(nota)})\n"
-        f"> 💰 Pago ao atendente: `{formatar_moeda(valor)}`\n"
-        f"> 💼 Saldo de trabalho agora: `{formatar_moeda(saldo_atendente)}`\n"
-        f"> 📊 Nota acumulada da semana: será calculada no fechamento semanal, com base em todos os tickets avaliados.\n"
+        + (
+            f"> 💰 Pago ao suporte: `{formatar_moeda(valor)}`\n"
+            f"> 💼 Saldo de trabalho agora: `{formatar_moeda(saldo_atendente)}`\n"
+            if atendente_tem_carteira
+            else "> ℹ️ Atendente é ADM (sem carteira de trabalho; recebe direto no PIX nos diários).\n"
+        )
         + (f"> 📝 Descrição: {descricao[:300]}" if descricao else "> 📝 Sem descrição"),
         "Dourado")
-    # Cópia privada no canal de pagamentos do cargo: nota individual + saldo + tickets de hoje.
-    hoje=agora_brt().strftime('%Y-%m-%d')
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        qtd_dia=(await (await db.execute(
-            "SELECT COUNT(*) FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND substr(criado_em,1,10)=?",
-            (interaction.guild.id,atendente_id,hoje))).fetchone())[0]
-    await anunciar_pagamento_equipe(
-        interaction.guild,atendente_id,"⭐ Nota de atendimento registrada",
-        f"{mencao(atendente_id)} recebeu **{nota:g}/5 {_emoji_nota(nota)}** no ticket `#{ticket_id}`.\n"
-        f"> 💵 Ganho deste atendimento: `{formatar_moeda(valor)}`\n"
-        f"> 🎫 Tickets avaliados hoje: **{qtd_dia}**\n"
-        f"> 💼 Carteira de trabalho agora: `{formatar_moeda(saldo_atendente)}`\n"
-        f"> 📊 Nota geral é recalculada no fechamento semanal com todas as avaliações.","Dourado")
+
+    if atendente_tem_carteira:
+        hoje = agora_brt().strftime('%Y-%m-%d')
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            qtd_dia = (await (await db.execute(
+                "SELECT COUNT(*) FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND substr(criado_em,1,10)=?",
+                (interaction.guild.id, atendente_id, hoje))).fetchone())[0]
+        await anunciar_pagamento_equipe(
+            interaction.guild, atendente_id, "⭐ Nota de atendimento registrada",
+            f"{mencao(atendente_id)} recebeu **{nota:g}/5 {_emoji_nota(nota)}** no ticket `#{ticket_id}`.\n"
+            f"> 💵 Ganho deste atendimento: `{formatar_moeda(valor)}`\n"
+            f"> 🎫 Tickets avaliados hoje: **{qtd_dia}**\n"
+            f"> 💼 Carteira de trabalho agora: `{formatar_moeda(saldo_atendente)}`\n"
+            f"> 📊 Nota geral é recalculada no fechamento semanal com todas as avaliações.", "Dourado")
 
     try:
         await interaction.channel.send(embed=criar_embed(
@@ -10681,7 +12063,7 @@ RANKING_TITULOS = {
     "depositos": ("⬆️ Quem mais depositou", "total depositado", "depositos"),
     "ganhos": ("🎁 Quem mais ganhou (equipe dando saldo)", "total ganho", "ganhos"),
     "vitórias": ("🏆 Quem mais venceu (top 1)", "vitórias", "vitorias"),
-    "trabalho": ("💼 Carteira de trabalho (equipe)", "a receber no domingo", "trabalho"),
+    "trabalho": ("💼 Carteira de trabalho (Suporte)", "a receber no domingo", "trabalho"),
 }
 
 
@@ -10728,7 +12110,7 @@ class RankingView(discord.ui.View):
         discord.SelectOption(label="Mais depósitos",value="depositos",emoji="⬆️"),
         discord.SelectOption(label="Mais ganhos (saldo dado)",value="ganhos",emoji="🎁"),
         discord.SelectOption(label="Mais vitórias (top 1)",value="vitórias",emoji="🏆"),
-        discord.SelectOption(label="Carteira de trabalho (equipe)",value="trabalho",emoji="💼"),
+        discord.SelectOption(label="Carteira de trabalho (Suporte)",value="trabalho",emoji="💼"),
     ])
     async def selecionar(self,interaction:discord.Interaction,select:discord.ui.Select):
         categoria=select.values[0]
@@ -10755,7 +12137,7 @@ class RankingResultadoView(discord.ui.View):
         discord.SelectOption(label="Mais depósitos",value="depositos",emoji="⬆️"),
         discord.SelectOption(label="Mais ganhos (saldo dado)",value="ganhos",emoji="🎁"),
         discord.SelectOption(label="Mais vitórias (top 1)",value="vitórias",emoji="🏆"),
-        discord.SelectOption(label="Carteira de trabalho (equipe)",value="trabalho",emoji="💼"),
+        discord.SelectOption(label="Carteira de trabalho (Suporte)",value="trabalho",emoji="💼"),
     ])
     async def selecionar(self,interaction:discord.Interaction,select:discord.ui.Select):
         self.categoria=select.values[0]
@@ -11139,19 +12521,34 @@ async def cmd_vitoria(interaction: discord.Interaction, usuario: discord.Member,
 @app_commands.describe(usuario="Ver a de outra pessoa (gerência)")
 async def cmd_trabalho(interaction: discord.Interaction, usuario: Optional[discord.Member] = None):
     alvo = usuario or interaction.user
-    if alvo.id == interaction.user.id and not await usuario_equipe_com_suporte(interaction.user):
+    if alvo.id == interaction.user.id and not await tem_carteira_trabalho(interaction.user):
         return await interaction.response.send_message(
-            embed=criar_embed("🔒 Carteira exclusiva da equipe", "A carteira de trabalho está disponível apenas para a equipe.", "Vermelho"), ephemeral=True)
+            embed=criar_embed(
+                "🔒 Carteira exclusiva do Suporte",
+                "A carteira de trabalho agora pertence **apenas ao cargo Suporte**.\n"
+                "> 🏦 **ADM:** recebe o pagamento integral diretamente no seu PIX (use `/pix` para cadastrar sua chave).\n"
+                "> 👑 Se você for Dono/Gerente e quiser consultar um Suporte, use `/trabalho usuario:@suporte`.",
+                "Amarelo",
+            ),
+            ephemeral=True,
+        )
     if usuario and usuario.id != interaction.user.id and not await e_gerencia(interaction.user):
         return await interaction.response.send_message(
             embed=criar_embed("❌ Sem Permissão", "Você só pode ver a sua.", "Vermelho"), ephemeral=True)
+    if usuario and not await tem_carteira_trabalho(usuario):
+        return await interaction.response.send_message(
+            embed=criar_embed(
+                "ℹ️ Sem carteira de trabalho",
+                f"{usuario.mention} não pertence exclusivamente ao cargo **Suporte** (ADM não possui carteira de trabalho e recebe direto no PIX).",
+                "Amarelo",
+            ),
+            ephemeral=True,
+        )
 
     saldo = await saldo_trabalho(alvo.id, interaction.guild.id)
     extrato = await extrato_trabalho(alvo.id, interaction.guild.id, 10)
-    dia = int(await cfgv(interaction.guild.id, "dia_fechamento", 0))
-    dias = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
     embed = criar_embed(
-        f"💼 Carteira de trabalho — {alvo.display_name}",
+        f"💼 Carteira de trabalho (Suporte) — {alvo.display_name}",
         f"**A receber:** `{formatar_moeda(saldo)}`\n"
         f"**Fechamento:** domingo à noite; saque até segunda **01:00 BRT** (depois, saldo não sacado vira da Org)\n\n"
         f"**Últimos ganhos:**\n{extrato}",
@@ -11160,11 +12557,11 @@ async def cmd_trabalho(interaction: discord.Interaction, usuario: Optional[disco
         db.row_factory = aiosqlite.Row
         semana_inicio=(agora_brt()-datetime.timedelta(days=agora_brt().weekday())).replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
         stats=await (await db.execute("SELECT COUNT(*) n, AVG(nota) media FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND criado_em>=?",(interaction.guild.id,alvo.id,semana_inicio))).fetchone()
-    embed.add_field(name="📊 Seu desempenho nesta semana", value=f"> 🎫 Tickets avaliados: **{stats['n'] or 0}**\n> ⭐ Média geral: **{float(stats['media'] or 0):.2f}/5**" if stats['n'] else "> Ainda sem avaliações nesta semana.", inline=False)
+    embed.add_field(name="📊 Desempenho nesta semana", value=f"> 🎫 Tickets avaliados: **{stats['n'] or 0}**\n> ⭐ Média geral: **{float(stats['media'] or 0):.2f}/5**" if stats['n'] else "> Ainda sem avaliações nesta semana.", inline=False)
     embed.add_field(name="🧾 Como a nota semanal afeta o valor",
                     value="> Média 5★: **100%** • 4,50–4,99★: **95%** • 4,00–4,49★: **90%**\n"
                           "> 3,00–3,99★: **50%** • 2,00–2,99★: **25%** • abaixo de 2★: **0%**\n"
-                          "> Comissão de 25% + notas por atendimento ficam na carteira; saque no domingo até segunda 01:00 BRT.", inline=False)
+                          "> Notas por atendimento ficam na carteira do Suporte; saque no domingo até segunda 01:00 BRT.", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -11178,6 +12575,7 @@ def _iniciar_tarefas_background():
         "fila_pagamento": loop_fila_pagamento,
         "relatorios": loop_relatorio,
         "supabase": loop_sync,
+        "supabase_keepalive": loop_supabase_keepalive,
         "cupons": loop_cupons,
         "fechamento_semanal": loop_fechamento_semanal,
     }
@@ -11227,19 +12625,20 @@ async def _inicializar_bot():
             _log_arquivo(f"[RECONCILIAÇÃO] guild={guild.id}: {type(erro).__name__}: {erro}")
 
     bot.add_view(TicketPainelView())
-    # (os botões de controle DENTRO de cada ticket são restaurados logo abaixo,
-    #  um por ticket aberto, com TicketView(id) — não existe view sem id pra eles)
     bot.add_view(StaffPainelView())
     bot.add_view(PainelCarteiraView())
+
+    await processar_repeticao_diaria()
 
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         
-        paineis = await (await db.execute("SELECT DISTINCT painel_id FROM horarios WHERE ativo = 1")).fetchall()
+        paineis = await (await db.execute("SELECT id, guild_id FROM paineis")).fetchall()
         for p in paineis:
-            for guild in bot.guilds:
+            guild_p = bot.get_guild(int(p["guild_id"]))
+            if guild_p:
                 try:
-                    await rebuild_painel(guild, p["painel_id"])
+                    await rebuild_painel(guild_p, p["id"])
                 except Exception:
                     pass
 

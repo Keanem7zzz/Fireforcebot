@@ -1,0 +1,118 @@
+# ==============================================================================
+#  ☁️ SUPABASE KEEP-ALIVE - envia sinal/ping a cada 2 dias
+# ==============================================================================
+#  Mantém o projeto do Supabase sempre ativo (evitando pausa por inatividade)
+#  e atualiza o carimbo de atividade para que o bot não seja marcado como offline.
+#
+#  Roda sozinho a cada 2 dias às 06:00 UTC e também pode ser testado manualmente
+#  em: Actions > "Supabase Keep-Alive (2 dias)" > Run workflow.
+# ==============================================================================
+
+name: Supabase Keep-Alive (2 dias)
+
+on:
+  schedule:
+    - cron: "0 6 */2 * *"       # a cada 2 dias às 06:00 UTC
+  workflow_dispatch:            # botão para testar manualmente na hora
+
+jobs:
+  ping-supabase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 🔄 Enviar sinal/ping ao Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_ID: ${{ secrets.SUPABASE_ID }}
+          SUPABASE_TABELA: ${{ secrets.SUPABASE_TABELA }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timedelta, timezone
+
+          url = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+          key = (
+              os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+              or os.getenv("SUPABASE_KEY")
+              or os.getenv("SUPABASE_ANON_KEY")
+              or ""
+          ).strip()
+          sb_id = (os.getenv("SUPABASE_ID") or "principal").strip() or "principal"
+          tabela = (os.getenv("SUPABASE_TABELA") or "fireforce_estado").strip() or "fireforce_estado"
+
+          if not url or not key:
+              print("⚠️ Segredos SUPABASE_URL / SUPABASE_KEY não configurados no repositório. Pulando ping.")
+              sys.exit(0)
+
+          tz_brt = timezone(timedelta(hours=-3))
+          agora_iso = datetime.now(tz_brt).isoformat()
+
+          headers_base = {
+              "apikey": key,
+              "Authorization": f"Bearer {key}",
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+          }
+
+          def req(metodo: str, caminho: str, corpo=None, prefer: str = ""):
+              hdrs = dict(headers_base)
+              if prefer:
+                  hdrs["Prefer"] = prefer
+              dados = json.dumps(corpo).encode("utf-8") if corpo is not None else None
+              pedido = urllib.request.Request(f"{url}{caminho}", data=dados, headers=hdrs, method=metodo)
+              with urllib.request.urlopen(pedido, timeout=25) as resp:
+                  texto = resp.read().decode("utf-8", errors="replace")
+                  return resp.status, (json.loads(texto) if texto.strip() else [])
+
+          try:
+              id_q = urllib.parse.quote(sb_id, safe="")
+              status, linhas = req(
+                  "GET",
+                  f"/rest/v1/{tabela}?id=eq.{id_q}&select=id,atualizado_em,versao",
+              )
+              print(f"✅ Ping de leitura em {tabela} (HTTP {status}) — registros encontrados: {len(linhas)}")
+
+              if linhas:
+                  status_up, _ = req(
+                      "PATCH",
+                      f"/rest/v1/{tabela}?id=eq.{id_q}",
+                      corpo={"atualizado_em": agora_iso},
+                      prefer="return=minimal",
+                  )
+                  print(f"✅ Sinal de atividade atualizado em {tabela} (HTTP {status_up}) -> {agora_iso}")
+          except urllib.error.HTTPError as e:
+              detalhe = e.read().decode("utf-8", errors="replace")[:200]
+              print(f"❌ Erro HTTP ao enviar ping para {tabela}: {e.code} — {detalhe}")
+              sys.exit(1)
+          except Exception as e:
+              print(f"❌ Falha de conexão ao enviar ping ao Supabase: {type(e).__name__}: {e}")
+              sys.exit(1)
+
+          # Atualiza também ff_config (se a tabela estruturada existir) para manter status ativo
+          try:
+              st_cfg, cfgs = req("GET", "/rest/v1/ff_config?select=guild_id&limit=20")
+              if cfgs:
+                  for item in cfgs:
+                      gid = item.get("guild_id")
+                      if gid is not None:
+                          req(
+                              "PATCH",
+                              f"/rest/v1/ff_config?guild_id=eq.{int(gid)}",
+                              corpo={"atualizado_em": agora_iso},
+                              prefer="return=minimal",
+                          )
+                  print(f"✅ Tabela ff_config sinalizada para {len(cfgs)} servidor(es).")
+          except Exception as e:
+              print(f"ℹ️ Aviso opcional em ff_config (ignorado): {e}")
+
+          print("🔥 Keep-alive do Supabase concluído com sucesso!")
+          PY
