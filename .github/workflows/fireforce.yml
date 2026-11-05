@@ -112,10 +112,12 @@ jobs:
           else { Write-Host "O bot NAO subiu - veja o vigia.log nesta pasta." -ForegroundColor Red }
           '@ | Set-Content -Path (Join-Path $ws 'iniciar_bot.ps1') -Encoding UTF8
 
-          # ---- reiniciar (pra usar dentro do RDP) ------------------------------
+          # ---- reiniciar (pra usar dentro do RDP: puxa a ultima versao do GitHub e reinicia) --
           @'
           $ErrorActionPreference = "Continue"
           Set-Location -Path $PSScriptRoot
+          Write-Host "Atualizando codigo do repositorio (git pull)..." -ForegroundColor Cyan
+          git pull origin main
           Write-Host "Encerrando o bot atual (se estiver rodando)..."
           Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -like "*fireforce_bot.py*" } | Stop-Process -Force -ErrorAction SilentlyContinue
