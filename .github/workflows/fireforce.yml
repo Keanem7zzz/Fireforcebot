@@ -166,16 +166,17 @@ jobs:
       - name: 🔐 Criar o .env do bot (vindo dos Segredos)
         shell: pwsh
         env:
-          DISCORD_TOKEN:         ${{ secrets.DISCORD_TOKEN }}
-          SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY:     ${{ secrets.SUPABASE_ANON_KEY }}
-          SUPABASE_KEY:          ${{ secrets.SUPABASE_KEY }}
-          SUPABASE_ID:           ${{ secrets.SUPABASE_ID }}
-          LIVEPIX_CLIENT_ID:     ${{ secrets.LIVEPIX_CLIENT_ID }}
-          LIVEPIX_CLIENT_SECRET: ${{ secrets.LIVEPIX_CLIENT_SECRET }}
+          DISCORD_TOKEN:             ${{ secrets.DISCORD_TOKEN }}
+          SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_ANON_KEY:         ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_KEY:              ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_ID:               ${{ secrets.SUPABASE_ID }}
+          LIVEPIX_CLIENT_ID:         ${{ secrets.LIVEPIX_CLIENT_ID }}
+          LIVEPIX_CLIENT_SECRET:     ${{ secrets.LIVEPIX_CLIENT_SECRET }}
         run: |
           $linhas = @()
-          foreach ($k in @("DISCORD_TOKEN","SUPABASE_URL","SUPABASE_ANON_KEY","SUPABASE_KEY","SUPABASE_ID","LIVEPIX_CLIENT_ID","LIVEPIX_CLIENT_SECRET")) {
+          foreach ($k in @("DISCORD_TOKEN","SUPABASE_URL","SUPABASE_SERVICE_ROLE_KEY","SUPABASE_ANON_KEY","SUPABASE_KEY","SUPABASE_ID","LIVEPIX_CLIENT_ID","LIVEPIX_CLIENT_SECRET")) {
             $v = [Environment]::GetEnvironmentVariable($k)
             if ($v) { $linhas += "$k=$v" }
           }
