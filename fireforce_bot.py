@@ -1,15 +1,16 @@
 # ══════════════════════════════════════════════════════════════
-#  🔥 FIRE FORCE — BOT PREMIUM v11.3
+#  🔥 FIRE FORCE — BOT PREMIUM v11.4
 #  Liga de Diário Free Fire
 #
 #  • Consulta de ID do Free Fire confiável (corrida de provedores + regiões
 #    + cache de 24h + disjuntor) — seção 'CONSULTA DE ID FREE FIRE'
+#  • Inscrição obrigatória por ID numérico do Free Fire (puxa Nick e Level na API)
 #  • Tabela do diário em TEXTO: "1. (nick)" — sem imagem, sem contador
 #  • Vaga e acesso liberados depois do pagamento aprovado pelo ADM
 #  • CARTEIRA: painel privado, depósito/saque PIX via LivePix e moedas do bot
-#  • v11.3: Keep-Alive Supabase (2 dias), PIX direto ao ADM (/pix), carteira de
+#  • v11.4: Keep-Alive Supabase (2 dias), PIX direto ao ADM (/pix), carteira de
 #    trabalho exclusiva do Suporte, regra +R$ 1,00 PIX em moedas, Repetição
-#    Diária por painel e tempo dinâmico configurável de bloqueio de compra
+#    Diária por painel, tempo dinâmico configurável de bloqueio e ID FF obrigatório
 #
 #  pip install -r requirements.txt
 # ══════════════════════════════════════════════════════════════
@@ -81,7 +82,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "11.3"
+VERSAO_BOT = "11.4"
 TAXA_MOEDAS_ADM_PIX = 1.00
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
 SUPABASE_KEEPALIVE_SEGUNDOS = max(3600, int(os.getenv("SUPABASE_PING_HORAS", "48")) * 3600)
@@ -1421,17 +1422,17 @@ async def consultar_jogador_local(busca: str) -> dict:
         return {"ok": False}
 
     consulta = """
-        SELECT j.ff_nome, s.criado_em, s.numero, h.tipo, h.categoria, h.horario
+        SELECT j.ff_uid, j.ff_nome, j.ff_nivel, s.criado_em, s.numero, h.tipo, h.categoria, h.horario
         FROM slot_jogadores j
         JOIN slots s ON s.id = j.slot_id
         JOIN horarios h ON h.id = s.horario_id
         WHERE s.confirmado = 1
-          AND (LOWER(j.ff_nome) = LOWER(?) OR LOWER(j.ff_nome) LIKE LOWER(?))
+          AND (j.ff_uid = ? OR LOWER(j.ff_nome) = LOWER(?) OR LOWER(j.ff_nome) LIKE LOWER(?))
         ORDER BY s.criado_em DESC
     """
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
-        linhas = await (await db.execute(consulta, (busca, f"%{busca}%"))).fetchall()
+        linhas = await (await db.execute(consulta, (busca, busca, f"%{busca}%"))).fetchall()
 
         # nick do Free Fire costuma ter caracteres invisíveis: se a busca direta
         # falhar, compara o "nick limpo" de todas as inscrições do bot.
@@ -2245,11 +2246,12 @@ class PainelInscricaoView(discord.ui.View):
 # ==================== MODAL DE COMPRA DE SLOT ====================
 
 class ComprarSlotModal(discord.ui.Modal):
-    """Inscrição simples: só o NICK do jogo (sem API, sem ID, sem level).
+    """Inscrição obrigatória por ID numérico do Free Fire: valida na API oficial
+    (`verificar_ff`) e preenche automaticamente o Nome da conta e o Level.
 
     Importante: ao enviar, o bot cria apenas o canal de pagamento e uma
     RESERVA pendente. A vaga de verdade, o número do lote e o acesso ao canal
-    do diário só são liberados quando a equipe confirmar o pagamento."""
+    do diário só são liberados quando o ADM confirmar o pagamento."""
 
     def __init__(self, horario_id: int, tipo: str, jogadores_qtd: int, valor: float, horario_str: str, categoria: str):
         self.horario_id = horario_id
@@ -2265,9 +2267,10 @@ class ComprarSlotModal(discord.ui.Modal):
         self.campos_jogadores = []
         for indice in range(1, jogadores_qtd + 1):
             campo = discord.ui.TextInput(
-                label=f"Nick no Free Fire — Jogador {indice}" + (" (você)" if indice == 1 else ""),
-                placeholder="Ex: FF⚡REI",
-                max_length=28,
+                label=f"ID do Free Fire — Jogador {indice}" + (" (você)" if indice == 1 else ""),
+                placeholder="Ex: 158492031 (somente números do ID)",
+                min_length=5,
+                max_length=15,
                 required=True
             )
             self.add_item(campo)
@@ -2284,23 +2287,25 @@ class ComprarSlotModal(discord.ui.Modal):
                 ), ephemeral=True
             )
 
-        nicks = []
+        uids = []
         for indice, campo in enumerate(self.campos_jogadores, 1):
-            nick = " ".join((campo.value or "").split())
-            if len(nick) < 2:
+            uid = (campo.value or "").strip()
+            if not uid.isdigit() or not (5 <= len(uid) <= 15):
                 return await interaction.followup.send(
                     embed=criar_embed(
-                        "❌ Nick inválido",
-                        f"**Jogador {indice}:** escreva o nick como está no jogo.",
+                        "❌ Informe exatamente o ID do Free Fire",
+                        f"**Jogador {indice}:** você digitou `{uid[:30]}`.\n"
+                        f"É obrigatório colocar **exatamente o ID numérico** da conta no Free Fire "
+                        f"(apenas números, de 5 a 15 dígitos — **não** digite o nick!).",
                         "Vermelho"
                     ),
                     ephemeral=True
                 )
-            nicks.append(nick)
+            uids.append(uid)
 
-        if len({n.lower() for n in nicks}) != len(nicks):
+        if len(set(uids)) != len(uids):
             return await interaction.followup.send(
-                embed=criar_embed("❌ Nicks repetidos", "Cada jogador precisa ter um nick diferente.", "Vermelho"),
+                embed=criar_embed("❌ IDs repetidos", "Cada jogador precisa ter um ID do Free Fire diferente.", "Vermelho"),
                 ephemeral=True
             )
 
@@ -2324,6 +2329,23 @@ class ComprarSlotModal(discord.ui.Modal):
             ocupadas = (await (await db.execute(
                 "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (self.horario_id,)
             )).fetchone())[0]
+            placeholders_uid = ",".join("?" for _ in uids)
+            uid_repetido_sala = await (await db.execute(
+                f"SELECT j.ff_uid, j.ff_nome FROM slot_jogadores j "
+                f"JOIN slots s ON s.id = j.slot_id "
+                f"WHERE s.horario_id = ? AND j.ff_uid IN ({placeholders_uid}) LIMIT 1",
+                (self.horario_id, *uids),
+            )).fetchone()
+
+        if uid_repetido_sala:
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "⚠️ ID já inscrito neste horário",
+                    f"O ID `{uid_repetido_sala['ff_uid']}` (`{uid_repetido_sala['ff_nome']}`) já está registrado neste diário.",
+                    "Amarelo",
+                ),
+                ephemeral=True,
+            )
 
         bloqueio_min = await obter_bloqueio_compra_min(interaction.guild.id)
         repetir_painel = bool(painel_info["repetir_diario"]) if painel_info and painel_info["repetir_diario"] else False
@@ -2339,6 +2361,31 @@ class ComprarSlotModal(discord.ui.Modal):
                 embed=criar_embed("🔒 Compra bloqueada", motivo, "Vermelho"),
                 ephemeral=True
             )
+
+        # ---- Consulta automática na API do Free Fire (em paralelo para todos os jogadores) ----
+        resultados_ff = await asyncio.gather(*(verificar_ff(uid) for uid in uids))
+        jogadores_validados = []
+        for indice, (uid, res) in enumerate(zip(uids, resultados_ff), 1):
+            if not res.get("ok"):
+                return await interaction.followup.send(
+                    embed=criar_embed(
+                        "❌ ID não validado no Free Fire",
+                        f"**Jogador {indice} (ID `{uid}`):** {res.get('mensagem', 'Não foi possível validar esse ID.')}",
+                        "Vermelho",
+                    ),
+                    ephemeral=True,
+                )
+            nome_conta = str(res.get("nome") or uid).strip()
+            nivel_conta = int(res.get("nivel") or 0)
+            regiao_conta = str(res.get("regiao") or "BR").strip()
+            jogadores_validados.append({
+                "uid": uid,
+                "nome": nome_conta,
+                "nivel": nivel_conta,
+                "regiao": regiao_conta,
+            })
+
+        nicks = [j["nome"] for j in jogadores_validados]
 
         if await usuario_staff_em_servico(interaction.user):
             return await interaction.followup.send(
@@ -2372,7 +2419,7 @@ class ComprarSlotModal(discord.ui.Modal):
 
         rotulo = texto_slot(self.tipo)
 
-        # ---- registro atômico da RESERVA: revalida horário, lote e duplicidade ----
+        # ---- registro atômico da RESERVA: revalida horário, lote, IDs e duplicidade ----
         async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
@@ -2402,6 +2449,13 @@ class ComprarSlotModal(discord.ui.Modal):
                 "SELECT 1 FROM slots WHERE horario_id = ? AND comprador_id = ? LIMIT 1",
                 (self.horario_id, interaction.user.id)
             )).fetchone()
+            placeholders_uid = ",".join("?" for _ in uids)
+            uid_duplicado_tx = await (await db.execute(
+                f"SELECT j.ff_uid FROM slot_jogadores j "
+                f"JOIN slots s ON s.id = j.slot_id "
+                f"WHERE s.horario_id = ? AND j.ff_uid IN ({placeholders_uid}) LIMIT 1",
+                (self.horario_id, *uids),
+            )).fetchone()
             ocupadas_atual = (await (await db.execute(
                 "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (self.horario_id,)
             )).fetchone())[0]
@@ -2411,14 +2465,18 @@ class ComprarSlotModal(discord.ui.Modal):
                 bloqueio_min=bloqueio_min, repetir=repetir_painel,
                 encerrado_hoje=bool(h_atual_dict.get("encerrado_hoje", 0))
             ) if horario_atual else (False, "Este diário foi arquivado ou encerrado."))
-            if not horario_atual or duplicada or not pode_atual:
+            if not horario_atual or duplicada or uid_duplicado_tx or not pode_atual:
                 await db.rollback()
                 try:
                     await canal_pagamento.delete(reason="Reserva não criada: horário indisponível")
                 except Exception:
                     pass
-                mensagem = ("Você já tem uma reserva/inscrição neste horário." if duplicada
-                            else motivo_atual)
+                if duplicada:
+                    mensagem = "Você já tem uma reserva/inscrição neste horário."
+                elif uid_duplicado_tx:
+                    mensagem = f"O ID `{uid_duplicado_tx['ff_uid']}` acabou de ser inscrito neste horário."
+                else:
+                    mensagem = motivo_atual
                 return await interaction.followup.send(
                     embed=criar_embed("⏸️ Não foi possível reservar", mensagem, "Amarelo"),
                     ephemeral=True)
@@ -2433,16 +2491,19 @@ class ComprarSlotModal(discord.ui.Modal):
             )
             slot_id = cursor.lastrowid
 
-            for pos, nick in enumerate(nicks, 1):
+            for pos, j in enumerate(jogadores_validados, 1):
                 await db.execute(
                     "INSERT INTO slot_jogadores (slot_id, posicao, ff_uid, ff_nome, ff_nivel, discord_nome) VALUES (?, ?, ?, ?, ?, ?)",
-                    (slot_id, pos, "", nick, 0, interaction.user.display_name if pos == 1 else "")
+                    (slot_id, pos, j["uid"], j["nome"], j["nivel"], interaction.user.display_name if pos == 1 else "")
                 )
             await db.commit()
             horario = horario_atual
             self.valor = float(horario_atual["valor"])
 
-        lista_nicks = "\n".join(f"> 👤 **J{i}:** `{n}`" for i, n in enumerate(nicks, 1))
+        lista_nicks = "\n".join(
+            f"> 👤 **J{i}:** `{j['nome']}` • **Level `{j['nivel']}`** • ID: `{j['uid']}`"
+            for i, j in enumerate(jogadores_validados, 1)
+        )
 
         embed_pagamento = criar_embed(
             titulo=f"💳 Pagamento — {rotulo} (reserva)",
@@ -2453,7 +2514,7 @@ class ComprarSlotModal(discord.ui.Modal):
                       f"║  💰  `{formatar_moeda(self.valor)}`\n"
                       f"║  🎫  Reserva — vaga liberada após aprovação do ADM\n"
                       f"╚══════════════════════════════════╝\n\n"
-                      f"**Jogadores:**\n{lista_nicks}",
+                      f"**Jogadores verificados pelo ID:**\n{lista_nicks}",
             cor_nome="Amarelo",
             thumb=interaction.user.display_avatar.url,
             footer="Fire Force • Reserva de vaga"
@@ -2513,7 +2574,8 @@ class ComprarSlotModal(discord.ui.Modal):
         await interaction.followup.send(
             embed=criar_embed(
                 "✅ Reserva Criada",
-                f"{rotulo} reservado(a) para **{self.horario_str}**!\n"
+                f"{rotulo} reservado(a) para **{self.horario_str}**!\n\n"
+                f"**Conta(s) identificada(s) pelo ID:**\n{lista_nicks}\n\n"
                 f"> Finalize o pagamento em {canal_pagamento.mention} — a vaga é liberada quando o ADM aprovar.",
                 "Esmeralda"
             ),
@@ -2897,7 +2959,17 @@ class PagamentoAcaoView(discord.ui.View):
         acesso_txt = f"\n> 📊 Acompanhe no canal {canal_tabela.mention} — seu acesso já foi liberado!" if canal_tabela else ""
 
         jogadores_do_slot = await _jogadores_do_slot(slot_dict["id"])
-        nicks_txt = ", ".join("`" + (j["ff_nome"] or "???") + "`" for j in jogadores_do_slot) or "`???`"
+        partes_jog = []
+        for j in jogadores_do_slot:
+            j_d = dict(j)
+            nome_j = j_d.get("ff_nome") or "???"
+            uid_j = j_d.get("ff_uid") or ""
+            niv_j = int(j_d.get("ff_nivel") or 0)
+            if uid_j:
+                partes_jog.append(f"`{nome_j}` (Nv. {niv_j} • ID `{uid_j}`)")
+            else:
+                partes_jog.append(f"`{nome_j}`")
+        nicks_txt = ", ".join(partes_jog) or "`???`"
 
         detalhe_pag = (
             f"**Modalidade de pagamento:** Moedas (`{formatar_moeda(slot_dict.get('valor_moedas') or slot_dict['valor_cobrado'])}`) "
@@ -3139,7 +3211,7 @@ async def _jogadores_do_slot(slot_id: int) -> list:
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         return await (await db.execute(
-            "SELECT ff_nome FROM slot_jogadores WHERE slot_id = ? ORDER BY posicao", (slot_id,)
+            "SELECT ff_uid, ff_nome, ff_nivel FROM slot_jogadores WHERE slot_id = ? ORDER BY posicao", (slot_id,)
         )).fetchall()
 
 
