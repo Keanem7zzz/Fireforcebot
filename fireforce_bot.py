@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════
-#  🔥 FIRE FORCE — BOT PREMIUM v11.5
+#  🔥 FIRE FORCE — BOT PREMIUM v11.6
 #  Liga de Diário Free Fire
 #
 #  • Consulta de ID do Free Fire OB55 confiável (corrida multi-provedores +
@@ -8,7 +8,8 @@
 #  • Tabela do diário em TEXTO: "1. (nick)" — sem imagem, sem contador
 #  • Vaga e acesso liberados depois do pagamento aprovado pelo ADM
 #  • CARTEIRA: painel privado, depósito/saque PIX via LivePix e moedas do bot
-#  • v11.5: API de verificação de ID atualizada para OB55 (multi-provedor),
+#  • v11.6: Log completo de ganhos/recebimentos do ADM (com cupom/desconto,
+#    valor pago e total do dia/semana do ADM), API OB55 multi-provedor,
 #    Keep-Alive Supabase (2 dias), PIX direto ao ADM (/pix), carteira de
 #    trabalho exclusiva do Suporte, regra +R$ 1,00 PIX em moedas, Repetição
 #    Diária por painel, tempo dinâmico configurável de bloqueio e ID FF obrigatório
@@ -83,7 +84,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "11.5"
+VERSAO_BOT = "11.6"
 TAXA_MOEDAS_ADM_PIX = 1.00
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
 SUPABASE_KEEPALIVE_SEGUNDOS = max(3600, int(os.getenv("SUPABASE_PING_HORAS", "48")) * 3600)
@@ -6482,11 +6483,12 @@ async def disponibilidade_saque(guild_id: int) -> dict:
 # ---------- APROVAÇÃO (usada pelo staff, pela carteira e pela LivePix) ----------
 
 async def pos_aprovacao(guild, slot, horario, staff_id: Optional[int] = None, origem: str = "staff"):
-    """Registra o log de recebimentos do ADM (sem carteira de trabalho) e anuncia a aprovação."""
+    """Registra o log de ganhos/recebimentos do ADM (com cupom/desconto se usado + quanto pagou + total do dia)."""
     slot_dict = slot if isinstance(slot, dict) else dict(slot)
     hor_dict = horario if isinstance(horario, dict) else dict(horario)
 
     valor = arredondar(slot_dict.get("valor_cobrado") or 0)
+    valor_original = arredondar(hor_dict.get("valor") if hor_dict.get("valor") is not None else valor)
     comprador = slot_dict["comprador_id"]
     numero = slot_dict["numero"]
     slot_id = slot_dict["id"]
@@ -6494,17 +6496,50 @@ async def pos_aprovacao(guild, slot, horario, staff_id: Optional[int] = None, or
     categoria = hor_dict["categoria"]
     hora = hor_dict["horario"]
     horario_id = hor_dict["id"]
+    cupom_id = slot_dict.get("cupom_id")
 
     pago_em_moedas = (origem == "moedas_adm") or (int(slot_dict.get("pago_moedas") or 0) == 1)
     valor_moedas = arredondar(slot_dict.get("valor_moedas") or valor) if pago_em_moedas else 0.0
+    valor_base_inscr = valor_moedas if pago_em_moedas else valor
     valor_pix_adm = (
         arredondar(slot_dict.get("taxa_adm_pix") or TAXA_MOEDAS_ADM_PIX)
         if pago_em_moedas
         else valor
     )
 
-    # Auditoria / Log de recebimentos do ADM (ADM não tem carteira de trabalho; recebe direto no seu PIX)
+    # Verifica se houve cupom / desconto aplicado na inscrição
+    cupom_info = None
+    if cupom_id:
+        try:
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                db.row_factory = aiosqlite.Row
+                cupom_row = await (await db.execute(
+                    "SELECT codigo, tipo_desconto, valor FROM cupons WHERE id = ?",
+                    (cupom_id,),
+                )).fetchone()
+                if cupom_row:
+                    cupom_info = dict(cupom_row)
+        except Exception:
+            cupom_info = None
+
+    desconto_reais = arredondar(max(0.0, valor_original - valor_base_inscr))
+    usou_desconto = bool(cupom_info) or (desconto_reais > 0.009)
+    detalhe_desconto = ""
+    if usou_desconto:
+        if cupom_info:
+            cod_cupom = str(cupom_info.get("codigo") or "CUPOM").upper()
+            if (cupom_info.get("tipo_desconto") or "pct") == "pct":
+                detalhe_desconto = f"`{cod_cupom}` ({cupom_info['valor']:g}% OFF • `-{formatar_moeda(desconto_reais)}`)"
+            else:
+                detalhe_desconto = f"`{cod_cupom}` (`-{formatar_moeda(desconto_reais)}`)"
+        else:
+            detalhe_desconto = f"`-{formatar_moeda(desconto_reais)}`"
+
+    canal_adm_enviado_id = None
+
+    # Auditoria / Log de ganhos do ADM (aparece sempre que o ADM confirma uma vaga)
     if staff_id and origem in ("staff", "moedas_adm"):
+        hoje_str = agora_brt().strftime("%Y-%m-%d")
         async with aiosqlite.connect(DATABASE_FILE) as db:
             await db.execute(
                 "INSERT INTO comissoes (guild_id, staff_id, slot_id, horario_id, valor_base, comissao, dia, criado_em) "
@@ -6514,9 +6549,9 @@ async def pos_aprovacao(guild, slot, horario, staff_id: Optional[int] = None, or
                     staff_id,
                     slot_id,
                     horario_id,
+                    valor_original,
                     valor_pix_adm,
-                    valor_pix_adm,
-                    agora_brt().strftime("%Y-%m-%d"),
+                    hoje_str,
                     agora_brt().isoformat(),
                 ),
             )
@@ -6524,27 +6559,42 @@ async def pos_aprovacao(guild, slot, horario, staff_id: Optional[int] = None, or
         marcar_sujo()
 
         if pago_em_moedas:
-            await anunciar_pagamento_equipe(
+            linhas_valores_adm = (
+                f"> 🏷️ Valor original do diário: `{formatar_moeda(valor_original)}`\n"
+                f"> 🎟️ **Desconto aplicado:** {detalhe_desconto}\n"
+                f"> 🪙 Pago em moedas do bot: `{formatar_moeda(valor_moedas)}` *(fora do ADM)*\n"
+                f"> 💰 **Quanto pagou no PIX ao ADM:** **`{formatar_moeda(valor_pix_adm)}`**"
+                if usou_desconto
+                else f"> 🪙 Pago em moedas do bot: `{formatar_moeda(valor_moedas)}` *(fora do ADM)*\n"
+                     f"> 💰 **Quanto pagou no PIX ao ADM:** **`{formatar_moeda(valor_pix_adm)}`**"
+            )
+            canal_adm_enviado_id = await anunciar_pagamento_equipe(
                 guild,
                 staff_id,
-                "🪙 Recebimento PIX do ADM (Inscrição em Moedas)",
-                f"{mencao(staff_id)} liberou a vaga de {mencao(comprador)} paga com moedas do bot.\n"
-                f"> 🎮 Modo: `{texto_slot(tipo)}` • Categoria: `{categoria.title()}`\n"
-                f"> ⏰ Diário: `{hora}` • Vaga: `#{numero}`\n"
-                f"> 🪙 Pago em moedas do bot: `{formatar_moeda(valor_moedas)}` *(fora do repasse — ADM não recebe)*\n"
-                f"> 🏦 **Recebido direto no PIX do ADM:** **`{formatar_moeda(valor_pix_adm)}`**",
+                "🛡️ Log de Ganho do ADM — Vaga Confirmada (Moedas + PIX)",
+                f"{mencao(staff_id)} confirmou a vaga de {mencao(comprador)}.\n"
+                f"> 🎮 Diário: `{formatar_rotulo_diario(tipo, categoria)}` • `{hora}` ({texto_slot(tipo)} `#{numero}`)\n"
+                f"{linhas_valores_adm}",
                 "Dourado",
+                forcar_adm=True,
             )
         else:
-            await anunciar_pagamento_equipe(
+            linhas_valores_adm = (
+                f"> 🏷️ Valor original do diário: `{formatar_moeda(valor_original)}`\n"
+                f"> 🎟️ **Desconto aplicado:** {detalhe_desconto}\n"
+                f"> 💰 **Quanto pagou ao ADM:** **`{formatar_moeda(valor_pix_adm)}`**"
+                if usou_desconto
+                else f"> 💰 **Quanto pagou ao ADM:** **`{formatar_moeda(valor_pix_adm)}`**"
+            )
+            canal_adm_enviado_id = await anunciar_pagamento_equipe(
                 guild,
                 staff_id,
-                "🏦 Recebimento PIX integral — ADM",
-                f"{mencao(staff_id)} confirmou o recebimento integral direto no PIX pelo pagamento de {mencao(comprador)}.\n"
-                f"> 🎮 Modo: `{texto_slot(tipo)}` • Categoria: `{categoria.title()}`\n"
-                f"> ⏰ Diário: `{hora}` • Vaga: `#{numero}`\n"
-                f"> 💰 **Valor integral recebido no PIX do ADM:** **`{formatar_moeda(valor_pix_adm)}`**",
+                "🛡️ Log de Ganho do ADM — Vaga Confirmada",
+                f"{mencao(staff_id)} confirmou o pagamento de {mencao(comprador)}.\n"
+                f"> 🎮 Diário: `{formatar_rotulo_diario(tipo, categoria)}` • `{hora}` ({texto_slot(tipo)} `#{numero}`)\n"
+                f"{linhas_valores_adm}",
                 "Esmeralda",
+                forcar_adm=True,
             )
 
     titulo_origem = {
@@ -6554,29 +6604,41 @@ async def pos_aprovacao(guild, slot, horario, staff_id: Optional[int] = None, or
         "livepix": "Confirmação automática (LivePix)",
     }.get(origem, origem)
 
+    bloco_desc_geral = (
+        f"> 🏷️ Valor original: `{formatar_moeda(valor_original)}` • 🎟️ Desconto: {detalhe_desconto}\n"
+        if usou_desconto
+        else ""
+    )
     resumo_valores_log = (
+        f"{bloco_desc_geral}"
         f"> 🪙 Moedas do bot: `{formatar_moeda(valor_moedas)}` *(fora do ADM)*\n"
-        f"> 🏦 PIX direto ao ADM ({mencao(staff_id) if staff_id else 'ADM'}): `{formatar_moeda(valor_pix_adm)}`"
+        f"> 💰 **Quanto pagou no PIX ao ADM ({mencao(staff_id) if staff_id else 'ADM'}):** `{formatar_moeda(valor_pix_adm)}`"
         if pago_em_moedas
-        else f"> 🏦 Valor integral recebido no PIX do ADM ({mencao(staff_id) if staff_id else 'ADM'}): `{formatar_moeda(valor_pix_adm)}`"
+        else f"{bloco_desc_geral}"
+             f"> 💰 **Quanto pagou ao ADM ({mencao(staff_id) if staff_id else 'ADM'}):** `{formatar_moeda(valor_pix_adm)}`"
     )
 
     await anunciar(
         guild, "pagamento", "🎮 Vaga liberada — pagamento confirmado",
         f"{mencao(comprador)} garantiu a vaga **#{numero}** no diário `{hora}`.\n"
         f"> 🎮 Modo: `{texto_slot(tipo)}` • Categoria: `{categoria.title()}`\n"
-        f"> 💰 Inscrição: `{formatar_moeda(valor)}` • ✅ confirmado ({titulo_origem})\n"
+        f"> 💰 Valor pago: `{formatar_moeda(valor)}` • ✅ confirmado ({titulo_origem})\n"
         f"> 🧑‍⚖️ Liberado por: {mencao(staff_id) if staff_id else 'Equipe'}",
         "Esmeralda", marcar=comprador)
 
-    await registrar_log(
-        guild, "✅ PAGAMENTO", "✅ Recebimento confirmado e vaga liberada",
-        f"**{titulo_origem}** — {mencao(comprador)}\n"
-        f"> 🎮 Modo: `{texto_slot(tipo)}` • Categoria: `{categoria.title()}`\n"
-        f"> ⏰ Diário: `{hora}` • Vaga: `#{numero}`\n"
-        f"{resumo_valores_log}",
-        "Esmeralda"
-    )
+    # Se o log do ADM já caiu no próprio canal_logs geral (fallback), evita duplicar a mesma mensagem lá
+    canal_logs_geral = await canal_de_logs(guild.id) if guild else None
+    if canal_adm_enviado_id and canal_logs_geral and int(canal_adm_enviado_id) == int(canal_logs_geral):
+        _log_arquivo(f"[✅ PAGAMENTO] {titulo_origem} — slot #{slot_id} ({formatar_moeda(valor_pix_adm)})")
+    else:
+        await registrar_log(
+            guild, "✅ PAGAMENTO", "✅ Recebimento confirmado e vaga liberada",
+            f"**{titulo_origem}** — {mencao(comprador)}\n"
+            f"> 🎮 Modo: `{texto_slot(tipo)}` • Categoria: `{categoria.title()}`\n"
+            f"> ⏰ Diário: `{hora}` • Vaga: `#{numero}`\n"
+            f"{resumo_valores_log}",
+            "Esmeralda"
+        )
 
 
 async def aprovar_pagamento(guild, slot_id: int, staff_id: Optional[int] = None,
@@ -8467,6 +8529,7 @@ async def cmd_saude(interaction: discord.Interaction):
                        janela="Minutos da confirmação automática (padrão 5)",
                        bloqueio_diario="Minutos antes do início para bloquear a compra do diário (ex: 5, 10, 20)",
                        canal_logs="Canal de logs geral (pagamentos, depósitos, saques)",
+                       canal_logs_adm="Canal privado de logs de ganhos/confirmações dos ADMs",
                        canal_logs_suporte="Canal de logs do atendimento (tickets e avaliações)",
                        canal_cupons="Canal que anuncia os cupons automaticamente",
                        canal_eventos="Canal que anuncia os eventos",
@@ -8483,6 +8546,7 @@ async def cmd_config(interaction: discord.Interaction,
                      deposito_min: Optional[str] = None, janela: Optional[int] = None,
                      bloqueio_diario: Optional[int] = None,
                      canal_logs: Optional[discord.TextChannel] = None,
+                     canal_logs_adm: Optional[discord.TextChannel] = None,
                      canal_logs_suporte: Optional[discord.TextChannel] = None,
                      canal_cupons: Optional[discord.TextChannel] = None,
                      canal_eventos: Optional[discord.TextChannel] = None,
@@ -8515,6 +8579,7 @@ async def cmd_config(interaction: discord.Interaction,
         novos["bloqueio_compra_min"] = max(0, min(int(bloqueio_diario), 720))
         mudancas.append(f"> 🔒 Bloqueio de compra do diário: `{novos['bloqueio_compra_min']} min` antes do início")
     for nome_campo, canal, chave in (("Logs gerais", canal_logs, "canal_logs"),
+                                     ("Logs de ganhos ADM", canal_logs_adm, "canal_log_pag_adm"),
                                      ("Logs do atendimento", canal_logs_suporte, "canal_logs_suporte"),
                                      ("Canal de cupons", canal_cupons, "canal_cupons"),
                                      ("Canal de eventos", canal_eventos, "canal_eventos"),
@@ -8545,6 +8610,7 @@ async def cmd_config(interaction: discord.Interaction,
             f"> ⏱️ Janela de confirmação LivePix: `{await cfgv(interaction.guild.id, 'janela_min', CARTEIRA_JANELA_MIN)} min`\n"
             f"> 🔒 Bloqueio de compra do diário: `{bloq_atual} min` antes do início\n"
             f"> 🧾 Logs gerais: {_canal(cfg.get('canal_logs'))}\n"
+            f"> 🛡️ Logs de ganhos ADM: {_canal(cfg.get('canal_log_pag_adm') or cfg.get('canal_logs'))}\n"
             f"> 🎧 Logs do atendimento: {_canal(cfg.get('canal_logs_suporte'))}\n"
             f"> 🎟️ Canal de cupons: {_canal(cfg.get('canal_cupons'))}\n"
             f"> 🎉 Canal de eventos: {_canal(cfg.get('canal_eventos'))}\n"
@@ -10197,58 +10263,109 @@ async def aviso_fora_de_servico(interaction) -> bool:
     return False
 
 
-async def canal_pagamento_equipe(guild, staff_id: int):
-    """Canal PRIVADO do pagamento da equipe: suporte -> canal_pag_suporte; ADM -> canal_pag_adm."""
+async def canal_pagamento_equipe(guild, staff_id: int, forcar_adm: bool = False):
+    """Canal PRIVADO do log da equipe:
+      • Suporte -> canal_log_pag_suporte (com fallback para canal_logs_suporte / canal_logs)
+      • ADM -> canal_log_pag_adm (com fallback automático para canal_logs / canal_logs_suporte,
+        para que o log de ganhos do ADM NUNCA suma caso um canal separado não esteja definido)."""
     if not guild:
         return None, "adm"
     cfg = await obter_config(guild.id)
-    membro = await membro_do_guild(guild, staff_id)
     qual = "adm"
-    try:
-        if membro is not None and not membro.guild_permissions.administrator:
-            ids = {r.id for r in getattr(membro, "roles", []) if r.id}
-            chefia = {cfg.get("cargo_dono"), cfg.get("cargo_gerente"), cfg.get("cargo_mediador")}
-            if cfg.get("cargo_suporte") in ids and not (chefia & ids):
-                qual = "suporte"
-    except Exception:
-        qual = "adm"
-    chave = "canal_log_pag_suporte" if qual == "suporte" else "canal_log_pag_adm"
-    canal_id = cfg.get(chave)
-    canal = guild.get_channel(int(canal_id)) if canal_id else None
-    # Sem canal privado configurado, não enviar dados salariais/avaliações a um canal genérico.
-    return canal, qual
+    if not forcar_adm:
+        membro = await membro_do_guild(guild, staff_id)
+        try:
+            if membro is not None and not membro.guild_permissions.administrator:
+                ids = {r.id for r in getattr(membro, "roles", []) if r.id}
+                chefia = {cfg.get("cargo_dono"), cfg.get("cargo_gerente"), cfg.get("cargo_mediador")}
+                if cfg.get("cargo_suporte") in ids and not (chefia & ids):
+                    qual = "suporte"
+        except Exception:
+            qual = "adm"
+
+    if qual == "suporte":
+        candidatos = (cfg.get("canal_log_pag_suporte"), cfg.get("canal_logs_suporte"), cfg.get("canal_logs"))
+    else:
+        candidatos = (cfg.get("canal_log_pag_adm"), cfg.get("canal_logs"), cfg.get("canal_logs_suporte"))
+
+    for cid in candidatos:
+        if not cid:
+            continue
+        try:
+            canal = guild.get_channel(int(cid))
+        except (TypeError, ValueError):
+            canal = None
+        if isinstance(canal, discord.TextChannel):
+            return canal, qual
+    return None, qual
 
 
 async def anunciar_pagamento_equipe(guild, staff_id: int, titulo: str, descricao: str,
-                                    cor: str = "Esmeralda") -> bool:
-    """Log privado de recebimento/pagamento: canal do suporte (carteira) ou canal do ADM (PIX direto)."""
+                                    cor: str = "Esmeralda", forcar_adm: bool = False) -> Optional[int]:
+    """Log de recebimento/pagamento da equipe:
+      • Suporte: mostra tickets avaliados hoje, média semanal e carteira de trabalho.
+      • ADM: mostra quanto recebeu nesta confirmação + total acumulado no DIA e na SEMANA.
+    Retorna o ID do canal onde enviou (ou None se nenhum canal de log estiver configurado)."""
     try:
-        canal, qual = await canal_pagamento_equipe(guild, staff_id)
+        canal, qual = await canal_pagamento_equipe(guild, staff_id, forcar_adm=forcar_adm)
         if not canal:
-            return False
+            return None
         rotulo = "🎧 SUPORTE" if qual == "suporte" else "🛡️ ADM"
         extra = ""
+        hoje = agora_brt().strftime('%Y-%m-%d')
+        semana = (agora_brt() - datetime.timedelta(days=agora_brt().weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
         if qual == "suporte":
             try:
                 async with aiosqlite.connect(DATABASE_FILE) as db:
                     db.row_factory = aiosqlite.Row
-                    hoje = agora_brt().strftime('%Y-%m-%d')
-                    dia = await (await db.execute("SELECT COUNT(*) n FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND substr(criado_em,1,10)=?", (guild.id, staff_id, hoje))).fetchone()
-                    semana = (agora_brt() - datetime.timedelta(days=agora_brt().weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-                    sem = await (await db.execute("SELECT COUNT(*) n, AVG(nota) media FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND criado_em>=?", (guild.id, staff_id, semana))).fetchone()
+                    dia = await (await db.execute(
+                        "SELECT COUNT(*) n FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND substr(criado_em,1,10)=?",
+                        (guild.id, staff_id, hoje),
+                    )).fetchone()
+                    sem = await (await db.execute(
+                        "SELECT COUNT(*) n, AVG(nota) media FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND criado_em>=?",
+                        (guild.id, staff_id, semana),
+                    )).fetchone()
                 saldo = await saldo_trabalho(staff_id, guild.id)
                 extra = (f"\n\n> 🎫 Tickets avaliados hoje: **{dia['n'] or 0}**"
                          f"\n> ⭐ Média desta semana: **{float(sem['media'] or 0):.2f}/5** ({sem['n'] or 0} avaliações)"
                          f"\n> 💼 Total disponível na carteira: **{formatar_moeda(saldo)}**")
             except Exception:
                 pass
-        rodape = "Fire Force • Carteira de trabalho (Suporte)" if qual == "suporte" else "Fire Force • Log de recebimentos do ADM"
+        else:
+            try:
+                async with aiosqlite.connect(DATABASE_FILE) as db:
+                    db.row_factory = aiosqlite.Row
+                    dia_adm = await (await db.execute(
+                        "SELECT COUNT(*) AS n, COALESCE(SUM(comissao), 0) AS total "
+                        "FROM comissoes WHERE guild_id = ? AND staff_id = ? AND dia = ?",
+                        (guild.id, staff_id, hoje),
+                    )).fetchone()
+                    sem_adm = await (await db.execute(
+                        "SELECT COUNT(*) AS n, COALESCE(SUM(comissao), 0) AS total "
+                        "FROM comissoes WHERE guild_id = ? AND staff_id = ? AND criado_em >= ?",
+                        (guild.id, staff_id, semana),
+                    )).fetchone()
+                qtd_hoje = int(dia_adm["n"] or 0)
+                tot_hoje = arredondar(dia_adm["total"] or 0)
+                qtd_sem = int(sem_adm["n"] or 0)
+                tot_sem = arredondar(sem_adm["total"] or 0)
+                extra = (
+                    f"\n\n> 📅 Vagas confirmadas hoje por este ADM: **{qtd_hoje}**"
+                    f"\n> 💵 **Total ganho por este ADM hoje:** **`{formatar_moeda(tot_hoje)}`**"
+                    f"\n> 📊 Acumulado nesta semana: `{formatar_moeda(tot_sem)}` ({qtd_sem} vaga{'s' if qtd_sem != 1 else ''})"
+                )
+            except Exception as erro_adm:
+                _log_arquivo(f"[LOG ADM] erro resumo diário: {erro_adm}")
+        rodape = "Fire Force • Carteira de trabalho (Suporte)" if qual == "suporte" else f"Fire Force • Controle de ganhos do ADM ({hoje[8:10]}/{hoje[5:7]})"
         embed = criar_embed(titulo, f"> 👤 **Cargo:** {rotulo}\n{descricao}{extra}", cor, footer=rodape)
         await canal.send(embed=embed)
-        return True
+        return canal.id
     except Exception as erro:
-        _log_arquivo(f"[PAG- EQUIPE] {erro}")
-        return False
+        _log_arquivo(f"[PAG-EQUIPE] {erro}")
+        return None
 
 
 # ---------- CARTEIRA DE TRABALHO (salários da equipe) ----------
@@ -12220,6 +12337,11 @@ async def ranking_dados(guild_id: int, categoria: str, limite: int = 10) -> list
             linhas = await (await db.execute(
                 "SELECT user_id, saldo AS valor FROM carteira_trabalho WHERE guild_id = ? AND saldo > 0 "
                 "ORDER BY saldo DESC LIMIT ?", (guild_id, limite))).fetchall()
+        elif categoria == "comissoes":
+            linhas = await (await db.execute(
+                "SELECT staff_id AS user_id, COALESCE(SUM(comissao), 0) AS valor FROM comissoes "
+                "WHERE guild_id = ? AND comissao > 0 GROUP BY staff_id ORDER BY valor DESC LIMIT ?",
+                (guild_id, limite))).fetchall()
         else:
             linhas = []
     return [(l["user_id"], arredondar(l["valor"])) for l in linhas]
@@ -12231,6 +12353,7 @@ RANKING_TITULOS = {
     "depositos": ("⬆️ Quem mais depositou", "total depositado", "depositos"),
     "ganhos": ("🎁 Quem mais ganhou (equipe dando saldo)", "total ganho", "ganhos"),
     "vitórias": ("🏆 Quem mais venceu (top 1)", "vitórias", "vitorias"),
+    "comissoes": ("🛡️ Recebimentos acumulados dos ADMs", "total recebido no PIX", "comissoes"),
     "trabalho": ("💼 Carteira de trabalho (Suporte)", "a receber no domingo", "trabalho"),
 }
 
@@ -12278,6 +12401,7 @@ class RankingView(discord.ui.View):
         discord.SelectOption(label="Mais depósitos",value="depositos",emoji="⬆️"),
         discord.SelectOption(label="Mais ganhos (saldo dado)",value="ganhos",emoji="🎁"),
         discord.SelectOption(label="Mais vitórias (top 1)",value="vitórias",emoji="🏆"),
+        discord.SelectOption(label="Ganhos dos ADMs (PIX)",value="comissoes",emoji="🛡️"),
         discord.SelectOption(label="Carteira de trabalho (Suporte)",value="trabalho",emoji="💼"),
     ])
     async def selecionar(self,interaction:discord.Interaction,select:discord.ui.Select):
@@ -12305,6 +12429,7 @@ class RankingResultadoView(discord.ui.View):
         discord.SelectOption(label="Mais depósitos",value="depositos",emoji="⬆️"),
         discord.SelectOption(label="Mais ganhos (saldo dado)",value="ganhos",emoji="🎁"),
         discord.SelectOption(label="Mais vitórias (top 1)",value="vitórias",emoji="🏆"),
+        discord.SelectOption(label="Ganhos dos ADMs (PIX)",value="comissoes",emoji="🛡️"),
         discord.SelectOption(label="Carteira de trabalho (Suporte)",value="trabalho",emoji="💼"),
     ])
     async def selecionar(self,interaction:discord.Interaction,select:discord.ui.Select):
@@ -12684,53 +12809,116 @@ async def cmd_vitoria(interaction: discord.Interaction, usuario: discord.Member,
                         "Dourado")
 
 
-@bot.tree.command(name="trabalho", description="💼 Ver sua carteira de trabalho (equipe) e quando o dinheiro é pago")
+@bot.tree.command(name="trabalho", description="💼 Carteira de trabalho (Suporte) ou controle de ganhos no PIX (ADM)")
 @app_commands.guild_only()
-@app_commands.describe(usuario="Ver a de outra pessoa (gerência)")
+@app_commands.describe(usuario="Ver o de outra pessoa da equipe (gerência)")
 async def cmd_trabalho(interaction: discord.Interaction, usuario: Optional[discord.Member] = None):
     alvo = usuario or interaction.user
-    if alvo.id == interaction.user.id and not await tem_carteira_trabalho(interaction.user):
-        return await interaction.response.send_message(
-            embed=criar_embed(
-                "🔒 Carteira exclusiva do Suporte",
-                "A carteira de trabalho agora pertence **apenas ao cargo Suporte**.\n"
-                "> 🏦 **ADM:** recebe o pagamento integral diretamente no seu PIX (use `/pix` para cadastrar sua chave).\n"
-                "> 👑 Se você for Dono/Gerente e quiser consultar um Suporte, use `/trabalho usuario:@suporte`.",
-                "Amarelo",
-            ),
-            ephemeral=True,
-        )
     if usuario and usuario.id != interaction.user.id and not await e_gerencia(interaction.user):
         return await interaction.response.send_message(
-            embed=criar_embed("❌ Sem Permissão", "Você só pode ver a sua.", "Vermelho"), ephemeral=True)
-    if usuario and not await tem_carteira_trabalho(usuario):
-        return await interaction.response.send_message(
-            embed=criar_embed(
-                "ℹ️ Sem carteira de trabalho",
-                f"{usuario.mention} não pertence exclusivamente ao cargo **Suporte** (ADM não possui carteira de trabalho e recebe direto no PIX).",
-                "Amarelo",
-            ),
+            embed=criar_embed("❌ Sem Permissão", "Você só pode ver o seu próprio histórico.", "Vermelho"),
             ephemeral=True,
         )
 
-    saldo = await saldo_trabalho(alvo.id, interaction.guild.id)
-    extrato = await extrato_trabalho(alvo.id, interaction.guild.id, 10)
-    embed = criar_embed(
-        f"💼 Carteira de trabalho (Suporte) — {alvo.display_name}",
-        f"**A receber:** `{formatar_moeda(saldo)}`\n"
-        f"**Fechamento:** domingo à noite; saque até segunda **01:00 BRT** (depois, saldo não sacado vira da Org)\n\n"
-        f"**Últimos ganhos:**\n{extrato}",
-        "Dourado")
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        semana_inicio=(agora_brt()-datetime.timedelta(days=agora_brt().weekday())).replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
-        stats=await (await db.execute("SELECT COUNT(*) n, AVG(nota) media FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND criado_em>=?",(interaction.guild.id,alvo.id,semana_inicio))).fetchone()
-    embed.add_field(name="📊 Desempenho nesta semana", value=f"> 🎫 Tickets avaliados: **{stats['n'] or 0}**\n> ⭐ Média geral: **{float(stats['media'] or 0):.2f}/5**" if stats['n'] else "> Ainda sem avaliações nesta semana.", inline=False)
-    embed.add_field(name="🧾 Como a nota semanal afeta o valor",
-                    value="> Média 5★: **100%** • 4,50–4,99★: **95%** • 4,00–4,49★: **90%**\n"
-                          "> 3,00–3,99★: **50%** • 2,00–2,99★: **25%** • abaixo de 2★: **0%**\n"
-                          "> Notas por atendimento ficam na carteira do Suporte; saque no domingo até segunda 01:00 BRT.", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    # Caso 1: Suporte -> Carteira de trabalho semanal
+    if await tem_carteira_trabalho(alvo):
+        saldo = await saldo_trabalho(alvo.id, interaction.guild.id)
+        extrato = await extrato_trabalho(alvo.id, interaction.guild.id, 10)
+        embed = criar_embed(
+            f"💼 Carteira de trabalho (Suporte) — {alvo.display_name}",
+            f"**A receber:** `{formatar_moeda(saldo)}`\n"
+            f"**Fechamento:** domingo à noite; saque até segunda **01:00 BRT** (depois, saldo não sacado vira da Org)\n\n"
+            f"**Últimos ganhos:**\n{extrato}",
+            "Dourado",
+        )
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            semana_inicio = (agora_brt() - datetime.timedelta(days=agora_brt().weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).isoformat()
+            stats = await (await db.execute(
+                "SELECT COUNT(*) n, AVG(nota) media FROM avaliacoes WHERE guild_id=? AND atendente_id=? AND criado_em>=?",
+                (interaction.guild.id, alvo.id, semana_inicio),
+            )).fetchone()
+        embed.add_field(
+            name="📊 Desempenho nesta semana",
+            value=f"> 🎫 Tickets avaliados: **{stats['n'] or 0}**\n> ⭐ Média geral: **{float(stats['media'] or 0):.2f}/5**"
+                  if stats["n"] else "> Ainda sem avaliações nesta semana.",
+            inline=False,
+        )
+        embed.add_field(
+            name="🧾 Como a nota semanal afeta o valor",
+            value="> Média 5★: **100%** • 4,50–4,99★: **95%** • 4,00–4,49★: **90%**\n"
+                  "> 3,00–3,99★: **50%** • 2,00–2,99★: **25%** • abaixo de 2★: **0%**\n"
+                  "> Notas por atendimento ficam na carteira do Suporte; saque no domingo até segunda 01:00 BRT.",
+            inline=False,
+        )
+        return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # Caso 2: ADM / Mediador / Gerente / Dono -> Controle de ganhos recebidos no PIX (sem carteira)
+    if await e_staff(alvo):
+        hoje = agora_brt().strftime("%Y-%m-%d")
+        semana_inicio = (agora_brt() - datetime.timedelta(days=agora_brt().weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            dia_adm = await (await db.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(comissao), 0) AS total "
+                "FROM comissoes WHERE guild_id = ? AND staff_id = ? AND dia = ?",
+                (interaction.guild.id, alvo.id, hoje),
+            )).fetchone()
+            sem_adm = await (await db.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(comissao), 0) AS total "
+                "FROM comissoes WHERE guild_id = ? AND staff_id = ? AND criado_em >= ?",
+                (interaction.guild.id, alvo.id, semana_inicio),
+            )).fetchone()
+            ultimos = await (await db.execute(
+                "SELECT c.valor_base, c.comissao, c.criado_em, h.horario, h.tipo, s.pago_moedas, s.cupom_id "
+                "FROM comissoes c "
+                "LEFT JOIN horarios h ON h.id = c.horario_id "
+                "LEFT JOIN slots s ON s.id = c.slot_id "
+                "WHERE c.guild_id = ? AND c.staff_id = ? ORDER BY c.id DESC LIMIT 10",
+                (interaction.guild.id, alvo.id),
+            )).fetchall()
+
+        linhas_hist = []
+        for r in ultimos:
+            r_d = dict(r)
+            pago_adm = arredondar(r_d.get("comissao") or 0)
+            base_orig = arredondar(r_d.get("valor_base") or pago_adm)
+            quando_txt = str(r_d.get("criado_em") or "")[8:16].replace("-", "/").replace("T", " ")
+            hor_txt = r_d.get("horario") or "--:--"
+            foi_moedas = int(r_d.get("pago_moedas") or 0) == 1
+            teve_desc = (not foi_moedas and base_orig - pago_adm > 0.009) or bool(r_d.get("cupom_id"))
+            tag_extra = (
+                " *(moedas + PIX)*" if foi_moedas
+                else (f" *(desconto sob `{formatar_moeda(base_orig)}`)*" if teve_desc else "")
+            )
+            linhas_hist.append(f"> 🏦 **`{formatar_moeda(pago_adm)}`** — diário `{hor_txt}`{tag_extra} • `{quando_txt}`")
+
+        embed_adm = criar_embed(
+            f"🛡️ Controle de Ganhos do ADM — {alvo.display_name}",
+            f"**Ganho hoje ({hoje[8:10]}/{hoje[5:7]}):** **`{formatar_moeda(dia_adm['total'] or 0)}`** "
+            f"({int(dia_adm['n'] or 0)} vaga{'s' if int(dia_adm['n'] or 0) != 1 else ''} confirmada{'s' if int(dia_adm['n'] or 0) != 1 else ''})\n"
+            f"**Ganho nesta semana:** `{formatar_moeda(sem_adm['total'] or 0)}` "
+            f"({int(sem_adm['n'] or 0)} vaga{'s' if int(sem_adm['n'] or 0) != 1 else ''})\n"
+            f"> ℹ️ *ADMs recebem direto na própria chave `/pix` (não possuem carteira de trabalho retida no bot).*\n\n"
+            f"**Últimas confirmações registradas:**\n"
+            + ("\n".join(linhas_hist) if linhas_hist else "> *Nenhuma vaga confirmada ainda.*"),
+            "Esmeralda",
+            footer="Fire Force • Auditoria de ganhos do ADM",
+        )
+        return await interaction.response.send_message(embed=embed_adm, ephemeral=True)
+
+    return await interaction.response.send_message(
+        embed=criar_embed(
+            "🔒 Exclusivo da Equipe",
+            f"{alvo.mention} não possui cargo de Suporte nem de ADM neste servidor.",
+            "Vermelho",
+        ),
+        ephemeral=True,
+    )
 
 
 def _iniciar_tarefas_background():
