@@ -142,7 +142,7 @@ jobs:
           $log = Join-Path $PSScriptRoot "vigia.log"
           if (Test-Path $log) { Get-Content $log -Tail 15 } else { Write-Host "  (o vigia.log ainda nao existe)" -ForegroundColor DarkGray }
           Write-Host ""
-          Write-Host "  No Discord, /saude mostra LivePix, Supabase e pendencias." -ForegroundColor Gray
+          Write-Host "  No Discord, /saude mostra Supabase, pendencias e status operacional." -ForegroundColor Gray
           Read-Host "  Aperte ENTER pra fechar"
           '@ | Set-Content -Path (Join-Path $ws 'status_bot.ps1') -Encoding UTF8
 
@@ -174,11 +174,9 @@ jobs:
           SUPABASE_ANON_KEY:         ${{ secrets.SUPABASE_ANON_KEY }}
           SUPABASE_KEY:              ${{ secrets.SUPABASE_KEY }}
           SUPABASE_ID:               ${{ secrets.SUPABASE_ID }}
-          LIVEPIX_CLIENT_ID:         ${{ secrets.LIVEPIX_CLIENT_ID }}
-          LIVEPIX_CLIENT_SECRET:     ${{ secrets.LIVEPIX_CLIENT_SECRET }}
         run: |
           $linhas = @()
-          foreach ($k in @("DISCORD_TOKEN","SUPABASE_URL","SUPABASE_SERVICE_ROLE_KEY","SUPABASE_ANON_KEY","SUPABASE_KEY","SUPABASE_ID","LIVEPIX_CLIENT_ID","LIVEPIX_CLIENT_SECRET")) {
+          foreach ($k in @("DISCORD_TOKEN","SUPABASE_URL","SUPABASE_SERVICE_ROLE_KEY","SUPABASE_ANON_KEY","SUPABASE_KEY","SUPABASE_ID")) {
             $v = [Environment]::GetEnvironmentVariable($k)
             if ($v) { $linhas += "$k=$v" }
           }
