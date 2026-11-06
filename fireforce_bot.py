@@ -84,7 +84,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "12.0"
+VERSAO_BOT = "12.1"
 TAXA_MOEDAS_ADM_PIX = 1.00
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
 SUPABASE_KEEPALIVE_SEGUNDOS = max(3600, int(os.getenv("SUPABASE_PING_HORAS", "48")) * 3600)
@@ -710,6 +710,7 @@ async def init_db():
             status TEXT DEFAULT 'pendente',
             canal_ticket_id INTEGER,
             msg_ticket_id INTEGER,
+            assumido_por INTEGER,
             aprovado_por INTEGER,
             cliques INTEGER DEFAULT 0,
             criado_em TEXT,
@@ -735,6 +736,8 @@ async def init_db():
         """)
 
         for _tabela, _coluna, _tipo in (
+            ("parceiros", "assumido_por", "INTEGER"),
+            ("divulgacoes", "valor_acordado", "REAL DEFAULT 0"),
             ("tickets", "tipo", "TEXT"), ("tickets", "assumido_por", "INTEGER"), ("tickets", "assumido_em", "TEXT"),
             ("tickets", "nota", "REAL"), ("tickets", "nota_desc", "TEXT"), ("tickets", "pago_nota", "REAL"),
             ("tickets", "fechado_em", "TEXT"), ("tickets", "fechado_por", "INTEGER"),
@@ -4219,7 +4222,6 @@ class SetupMainSelect(discord.ui.Select):
                 discord.SelectOption(label="Cargos da Equipe", value="cargos", emoji="👑", description="Definir Dono, Gerente, ADM e Suporte"),
                 discord.SelectOption(label="Categorias de Canais", value="categorias", emoji="📂", description="Salas, pagamentos e atendimentos"),
                 discord.SelectOption(label="Bloqueio de Diários", value="bloqueio", emoji="⏱️", description="Minutos antes do início para travar compra"),
-                discord.SelectOption(label="PIX Oficial da Org (Depósitos)", value="pix_org", emoji="🏦", description="Chave PIX dos Donos para depósitos na carteira"),
                 discord.SelectOption(label="Ver Configuração Atual", value="ver", emoji="📋", description="Resumo minimalista de tudo que está ativo"),
                 discord.SelectOption(label="Diagnóstico Técnico", value="diagnostico", emoji="🩺", description="Auditar permissões e estrutura do servidor"),
             ],
@@ -4247,14 +4249,6 @@ class SetupMainSelect(discord.ui.Select):
         if mod == "bloqueio":
             atual = await obter_bloqueio_compra_min(interaction.guild.id)
             return await interaction.response.send_modal(ConfigurarBloqueioCompraModal(atual))
-        if mod == "pix_org":
-            cfg = await obter_config(interaction.guild.id)
-            return await interaction.response.send_modal(
-                PixOrgSetupModal(
-                    cfg.get("pix_org_chave") or "",
-                    cfg.get("pix_org_titular") or "",
-                )
-            )
         if mod == "diagnostico":
             embed, _ = await montar_diagnostico_config(interaction.guild)
             return await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -4271,77 +4265,17 @@ class SetupMainSelect(discord.ui.Select):
             cats_linhas.append(f"• **{nome}:** {canal.mention if canal else '`não definida`'}")
 
         bloq = await obter_bloqueio_compra_min(interaction.guild.id)
-        pix_org = cfg.get("pix_org_chave")
         parc_canal = interaction.guild.get_channel(cfg.get("canal_parcerias") or 0) if cfg.get("canal_parcerias") else None
         resumo = (
             "**👑 Cargos**\n" + "\n".join(cargos_linhas) + "\n\n"
             "**📂 Categorias**\n" + "\n".join(cats_linhas) + "\n\n"
             "**⚡ Operação**\n"
             f"• **Bloqueio de diários:** `{bloq} min` antes\n"
-            f"• **PIX Depósitos (Dono):** `{mascarar_chave(pix_org) if pix_org else 'automático (chave /pix do Dono)'}`\n"
+            f"• **PIX (Diários, Depósitos & Parcerias):** chave `/pix` individual de quem assumir\n"
             f"• **Vitrine de Parceiros:** {parc_canal.mention if parc_canal else '`usar /parceria`'}"
         )
         await interaction.response.send_message(
             embed=criar_embed("📋 Configuração Atual", resumo, "Cinza Escuro"),
-            ephemeral=True,
-        )
-
-
-class PixOrgSetupModal(discord.ui.Modal, title="🏦 PIX Oficial da Organização"):
-    chave = discord.ui.TextInput(
-        label="Chave PIX dos Donos (CPF, CNPJ, Cel, E-mail ou EVP)",
-        placeholder="Ex: 12345678909 ou financeiro@suaorg.com",
-        max_length=120,
-        required=True,
-    )
-    titular = discord.ui.TextInput(
-        label="Nome do titular exibido no banco",
-        placeholder="Ex: FIRE FORCE ORG",
-        max_length=40,
-        required=True,
-    )
-
-    def __init__(self, chave_atual: str = "", titular_atual: str = ""):
-        super().__init__()
-        if chave_atual:
-            self.chave.default = str(chave_atual)[:120]
-        if titular_atual:
-            self.titular.default = str(titular_atual)[:40]
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not await e_dono_ou_gerente(interaction.user):
-            return await interaction.response.send_message(
-                embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente.", "Vermelho"),
-                ephemeral=True,
-            )
-        raw = self.chave.value.strip()
-        digs = re.sub(r"\D", "", raw)
-        tipo_hint = None
-        if len(digs) == 11 and _cpf_valido(digs) and not raw.startswith("+"):
-            tipo_hint = "cpf"
-        ok_p, tipo_n, chave_dict, erro_p = validar_e_normalizar_chave_pix(tipo_hint, raw)
-        if not ok_p:
-            return await interaction.response.send_message(
-                embed=criar_embed("❌ Chave PIX Inválida", erro_p, "Vermelho"),
-                ephemeral=True,
-            )
-        tit = self.titular.value.strip() or "FIRE FORCE"
-        await salvar_config(
-            interaction.guild.id,
-            pix_org_chave=chave_dict,
-            pix_org_tipo=tipo_n,
-            pix_org_titular=tit,
-        )
-        marcar_sujo()
-        await interaction.response.send_message(
-            embed=criar_embed(
-                "✅ PIX da Organização Salvo",
-                f"Todos os depósitos na carteira gerarão QR Code direto para:\n"
-                f"• **Titular:** `{tit}`\n"
-                f"• **Tipo:** `{tipo_n.upper()}`\n"
-                f"• **Chave:** `{chave_dict}`",
-                "Esmeralda",
-            ),
             ephemeral=True,
         )
 
@@ -4914,7 +4848,7 @@ async def loop_tabelas():
 
 # ==================== SLASH COMMANDS ====================
 
-@bot.tree.command(name="setup", description="⚙️ Configurar cargos, categorias e PIX dos Donos")
+@bot.tree.command(name="setup", description="⚙️ Configurar cargos e categorias do servidor")
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_channels=True)
 async def cmd_setup(interaction: discord.Interaction):
@@ -4927,7 +4861,7 @@ async def cmd_setup(interaction: discord.Interaction):
         embed=criar_embed(
             "⚙️ Central de Configuração",
             "Selecione no menu abaixo o módulo que deseja configurar.\n"
-            "-# 🏦 Depósitos vão direto ao PIX dos Donos • Diários vão direto ao PIX do ADM",
+            "-# 🏦 Dono, Gerente e ADM cadastram sua chave individual em /pix",
             "Cinza Escuro"),
         view=SetupMainView(),
         ephemeral=True
@@ -6108,35 +6042,52 @@ async def registrar_log(guild, tipo: str, titulo: str, descricao: str,
 
 # ---------- PIX OFICIAL DOS DONOS (DEPÓSITOS NA CARTEIRA) ----------
 
-async def obter_pix_dono_org(guild: discord.Guild) -> Optional[dict]:
-    """Retorna a chave PIX dos Donos para depósitos na carteira:
-    1) Primeiro verifica `pix_org_chave` configurada em `/setup` -> `PIX Oficial da Org`.
-    2) Caso não definida, usa a chave `/pix` cadastrada pelo Dono do servidor ou membro com `cargo_dono`."""
-    if not guild:
-        return None
-    cfg = await obter_config(guild.id)
-    if cfg.get("pix_org_chave"):
-        return {
-            "chave": str(cfg["pix_org_chave"]),
-            "tipo": str(cfg.get("pix_org_tipo") or "aleatoria"),
-            "titular": str(cfg.get("pix_org_titular") or "FIRE FORCE"),
-        }
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        rows = await (await db.execute(
-            "SELECT user_id, tipo, chave, titular FROM pix WHERE guild_id = ? ORDER BY atualizado_em DESC",
-            (guild.id,),
-        )).fetchall()
-    cargo_dono_id = int(cfg.get("cargo_dono") or 0)
-    owner_id = int(getattr(guild, "owner_id", 0) or 0)
-    for r in rows:
-        uid = int(r["user_id"])
-        if uid == owner_id:
-            return {"chave": str(r["chave"]), "tipo": str(r["tipo"] or "aleatoria"), "titular": str(r["titular"] or "FIRE FORCE")}
-        membro = await membro_do_guild(guild, uid)
-        if membro and cargo_dono_id and any(role.id == cargo_dono_id for role in getattr(membro, "roles", ())):
-            return {"chave": str(r["chave"]), "tipo": str(r["tipo"] or "aleatoria"), "titular": str(r["titular"] or "FIRE FORCE")}
-    return None
+async def montar_cobranca_pix_responsavel(
+    guild_id: int,
+    responsavel_id: int,
+    valor: float = 0.0,
+    titulo: str = "🏦 Chave PIX Liberada",
+    mencao_destino: str = "",
+    rodape: str = "Fire Force • QR Code PIX Oficial (BRCode)",
+    nome_arquivo: str = "pix_qrcode.png",
+):
+    """Monta (embed, discord.File|None, CopiarPixAdmView) a partir da chave `/pix`
+    cadastrada pelo Dono ou Gerente (`responsavel_id`) que assumiu o atendimento.
+    Se `valor <= 0`, gera QR Code e Copia e Cola com valor livre."""
+    pix_resp = await obter_pix_adm(int(responsavel_id), int(guild_id))
+    if not pix_resp:
+        return None, None, None
+
+    tipo_ch = str(pix_resp.get("tipo") or "aleatoria")
+    titular = str(pix_resp.get("titular") or "FIRE FORCE")
+    chave_norm = normalizar_chave_pix_emv(tipo_ch, str(pix_resp["chave"]))
+    val_num = arredondar(valor) if valor and float(valor) > 0 else 0.0
+    payload = gerar_payload_pix(chave_norm, tipo_ch, titular, valor=val_num)
+
+    valor_linha = (
+        f"• **Valor específico:** **`{formatar_moeda(val_num)}`**\n"
+        if val_num > 0
+        else "• **Valor:** `Livre (digite o valor combinado no seu banco)`\n"
+    )
+    saudacao = f"{mencao_destino}, escaneie o QR Code ou copie a chave abaixo:\n\n" if mencao_destino else ""
+    embed = criar_embed(
+        titulo,
+        f"{saudacao}"
+        f"{valor_linha}"
+        f"• **Responsável:** {mencao(responsavel_id)} (`{titular}`)\n"
+        f"• **Chave PIX ({tipo_ch.upper()}):** `{chave_norm}`\n\n"
+        f"**📋 PIX Copia e Cola:**\n```\n{payload}\n```\n"
+        f"-# 📄 Após pagar, envie o print do comprovante neste canal.",
+        "Esmeralda",
+        footer=rodape,
+    )
+    arquivo = None
+    try:
+        arquivo = discord.File(gerar_qr_url(payload), nome_arquivo)
+        embed.set_image(url=f"attachment://{nome_arquivo}")
+    except Exception:
+        arquivo = None
+    return embed, arquivo, CopiarPixAdmView(payload)
 
 
 def gerar_qr_url(url: str):
@@ -6799,8 +6750,10 @@ class DepositoModal(discord.ui.Modal, title="💰 Depositar na Carteira (PIX)"):
         nome = self.campo_nome.value.strip()
         expira = (agora_brt() + datetime.timedelta(hours=12)).isoformat()
 
+        assumido_por = 0
         if self.deposito_id:
             async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                db.row_factory = aiosqlite.Row
                 cur = await db.execute("UPDATE depositos SET valor = ?, nome_pagador = ?, status = 'na_janela', "
                                        "criado_em = ?, expira_em = ? WHERE id = ? AND guild_id = ? "
                                        "AND user_id = ? AND status IN ('aguardando','na_janela')",
@@ -6812,6 +6765,10 @@ class DepositoModal(discord.ui.Modal, title="💰 Depositar na Carteira (PIX)"):
                         embed=criar_embed("ℹ️ Depósito já resolvido",
                                           "Esse pedido não está mais aberto. Abra um novo pelo painel da carteira.", "Amarelo"),
                         ephemeral=True)
+                row_dep = await (await db.execute(
+                    "SELECT assumido_por FROM depositos WHERE id = ?", (self.deposito_id,)
+                )).fetchone()
+                assumido_por = int((row_dep["assumido_por"] if row_dep else 0) or 0)
             deposito_id = self.deposito_id
         else:
             async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -6824,43 +6781,39 @@ class DepositoModal(discord.ui.Modal, title="💰 Depositar na Carteira (PIX)"):
                 await db.commit()
         marcar_sujo()
 
-        pix_dono = await obter_pix_dono_org(interaction.guild)
         arquivo = None
         view_copiar = None
-        if pix_dono:
-            chave_norm = normalizar_chave_pix_emv(pix_dono.get("tipo") or "aleatoria", pix_dono["chave"])
-            payload = gerar_payload_pix(
-                chave_norm,
-                pix_dono.get("tipo") or "aleatoria",
-                pix_dono.get("titular") or "FIRE FORCE",
+        mencoes_vip = ""
+        if assumido_por:
+            embed, arquivo, view_copiar = await montar_cobranca_pix_responsavel(
+                interaction.guild.id,
+                assumido_por,
                 valor=valor,
-                txid=f"DEP{deposito_id}",
+                titulo="💰 PIX para Depósito na Carteira",
+                mencao_destino=interaction.user.mention,
+                rodape=f"Fire Force • Depósito #{deposito_id}",
+                nome_arquivo="deposito_pix.png",
             )
-            embed = criar_embed(
-                "💰 PIX para Depósito na Carteira",
-                f"{interaction.user.mention}, escaneie o QR Code ou copie o código abaixo:\n\n"
-                f"• **Valor exato:** **`{formatar_moeda(valor)}`**\n"
-                f"• **Titular:** `{pix_dono.get('titular') or 'FIRE FORCE'}`\n"
-                f"• **Chave ({(pix_dono.get('tipo') or 'aleatoria').upper()}):** `{chave_norm}`\n"
-                f"• **Pagador informado:** `{nome}`\n\n"
-                f"**📋 PIX Copia e Cola:**\n```\n{payload}\n```\n"
-                f"-# 📄 Após pagar, envie o print do comprovante neste canal para a equipe creditar suas moedas.",
-                "Esmeralda",
-                footer=f"Fire Force • Depósito #{deposito_id}",
-            )
-            view_copiar = CopiarPixAdmView(payload)
-            try:
-                arquivo = discord.File(gerar_qr_url(payload), "deposito_pix.png")
-                embed.set_image(url="attachment://deposito_pix.png")
-            except Exception:
-                arquivo = None
+            if not embed:
+                embed = criar_embed(
+                    "💰 Pedido de Depósito Registrado",
+                    f"{interaction.user.mention} informou o depósito de **`{formatar_moeda(valor)}`** (`{nome}`).\n"
+                    f"• {mencao(assumido_por)}, cadastre sua chave em `/pix` e clique novamente em **Assumir** para enviar o QR Code.",
+                    "Amarelo",
+                    footer=f"Fire Force • Depósito #{deposito_id}",
+                )
         else:
+            cfg = await obter_config(interaction.guild.id)
+            mencoes_vip = " ".join(
+                f"<@&{cfg[k]}>" for k in ("cargo_dono", "cargo_gerente") if cfg.get(k)
+            )
             embed = criar_embed(
                 "💰 Pedido de Depósito Registrado",
-                f"{interaction.user.mention} solicitou depósito de **`{formatar_moeda(valor)}`** (`{nome}`).\n\n"
-                f"-# ⚠️ O PIX oficial dos Donos ainda não foi cadastrado em `/setup` → `🏦 PIX Oficial da Org` (ou `/pix` do Dono). "
-                f"Aguarde um membro da equipe enviar a chave PIX aqui e anexe o comprovante.",
-                "Amarelo",
+                f"• **Jogador:** {interaction.user.mention}\n"
+                f"• **Valor desejado:** **`{formatar_moeda(valor)}`**\n"
+                f"• **Pagador informado:** `{nome}`\n\n"
+                f"-# 🙋 Aguardando o **Dono** ou **Gerente** clicar em **Assumir** — o QR Code e a chave PIX dele serão enviados aqui automaticamente.",
+                "Cinza Escuro",
                 footer=f"Fire Force • Depósito #{deposito_id}",
             )
 
@@ -6871,6 +6824,8 @@ class DepositoModal(discord.ui.Modal, title="💰 Depositar na Carteira (PIX)"):
         except Exception:
             destino = interaction.channel
         enviar = {"embed": embed}
+        if mencoes_vip:
+            enviar["content"] = mencoes_vip
         if arquivo:
             enviar["file"] = arquivo
         if view_copiar:
@@ -6878,10 +6833,15 @@ class DepositoModal(discord.ui.Modal, title="💰 Depositar na Carteira (PIX)"):
         try:
             await destino.send(**enviar)
             await interaction.followup.send(
-                embed=criar_embed("✅ QR Code Gerado", "Confira os dados do PIX publicados aqui no canal.", "Esmeralda"),
+                embed=criar_embed(
+                    "✅ Valor Registrado",
+                    "QR Code enviado no canal!" if assumido_por else "Pedido registrado! Assim que um Dono ou Gerente assumir, o PIX aparecerá automaticamente no canal.",
+                    "Esmeralda",
+                ),
                 ephemeral=True,
             )
         except Exception:
+            enviar.pop("content", None)
             enviar["ephemeral"] = True
             await interaction.followup.send(**enviar)
 
@@ -8406,10 +8366,9 @@ async def cmd_config(interaction: discord.Interaction,
 
         dias = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
         bloq_atual = await obter_bloqueio_compra_min(interaction.guild.id)
-        pix_org = cfg.get("pix_org_chave")
         embed = criar_embed(
             "⚙️ Configuração atual",
-            f"> 🏦 PIX Depósitos (Donos): `{mascarar_chave(pix_org) if pix_org else 'automático (/pix do Dono)'}`\n"
+            f"> 🏦 PIX (Depósitos, Parcerias & Diários): `chave /pix individual de quem assumir`\n"
             f"> 🏦 Reserva: `{formatar_moeda(await cfgv(interaction.guild.id, 'reserva', CARTEIRA_RESERVA))}`\n"
             f"> 💸 Saque mínimo: `{formatar_moeda(await cfgv(interaction.guild.id, 'saque_min', CARTEIRA_SAQUE_MIN))}`\n"
             f"> 💰 Depósito mínimo: `{formatar_moeda(await cfgv(interaction.guild.id, 'deposito_min', CARTEIRA_DEPOSITO_MIN))}`\n"
@@ -10745,9 +10704,8 @@ async def abrir_atendimento_deposito(interaction: discord.Interaction):
         "💰 Depósito na Carteira",
         f"Olá {interaction.user.mention}! Este é o seu atendimento privado de **depósito**.\n\n"
         f"• **1.** Clique em **Abrir depósito** e informe o valor desejado\n"
-        f"• **2.** Escaneie o QR Code PIX (ou copie o código) direto para os Donos\n"
-        f"• **3.** Envie o comprovante aqui para a equipe creditar suas moedas\n\n"
-        f"-# 🙋 Equipe: clique em **Assumir** antes de confirmar o depósito.",
+        f"• **2.** Assim que um **Dono** ou **Gerente** clicar em **Assumir**, o QR Code e a chave PIX dele são enviados automaticamente aqui\n"
+        f"• **3.** Envie o comprovante neste canal para o crédito das suas moedas",
         "Esmeralda", footer=f"Fire Force • Depósito #{deposito_id}")
     try:
         await canal.send(content=mencao(interaction.user.id), embed=embed, view=DepositoCanalView(deposito_id))
@@ -10854,32 +10812,55 @@ class DepositoCanalView(discord.ui.View):
     @discord.ui.button(label="Assumir", style=discord.ButtonStyle.blurple, emoji="🙋")
     async def assumir(self, interaction: discord.Interaction, button: discord.ui.Button):
         deposito = await self._deposito(interaction.channel.id)
-        if not deposito or not await atendente_autorizado("suporte", interaction.user):
+        if not deposito or not await e_dono_ou_gerente(interaction.user):
             return await interaction.response.send_message(
-                embed=criar_embed("❌ Sem Permissão", "Só a equipe de suporte/gerência assume depósitos.", "Vermelho"),
+                embed=criar_embed("❌ Exclusivo Dono/Gerente", "Apenas **Dono** ou **Gerente** assume depósitos (o PIX enviado será o de quem assumir).", "Vermelho"),
                 ephemeral=True)
         if deposito["status"] not in ("aguardando", "na_janela"):
             return await interaction.response.send_message(
                 embed=criar_embed("ℹ️ Depósito encerrado", "Este atendimento já foi resolvido/cancelado.", "Amarelo"),
                 ephemeral=True)
-        if not await aviso_fora_de_servico(interaction):
-            return
         if deposito["assumido_por"] and deposito["assumido_por"] != interaction.user.id:
             return await interaction.response.send_message(
-                embed=criar_embed("🙋 Já assumido", f"Já é de {mencao(deposito['assumido_por'])}.", "Amarelo"),
+                embed=criar_embed("🙋 Já assumido", f"Já foi assumido por {mencao(deposito['assumido_por'])}.", "Amarelo"),
                 ephemeral=True)
+
+        pix_meu = await obter_pix_adm(interaction.user.id, interaction.guild.id)
+        if not pix_meu:
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "⚠️ Cadastre sua chave PIX primeiro",
+                    "Use `/pix` para cadastrar sua chave PIX antes de assumir — no depósito, sua chave PIX e o QR Code são enviados **automaticamente** assim que você assume.",
+                    "Amarelo",
+                ),
+                ephemeral=True,
+            )
+
+        await interaction.response.defer()
         async with aiosqlite.connect(DATABASE_FILE) as db:
             await db.execute("UPDATE depositos SET assumido_por = ? WHERE id = ?",
                              (interaction.user.id, deposito["id"]))
             await db.commit()
         marcar_sujo()
-        await interaction.response.send_message(
-            content=mencao(deposito["user_id"]),
-            embed=criar_embed("🙋 Depósito assumido",
-                              f"{interaction.user.mention} está acompanhando este depósito.\n"
-                              f"> Qualquer coisa, é só falar aqui. 💛", "Esmeralda"))
-        await registrar_log_suporte(interaction.guild, "💰 DEPÓSITO", "🙋 Depósito assumido",
-                                    f"{mencao(interaction.user.id)} assumiu o depósito `#{deposito['id']}`.", "Verde")
+
+        valor_dep = float(deposito["valor"] or 0)
+        embed_pix, arquivo_pix, view_pix = await montar_cobranca_pix_responsavel(
+            interaction.guild.id,
+            interaction.user.id,
+            valor=valor_dep,
+            titulo=f"💰 Depósito Assumido — PIX de {interaction.user.display_name}",
+            mencao_destino=mencao(deposito["user_id"]),
+            rodape=f"Fire Force • Depósito #{deposito['id']}",
+            nome_arquivo="deposito_pix.png",
+        )
+        kwargs_envio = {"content": mencao(deposito["user_id"]), "embed": embed_pix}
+        if arquivo_pix:
+            kwargs_envio["file"] = arquivo_pix
+        if view_pix:
+            kwargs_envio["view"] = view_pix
+        await interaction.followup.send(**kwargs_envio)
+        await registrar_log_suporte(interaction.guild, "💰 DEPÓSITO", "🙋 Depósito assumido (PIX enviado)",
+                                    f"{mencao(interaction.user.id)} assumiu o depósito `#{deposito['id']}` e enviou seu PIX automaticamente.", "Verde")
 
     @discord.ui.button(label="Confirmar pelo financeiro", style=discord.ButtonStyle.green, emoji="✅")
     async def manual(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -12217,35 +12198,206 @@ class EditarParceiroModal(discord.ui.Modal, title="✏️ Revisar Ficha do Parce
         )
 
 
-class ParceriaTicketView(discord.ui.View):
-    """Controles exclusivos de Dono/Gerente dentro do ticket de parceria."""
+class ValorEspecificoPixLiberadoModal(discord.ui.Modal, title="💰 Valor Específico na Chave PIX"):
+    def __init__(
+        self,
+        canal_id: int,
+        responsavel_id: int,
+        solicitante_id: int,
+        titulo_pix: str,
+        rodape_pix: str,
+        divulgacao_id: int = 0,
+    ):
+        super().__init__()
+        self.canal_id = int(canal_id)
+        self.responsavel_id = int(responsavel_id)
+        self.solicitante_id = int(solicitante_id or 0)
+        self.titulo_pix = titulo_pix
+        self.rodape_pix = rodape_pix
+        self.divulgacao_id = int(divulgacao_id or 0)
+        self.valor_inp = discord.ui.TextInput(
+            label="Qual o valor específico em R$?",
+            placeholder="Ex: 25,00",
+            required=True,
+            max_length=16,
+        )
+        self.add_item(self.valor_inp)
 
-    def __init__(self, parceria_id: int):
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message("❌ Apenas Dono ou Gerente.", ephemeral=True)
+        valor = parse_valor(self.valor_inp.value)
+        if not valor or valor <= 0:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Valor inválido", "Informe um valor maior que zero (ex: `25,00`).", "Vermelho"),
+                ephemeral=True,
+            )
+        if self.divulgacao_id:
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                await db.execute("UPDATE divulgacoes SET valor_acordado = ? WHERE id = ?", (valor, self.divulgacao_id))
+                await db.commit()
+            marcar_sujo()
+
+        embed_pix, arq_pix, view_pix = await montar_cobranca_pix_responsavel(
+            interaction.guild.id,
+            self.responsavel_id,
+            valor=valor,
+            titulo=self.titulo_pix,
+            mencao_destino=mencao(self.solicitante_id) if self.solicitante_id else "",
+            rodape=self.rodape_pix,
+            nome_arquivo="chave_pix.png",
+        )
+        if not embed_pix:
+            return await interaction.response.send_message(
+                embed=criar_embed("⚠️ Chave PIX não encontrada", "Cadastre sua chave em `/pix` primeiro.", "Amarelo"),
+                ephemeral=True,
+            )
+        canal_dest = interaction.guild.get_channel(self.canal_id) or interaction.channel
+        kwargs_msg = {"embed": embed_pix}
+        if self.solicitante_id:
+            kwargs_msg["content"] = mencao(self.solicitante_id)
+        if arq_pix:
+            kwargs_msg["file"] = arq_pix
+        if view_pix:
+            kwargs_msg["view"] = view_pix
+        await canal_dest.send(**kwargs_msg)
+        await interaction.response.send_message(
+            embed=criar_embed("✅ Chave PIX Liberada", f"Chave PIX enviada no canal com o valor de **`{formatar_moeda(valor)}`**.", "Esmeralda"),
+            ephemeral=True,
+        )
+
+
+class EscolherValorPixLiberadoView(discord.ui.View):
+    """Pergunta ao Dono/Gerente se deseja definir um valor específico na chave PIX ou não."""
+
+    def __init__(
+        self,
+        canal_id: int,
+        responsavel_id: int,
+        solicitante_id: int,
+        titulo_pix: str,
+        rodape_pix: str,
+        divulgacao_id: int = 0,
+    ):
+        super().__init__(timeout=180)
+        self.canal_id = int(canal_id)
+        self.responsavel_id = int(responsavel_id)
+        self.solicitante_id = int(solicitante_id or 0)
+        self.titulo_pix = titulo_pix
+        self.rodape_pix = rodape_pix
+        self.divulgacao_id = int(divulgacao_id or 0)
+
+    @discord.ui.select(
+        placeholder="🔓 Tem um valor específico para colocar na chave PIX?",
+        options=[
+            discord.SelectOption(
+                label="Sim — Colocar um valor específico",
+                value="com_valor",
+                emoji="💰",
+                description="Digitar o valor em R$ para já sair cravado no QR Code",
+            ),
+            discord.SelectOption(
+                label="Não — Liberar chave sem valor específico",
+                value="sem_valor",
+                emoji="🆓",
+                description="Enviar sua chave PIX e QR Code com valor livre",
+            ),
+        ],
+    )
+    async def escolher_modo(self, interaction: discord.Interaction, select: discord.ui.Select):
+        if interaction.user.id != self.responsavel_id:
+            return await interaction.response.send_message("❌ Apenas quem assumiu o atendimento pode escolher.", ephemeral=True)
+        modo = select.values[0]
+        if modo == "com_valor":
+            return await interaction.response.send_modal(
+                ValorEspecificoPixLiberadoModal(
+                    self.canal_id,
+                    self.responsavel_id,
+                    self.solicitante_id,
+                    self.titulo_pix,
+                    self.rodape_pix,
+                    divulgacao_id=self.divulgacao_id,
+                )
+            )
+
+        embed_pix, arq_pix, view_pix = await montar_cobranca_pix_responsavel(
+            interaction.guild.id,
+            self.responsavel_id,
+            valor=0.0,
+            titulo=self.titulo_pix,
+            mencao_destino=mencao(self.solicitante_id) if self.solicitante_id else "",
+            rodape=self.rodape_pix,
+            nome_arquivo="chave_pix.png",
+        )
+        if not embed_pix:
+            return await interaction.response.edit_message(
+                embed=criar_embed("⚠️ Chave PIX não encontrada", "Cadastre sua chave em `/pix` primeiro.", "Amarelo"),
+                view=None,
+            )
+        canal_dest = interaction.guild.get_channel(self.canal_id) or interaction.channel
+        kwargs_msg = {"embed": embed_pix}
+        if self.solicitante_id:
+            kwargs_msg["content"] = mencao(self.solicitante_id)
+        if arq_pix:
+            kwargs_msg["file"] = arq_pix
+        if view_pix:
+            kwargs_msg["view"] = view_pix
+        await canal_dest.send(**kwargs_msg)
+        await interaction.response.edit_message(
+            embed=criar_embed("✅ Chave PIX Liberada", "Sua chave PIX foi enviada no canal sem valor fixo (valor livre).", "Esmeralda"),
+            view=None,
+        )
+
+
+class ParceriaTicketView(discord.ui.View):
+    """Controles exclusivos de Dono/Gerente dentro do ticket de parceria.
+    Após clicar em Assumir, libera a nova função 'Liberar Chave PIX' no painel."""
+
+    def __init__(self, parceria_id: int, assumido: bool = False):
         super().__init__(timeout=None)
         self.parceria_id = int(parceria_id)
+        self.assumido = bool(assumido)
+        opcoes = [
+            discord.SelectOption(
+                label="Assumir Atendimento",
+                value="assumir",
+                emoji="🙋",
+                description="Assumir esta parceria (habilita Liberar Chave PIX no painel)",
+            ),
+        ]
+        if self.assumido:
+            opcoes.append(
+                discord.SelectOption(
+                    label="Liberar Chave PIX",
+                    value="liberar_pix",
+                    emoji="🔓",
+                    description="Envia sua chave /pix (pergunta se tem valor específico ou não)",
+                )
+            )
+        opcoes.extend([
+            discord.SelectOption(
+                label="Aprovar e Publicar na Vitrine",
+                value="aprovar",
+                emoji="✅",
+                description="Aprova a parceria e adiciona automaticamente na Vitrine",
+            ),
+            discord.SelectOption(
+                label="Editar Ficha Antes de Aprovar",
+                value="editar",
+                emoji="✏️",
+                description="Ajustar nome, link ou descrição da organização",
+            ),
+            discord.SelectOption(
+                label="Recusar Solicitação",
+                value="recusar",
+                emoji="❌",
+                description="Recusa a solicitação e encerra este canal",
+            ),
+        ])
         sel = discord.ui.Select(
             custom_id=f"ff_parc_tk_{self.parceria_id}",
-            placeholder="⚙️ Decisão da Parceria (Dono / Gerente)...",
-            options=[
-                discord.SelectOption(
-                    label="Aprovar e Publicar na Vitrine",
-                    value="aprovar",
-                    emoji="✅",
-                    description="Aprova a parceria e adiciona automaticamente na Vitrine",
-                ),
-                discord.SelectOption(
-                    label="Editar Ficha Antes de Aprovar",
-                    value="editar",
-                    emoji="✏️",
-                    description="Ajustar nome, link ou descrição da organização",
-                ),
-                discord.SelectOption(
-                    label="Recusar Solicitação",
-                    value="recusar",
-                    emoji="❌",
-                    description="Recusa a solicitação e encerra este canal",
-                ),
-            ],
+            placeholder="⚙️ Gerenciar Parceria (Dono / Gerente)...",
+            options=opcoes,
         )
         sel.callback = self._decidir
         self.add_item(sel)
@@ -12253,7 +12405,7 @@ class ParceriaTicketView(discord.ui.View):
     async def _decidir(self, interaction: discord.Interaction):
         if not await e_dono_ou_gerente(interaction.user):
             return await interaction.response.send_message(
-                embed=criar_embed("🔒 Exclusivo Dono/Gerente", "Apenas **Dono** ou **Gerente** podem aprovar ou recusar parcerias.", "Vermelho"),
+                embed=criar_embed("🔒 Exclusivo Dono/Gerente", "Apenas **Dono** ou **Gerente** gerenciam parcerias.", "Vermelho"),
                 ephemeral=True,
             )
         acao = interaction.data["values"][0]
@@ -12263,8 +12415,78 @@ class ParceriaTicketView(discord.ui.View):
         if not parceria:
             return await interaction.response.send_message("❌ Registro não encontrado.", ephemeral=True)
         p = dict(parceria)
+        ja_assumido = int(p.get("assumido_por") or 0)
+
+        if acao == "assumir":
+            if ja_assumido and ja_assumido != interaction.user.id:
+                try:
+                    await interaction.message.edit(view=ParceriaTicketView(self.parceria_id, assumido=True))
+                except Exception:
+                    pass
+                return await interaction.response.send_message(
+                    embed=criar_embed("🙋 Já assumido", f"Esta parceria já foi assumida por {mencao(ja_assumido)}.", "Amarelo"),
+                    ephemeral=True,
+                )
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                await db.execute("UPDATE parceiros SET assumido_por = ? WHERE id = ?", (interaction.user.id, self.parceria_id))
+                await db.commit()
+            marcar_sujo()
+            await interaction.response.edit_message(view=ParceriaTicketView(self.parceria_id, assumido=True))
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "🙋 Parceria Assumida",
+                    f"{interaction.user.mention} assumiu este atendimento.\n"
+                    f"-# 🔓 A função **Liberar Chave PIX** já está disponível no painel acima caso precise enviar seu PIX.",
+                    "Esmeralda",
+                )
+            )
+
+        if acao == "liberar_pix":
+            try:
+                await interaction.message.edit(view=ParceriaTicketView(self.parceria_id, assumido=True))
+            except Exception:
+                pass
+            if not ja_assumido:
+                return await interaction.response.send_message(
+                    embed=criar_embed("🙋 Assuma primeiro", "Selecione **Assumir Atendimento** antes de liberar a chave PIX.", "Amarelo"),
+                    ephemeral=True,
+                )
+            if ja_assumido != interaction.user.id:
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Assumido por outro responsável", f"Apenas {mencao(ja_assumido)} (quem assumiu) pode liberar a própria chave PIX.", "Vermelho"),
+                    ephemeral=True,
+                )
+            pix_meu = await obter_pix_adm(interaction.user.id, interaction.guild.id)
+            if not pix_meu:
+                return await interaction.response.send_message(
+                    embed=criar_embed(
+                        "⚠️ Cadastre sua chave PIX primeiro",
+                        "Use `/pix` para cadastrar sua chave PIX e em seguida selecione **Liberar Chave PIX** novamente.",
+                        "Amarelo",
+                    ),
+                    ephemeral=True,
+                )
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "🔓 Liberar Chave PIX",
+                    "Deseja colocar um **valor específico** na sua chave PIX (QR Code + Copia e Cola) ou enviar **sem valor específico**?",
+                    "Cinza Escuro",
+                ),
+                view=EscolherValorPixLiberadoView(
+                    interaction.channel.id,
+                    interaction.user.id,
+                    int(p.get("solicitante_id") or 0),
+                    titulo_pix=f"🏦 Chave PIX — {interaction.user.display_name}",
+                    rodape_pix=f"Fire Force • Parceria #{self.parceria_id}",
+                ),
+                ephemeral=True,
+            )
 
         if acao == "editar":
+            try:
+                await interaction.message.edit(view=ParceriaTicketView(self.parceria_id, assumido=bool(ja_assumido)))
+            except Exception:
+                pass
             return await interaction.response.send_modal(EditarParceiroModal(self.parceria_id, p))
 
         if acao == "aprovar":
@@ -12755,61 +12977,6 @@ class SolicitarDivulgacaoModal(discord.ui.Modal, title="📣 Contratar Divulgaç
         )
 
 
-class CobrarDivulgacaoPixModal(discord.ui.Modal, title="💳 Gerar Cobrança PIX da Divulgação"):
-    def __init__(self, divulgacao_id: int):
-        super().__init__()
-        self.divulgacao_id = divulgacao_id
-        self.valor_inp = discord.ui.TextInput(
-            label="Valor acordado em R$",
-            placeholder="Ex: 35,00",
-            max_length=16,
-        )
-        self.add_item(self.valor_inp)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not await e_dono_ou_gerente(interaction.user):
-            return await interaction.response.send_message("❌ Apenas Dono ou Gerente.", ephemeral=True)
-        valor = parse_valor(self.valor_inp.value)
-        if not valor or valor <= 0:
-            return await interaction.response.send_message("❌ Informe um valor válido (ex: `35,00`).", ephemeral=True)
-        pix_org = await obter_pix_dono_org(interaction.guild)
-        if not pix_org:
-            return await interaction.response.send_message(
-                embed=criar_embed("⚙️ PIX dos Donos não configurado", "Configure o PIX em `/setup` ou `/pix` antes de gerar a cobrança.", "Amarelo"),
-                ephemeral=True,
-            )
-        async with aiosqlite.connect(DATABASE_FILE) as db:
-            await db.execute("UPDATE divulgacoes SET valor_acordado = ? WHERE id = ?", (valor, self.divulgacao_id))
-            await db.commit()
-        marcar_sujo()
-
-        chave_norm = normalizar_chave_pix_emv(pix_org.get("tipo") or "aleatoria", pix_org["chave"])
-        payload = gerar_payload_pix(
-            chave_norm,
-            pix_org.get("tipo") or "aleatoria",
-            pix_org.get("titular") or "FIRE FORCE",
-            valor=valor,
-        )
-        qr_buf = gerar_qr_url(payload)
-        arquivo = discord.File(fp=qr_buf, filename="pix_divulgacao.png")
-        embed_cob = criar_embed(
-            f"💳 Pagamento da Divulgação #{self.divulgacao_id}",
-            f"• **Valor combinado:** `{formatar_moeda(valor)}`\n"
-            f"• **Recebedor:** **{pix_org['titular']}**\n"
-            f"• **Chave PIX ({pix_org['tipo'].upper()}):** `{chave_norm}`\n\n"
-            f"**PIX Copia e Cola:**\n```\n{payload}\n```\n"
-            "Envie o comprovante neste canal após realizar o pagamento.",
-            "Esmeralda",
-        )
-        embed_cob.set_image(url="attachment://pix_divulgacao.png")
-        await interaction.channel.send(
-            embed=embed_cob,
-            file=arquivo,
-            view=CopiarPixAdmView(payload),
-        )
-        await interaction.response.send_message("✅ Cobrança PIX enviada no canal!", ephemeral=True)
-
-
 class PublicarDivulgacaoCanalView(discord.ui.View):
     def __init__(self, divulgacao_id: int):
         super().__init__(timeout=180)
@@ -12851,40 +13018,48 @@ class PublicarDivulgacaoCanalView(discord.ui.View):
 
 
 class DivulgacaoTicketView(discord.ui.View):
-    """Menu minimalista dentro do ticket privado de divulgação paga."""
+    """Menu minimalista dentro do ticket privado de divulgação paga.
+    Após Assumir, libera no painel a opção 'Liberar Chave PIX'."""
 
-    def __init__(self, divulgacao_id: int):
+    def __init__(self, divulgacao_id: int, assumido: bool = False):
         super().__init__(timeout=None)
         self.divulgacao_id = int(divulgacao_id)
+        self.assumido = bool(assumido)
+        opcoes = [
+            discord.SelectOption(
+                label="Assumir Atendimento",
+                value="assumir",
+                emoji="🙋",
+                description="Dono/Gerente assume (habilita Liberar Chave PIX no painel)",
+            ),
+        ]
+        if self.assumido:
+            opcoes.append(
+                discord.SelectOption(
+                    label="Liberar Chave PIX",
+                    value="liberar_pix",
+                    emoji="🔓",
+                    description="Envia sua chave /pix (pergunta se tem valor específico ou não)",
+                )
+            )
+        opcoes.extend([
+            discord.SelectOption(
+                label="Publicar Texto em um Canal",
+                value="publicar",
+                emoji="📢",
+                description="Envia o texto da divulgação no canal escolhido",
+            ),
+            discord.SelectOption(
+                label="Encerrar Ticket de Divulgação",
+                value="fechar",
+                emoji="🔒",
+                description="Finaliza e apaga este canal confidencial",
+            ),
+        ])
         sel = discord.ui.Select(
             custom_id=f"ff_div_tk_{self.divulgacao_id}",
             placeholder="⚙️ Gerenciar Divulgação...",
-            options=[
-                discord.SelectOption(
-                    label="Assumir Negociação",
-                    value="assumir",
-                    emoji="🙋",
-                    description="Dono/Gerente assume o atendimento desta divulgação",
-                ),
-                discord.SelectOption(
-                    label="Gerar Cobrança PIX (Valor Combinado)",
-                    value="cobrar",
-                    emoji="💳",
-                    description="Gera QR Code PIX direto para os Donos com o valor combinado",
-                ),
-                discord.SelectOption(
-                    label="Publicar Texto em um Canal",
-                    value="publicar",
-                    emoji="📢",
-                    description="Envia o texto da divulgação no canal escolhido",
-                ),
-                discord.SelectOption(
-                    label="Encerrar Ticket de Divulgação",
-                    value="fechar",
-                    emoji="🔒",
-                    description="Finaliza e apaga este canal confidencial",
-                ),
-            ],
+            options=opcoes,
         )
         sel.callback = self._gerenciar
         self.add_item(sel)
@@ -12898,25 +13073,85 @@ class DivulgacaoTicketView(discord.ui.View):
             return await interaction.response.send_message("❌ Registro não encontrado.", ephemeral=True)
         d = dict(div)
         eh_vip = await e_dono_ou_gerente(interaction.user)
+        ja_assumido = int(d.get("assumido_por") or 0)
 
-        if acao in ("assumir", "cobrar", "publicar") and not eh_vip:
+        if acao in ("assumir", "liberar_pix", "publicar") and not eh_vip:
             return await interaction.response.send_message(
                 embed=criar_embed("🔒 Exclusivo Dono/Gerente", "Esta opção pertence apenas ao Dono ou Gerente.", "Vermelho"),
                 ephemeral=True,
             )
 
         if acao == "assumir":
+            if ja_assumido and ja_assumido != interaction.user.id:
+                try:
+                    await interaction.message.edit(view=DivulgacaoTicketView(self.divulgacao_id, assumido=True))
+                except Exception:
+                    pass
+                return await interaction.response.send_message(
+                    embed=criar_embed("🙋 Já assumido", f"Este atendimento já foi assumido por {mencao(ja_assumido)}.", "Amarelo"),
+                    ephemeral=True,
+                )
             async with aiosqlite.connect(DATABASE_FILE) as db:
                 await db.execute("UPDATE divulgacoes SET assumido_por = ? WHERE id = ?", (interaction.user.id, self.divulgacao_id))
                 await db.commit()
-            return await interaction.response.send_message(
-                embed=criar_embed("🙋 Negociação Assumida", f"{interaction.user.mention} assumiu esta proposta de divulgação.", "Esmeralda")
+            marcar_sujo()
+            await interaction.response.edit_message(view=DivulgacaoTicketView(self.divulgacao_id, assumido=True))
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "🙋 Atendimento Assumido",
+                    f"{interaction.user.mention} assumiu esta proposta de divulgação.\n"
+                    f"-# 🔓 A função **Liberar Chave PIX** já está disponível no painel acima.",
+                    "Esmeralda",
+                )
             )
 
-        if acao == "cobrar":
-            return await interaction.response.send_modal(CobrarDivulgacaoPixModal(self.divulgacao_id))
+        if acao == "liberar_pix":
+            try:
+                await interaction.message.edit(view=DivulgacaoTicketView(self.divulgacao_id, assumido=True))
+            except Exception:
+                pass
+            if not ja_assumido:
+                return await interaction.response.send_message(
+                    embed=criar_embed("🙋 Assuma primeiro", "Selecione **Assumir Atendimento** antes de liberar a chave PIX.", "Amarelo"),
+                    ephemeral=True,
+                )
+            if ja_assumido != interaction.user.id:
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Assumido por outro responsável", f"Apenas {mencao(ja_assumido)} (quem assumiu) pode liberar a própria chave PIX.", "Vermelho"),
+                    ephemeral=True,
+                )
+            pix_meu = await obter_pix_adm(interaction.user.id, interaction.guild.id)
+            if not pix_meu:
+                return await interaction.response.send_message(
+                    embed=criar_embed(
+                        "⚠️ Cadastre sua chave PIX primeiro",
+                        "Use `/pix` para cadastrar sua chave PIX e em seguida selecione **Liberar Chave PIX** novamente.",
+                        "Amarelo",
+                    ),
+                    ephemeral=True,
+                )
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "🔓 Liberar Chave PIX",
+                    "Deseja colocar um **valor específico** na sua chave PIX (QR Code + Copia e Cola) ou enviar **sem valor específico**?",
+                    "Cinza Escuro",
+                ),
+                view=EscolherValorPixLiberadoView(
+                    interaction.channel.id,
+                    interaction.user.id,
+                    int(d.get("solicitante_id") or 0),
+                    titulo_pix=f"💳 Chave PIX — {interaction.user.display_name}",
+                    rodape_pix=f"Fire Force • Divulgação #{self.divulgacao_id}",
+                    divulgacao_id=self.divulgacao_id,
+                ),
+                ephemeral=True,
+            )
 
         if acao == "publicar":
+            try:
+                await interaction.message.edit(view=DivulgacaoTicketView(self.divulgacao_id, assumido=bool(ja_assumido)))
+            except Exception:
+                pass
             return await interaction.response.send_message(
                 embed=criar_embed("📢 Publicar Divulgação", "Selecione o canal onde o texto será publicado:", "Cinza Escuro"),
                 view=PublicarDivulgacaoCanalView(self.divulgacao_id),
@@ -13080,14 +13315,14 @@ async def _inicializar_bot():
         bot.add_view(RankingView("saldo"))
 
         parcerias_abertas = await (await db.execute(
-            "SELECT id FROM parceiros WHERE status = 'pendente'")).fetchall()
+            "SELECT id, assumido_por FROM parceiros WHERE status = 'pendente'")).fetchall()
         for lp in parcerias_abertas:
-            bot.add_view(ParceriaTicketView(lp["id"]))
+            bot.add_view(ParceriaTicketView(lp["id"], assumido=bool(lp["assumido_por"])))
 
         divulgacoes_abertas = await (await db.execute(
-            "SELECT id FROM divulgacoes WHERE status IN ('aberto', 'publicada')")).fetchall()
+            "SELECT id, assumido_por FROM divulgacoes WHERE status IN ('aberto', 'publicada')")).fetchall()
         for ld in divulgacoes_abertas:
-            bot.add_view(DivulgacaoTicketView(ld["id"]))
+            bot.add_view(DivulgacaoTicketView(ld["id"], assumido=bool(ld["assumido_por"])))
 
     for guild in bot.guilds:
         try:
