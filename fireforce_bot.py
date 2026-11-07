@@ -1467,7 +1467,7 @@ def calcular_patente_por_pontos(pontos: int) -> dict:
     atual = PATENTES_OFICIAIS[indice_atual]
     slug, nome, emoji, req_atual = atual["slug"], atual["nome"], atual["emoji"], atual["min_pts"]
     if indice_atual + 1 < len(PATENTES_OFICIAIS):
-        prox = PATENTES_OFICIAIS[indice_atual + 1]
+        prox = dict(PATENTES_OFICIAIS[indice_atual + 1])
         prox_slug, prox_nome, prox_emoji, prox_req = prox["slug"], prox["nome"], prox["emoji"], prox["min_pts"]
         faixa = max(1, prox_req - req_atual)
         feito = max(0, pts - req_atual)
@@ -1476,7 +1476,9 @@ def calcular_patente_por_pontos(pontos: int) -> dict:
         faltam = max(0, prox_req - pts)
         progresso_txt = f"`{barra}` `{pts}/{prox_req} pts` *(faltam {faltam} pts p/ {prox_emoji} {prox_nome})*"
     else:
+        prox = None
         prox_slug, prox_nome, prox_emoji, prox_req = None, None, None, None
+        faltam = 0
         barra = "▰" * 10
         progresso_txt = f"`{barra}` `{pts} pts` *(Patente Máxima Alcançada!)*"
 
@@ -1485,8 +1487,11 @@ def calcular_patente_por_pontos(pontos: int) -> dict:
         "slug": slug,
         "nome": nome,
         "emoji": emoji,
+        "min_pts": req_atual,
         "pontos": pts,
         "req_atual": req_atual,
+        "proxima_patente": prox,
+        "faltam_pts": faltam,
         "prox_slug": prox_slug,
         "prox_nome": prox_nome,
         "prox_emoji": prox_emoji,
@@ -1543,11 +1548,27 @@ async def obter_estatisticas_completas_jogador(guild_id: int, user_id: int) -> d
             (int(guild_id), int(user_id)),
         )).fetchone()
 
+        lines_rows = await (await db.execute(
+            "SELECT nome_line, favorita FROM lines_salvas WHERE guild_id = ? AND user_id = ? ORDER BY favorita DESC, id DESC",
+            (int(guild_id), int(user_id)),
+        )).fetchall()
+
+        ult_row = await (await db.execute(
+            "SELECT s.criado_em, h.tipo, h.categoria, h.horario "
+            "FROM slots s LEFT JOIN horarios h ON h.id = s.horario_id "
+            "WHERE s.guild_id = ? AND s.comprador_id = ? AND s.confirmado = 1 "
+            "ORDER BY s.id DESC LIMIT 1",
+            (int(guild_id), int(user_id)),
+        )).fetchone()
+
     partidas = max(0, base_partidas + int(recentes or 0))
     vitorias = max(0, int(vit_row["qtd"] or 0)) if vit_row else 0
     pontos = partidas + (vitorias * 3)
     winrate = round((vitorias / partidas) * 100, 1) if partidas > 0 else (100.0 if vitorias > 0 else 0.0)
     patente = calcular_patente_por_pontos(pontos)
+    qtd_lines = len(lines_rows)
+    line_favorita = str(lines_rows[0]["nome_line"]) if lines_rows else ""
+    ultima = dict(ult_row) if ult_row else None
     return {
         "partidas": partidas,
         "vitorias": vitorias,
@@ -1555,7 +1576,14 @@ async def obter_estatisticas_completas_jogador(guild_id: int, user_id: int) -> d
         "winrate": min(100.0, winrate),
         "sequencia_atual": seq_atual,
         "melhor_sequencia": melhor_seq,
+        "streak_atual": seq_atual,
+        "maior_streak": melhor_seq,
         "patente": patente,
+        "proxima_patente": patente["proxima_patente"],
+        "faltam_pts": patente["faltam_pts"],
+        "qtd_lines": qtd_lines,
+        "line_favorita": line_favorita,
+        "ultima": ultima,
     }
 
 
@@ -3247,9 +3275,14 @@ class ConfirmarCancelamentoQuorumView(discord.ui.View):
             comp_id = int(s_d["comprador_id"])
             confirmado = int(s_d.get("confirmado") or 0) == 1
             pago_moedas = int(s_d.get("pago_moedas") or 0) == 1
+            usou_vip = int(s_d.get("usou_vaga_vip") or 0) == 1
             valor_estorno = 0.0
 
-            if confirmado:
+            if usou_vip:
+                await devolver_vaga_vip(interaction.guild.id, comp_id)
+                if confirmado:
+                    valor_estorno = arredondar(float(s_d.get("taxa_adm_pix") or TAXA_VAGA_VIP_ADM_PIX))
+            elif confirmado:
                 if pago_moedas:
                     valor_estorno = arredondar(
                         float(s_d.get("valor_moedas") or s_d.get("valor_cobrado") or 0)
@@ -3275,14 +3308,27 @@ class ConfirmarCancelamentoQuorumView(discord.ui.View):
                 estornados_qtd += 1
                 total_estornado = arredondar(total_estornado + valor_estorno)
                 await avisar_jogador(
+                    interaction.guild,
                     comp_id,
                     embed=criar_embed(
                         "🪙 Sala Cancelada — Estorno Automático em Moedas",
                         f"O diário **{formatar_rotulo_diario(horario['tipo'], horario['categoria'])}** das **`{horario['horario']}`** "
                         f"foi cancelado por falta de quórum.\n\n"
-                        f"• **Estorno creditado:** **`{formatar_moeda(valor_estorno)}`** em moedas\n"
-                        f"• **Novo saldo na sua carteira:** `{formatar_moeda(novo_saldo)}`\n"
+                        f"• **Estorno creditado:** **`{formatar_moeda(valor_estorno)}`** em moedas"
+                        + ("\n• **🎟️ Sua Vaga VIP também foi devolvida!**" if usou_vip else "")
+                        + f"\n• **Novo saldo na sua carteira:** `{formatar_moeda(novo_saldo)}`\n"
                         f"-# Use suas moedas em qualquer próximo horário disponível!",
+                        "Dourado",
+                    ),
+                )
+            elif usou_vip:
+                await avisar_jogador(
+                    interaction.guild,
+                    comp_id,
+                    embed=criar_embed(
+                        "🎟️ Sala Cancelada — Vaga VIP Devolvida",
+                        f"O diário **{formatar_rotulo_diario(horario['tipo'], horario['categoria'])}** das **`{horario['horario']}`** "
+                        f"foi cancelado por falta de quórum e sua **🎟️ Vaga VIP** voltou para o seu saldo!",
                         "Dourado",
                     ),
                 )
@@ -4095,7 +4141,7 @@ async def notificar_fila_espera(guild: discord.Guild, horario_id: int) -> int:
     )
     enviados = 0
     for row in inscritos_fila:
-        ok = await avisar_jogador(int(row["user_id"]), embed=embed_dm)
+        ok = await avisar_jogador(guild, int(row["user_id"]), embed=embed_dm)
         if ok:
             enviados += 1
     return enviados
@@ -8968,7 +9014,7 @@ async def cmd_perfil(interaction: discord.Interaction,
         f"{progresso_txt}",
         cor_perfil,
         thumb=alvo.display_avatar.url,
-        footer="Fire Force • Pontuação: cada Diário = +1 pt | cada Vitória = +5 pts",
+        footer="Fire Force • Pontuação: cada Diário = +1 pt | cada Vitória = +3 pts",
     )
 
     streak_str = (
