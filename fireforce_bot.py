@@ -84,9 +84,11 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "12.2"
+VERSAO_BOT = "12.3"
 TAXA_MOEDAS_ADM_PIX = 1.00
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
+FF_NIVEL_MIN_PADRAO = 20
+SUBSTITUICAO_MIN_PADRAO = 5
 SUPABASE_KEEPALIVE_SEGUNDOS = max(3600, int(os.getenv("SUPABASE_PING_HORAS", "48")) * 3600)
 
 # O arquivo antigo é mantido intacto: a nova instalação usa ffv1.db.
@@ -764,6 +766,9 @@ async def init_db():
             ("paineis", "repetir_diario", "INTEGER DEFAULT 0"),
             ("horarios", "data_ciclo", "TEXT"),
             ("horarios", "encerrado_hoje", "INTEGER DEFAULT 0"),
+            ("horarios", "alerta_ish_enviado", "INTEGER DEFAULT 0"),
+            ("config", "ff_nivel_min", "INTEGER DEFAULT 20"),
+            ("config", "substituicao_min", "INTEGER DEFAULT 5"),
             ("pix", "atualizado_em", "TEXT"),
         ):
             try:
@@ -772,6 +777,44 @@ async def init_db():
                 pass
 
         await db.executescript("""
+        CREATE TABLE IF NOT EXISTS lines_salvas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            modo TEXT NOT NULL,
+            nome_line TEXT NOT NULL,
+            uids_json TEXT NOT NULL,
+            nicks_json TEXT NOT NULL,
+            favorita INTEGER DEFAULT 0,
+            criado_em TEXT,
+            atualizado_em TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS ff_blacklist (
+            guild_id INTEGER NOT NULL,
+            ff_uid TEXT NOT NULL,
+            ff_nome TEXT,
+            motivo TEXT NOT NULL,
+            adicionado_por INTEGER,
+            criado_em TEXT,
+            PRIMARY KEY (guild_id, ff_uid)
+        );
+
+        CREATE TABLE IF NOT EXISTS fila_espera (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            horario_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            criado_em TEXT,
+            UNIQUE(horario_id, user_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lines_salvas_user_modo
+            ON lines_salvas(guild_id, user_id, modo);
+        CREATE INDEX IF NOT EXISTS idx_ff_blacklist_guild_uid
+            ON ff_blacklist(guild_id, ff_uid);
+        CREATE INDEX IF NOT EXISTS idx_fila_espera_horario
+            ON fila_espera(horario_id);
         CREATE INDEX IF NOT EXISTS idx_horarios_guild_ativo
             ON horarios(guild_id, ativo);
         CREATE INDEX IF NOT EXISTS idx_slots_horario_confirmado
@@ -960,6 +1003,409 @@ async def obter_bloqueio_compra_min(guild_id: int) -> int:
     except (TypeError, ValueError):
         pass
     return BLOQUEIO_COMPRA_PADRAO_MIN
+
+
+async def obter_ff_nivel_min(guild_id: int) -> int:
+    """Level mínimo da conta no Free Fire para inscrição/substituição (padrão 20)."""
+    cfg = await obter_config(guild_id)
+    val = cfg.get("ff_nivel_min")
+    try:
+        if val is not None and str(val).strip() != "":
+            return max(0, min(int(val), 100))
+    except (TypeError, ValueError):
+        pass
+    return FF_NIVEL_MIN_PADRAO
+
+
+async def obter_substituicao_min(guild_id: int) -> int:
+    """Até quantos minutos antes do diário o capitão pode substituir membro na line (padrão 5)."""
+    cfg = await obter_config(guild_id)
+    val = cfg.get("substituicao_min")
+    try:
+        if val is not None and str(val).strip() != "":
+            return max(0, min(int(val), 720))
+    except (TypeError, ValueError):
+        pass
+    return SUBSTITUICAO_MIN_PADRAO
+
+
+# ==================== BLACKLIST DE ID FREE FIRE (v12.3) ====================
+
+async def obter_blacklist_ff(guild_id: int, ff_uid: str) -> Optional[dict]:
+    """Retorna os dados de banimento do ID numérico do Free Fire neste servidor, ou None."""
+    uid_limpo = re.sub(r"\D", "", str(ff_uid or ""))
+    if not uid_limpo:
+        return None
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            "SELECT * FROM ff_blacklist WHERE guild_id = ? AND ff_uid = ?",
+            (int(guild_id), uid_limpo),
+        )).fetchone()
+    return dict(row) if row else None
+
+
+async def listar_blacklist_ff(guild_id: int) -> list:
+    """Lista todos os IDs banidos na Blacklist do servidor."""
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT * FROM ff_blacklist WHERE guild_id = ? ORDER BY criado_em DESC",
+            (int(guild_id),),
+        )).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def banir_id_ff(guild_id: int, ff_uid: str, motivo: str, autor_id: int, ff_nome: str = "") -> dict:
+    """Adiciona ou atualiza um ID numérico do Free Fire na Blacklist do servidor."""
+    uid_limpo = re.sub(r"\D", "", str(ff_uid or ""))
+    motivo_limpo = (motivo or "Violação das regras").strip()[:220]
+    nome_limpo = (ff_nome or "").strip()[:60]
+    agora_iso = agora_brt().isoformat()
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute(
+            """
+            INSERT INTO ff_blacklist (guild_id, ff_uid, ff_nome, motivo, adicionado_por, criado_em)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, ff_uid) DO UPDATE SET
+                ff_nome = CASE WHEN excluded.ff_nome != '' THEN excluded.ff_nome ELSE ff_blacklist.ff_nome END,
+                motivo = excluded.motivo,
+                adicionado_por = excluded.adicionado_por,
+                criado_em = excluded.criado_em
+            """,
+            (int(guild_id), uid_limpo, nome_limpo, motivo_limpo, int(autor_id), agora_iso),
+        )
+        await db.commit()
+    marcar_sujo()
+    return {
+        "guild_id": int(guild_id),
+        "ff_uid": uid_limpo,
+        "ff_nome": nome_limpo,
+        "motivo": motivo_limpo,
+        "adicionado_por": int(autor_id),
+        "criado_em": agora_iso,
+    }
+
+
+async def remover_blacklist_ff(guild_id: int, ff_uid: str) -> bool:
+    """Remove um ID da Blacklist do servidor. Retorna True se existia e foi removido."""
+    uid_limpo = re.sub(r"\D", "", str(ff_uid or ""))
+    if not uid_limpo:
+        return False
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cur = await db.execute(
+            "DELETE FROM ff_blacklist WHERE guild_id = ? AND ff_uid = ?",
+            (int(guild_id), uid_limpo),
+        )
+        await db.commit()
+        removido = cur.rowcount > 0
+    if removido:
+        marcar_sujo()
+    return removido
+
+
+async def validar_regras_jogadores_ff(guild_id: int, jogadores_validados: list) -> Optional[tuple]:
+    """Valida Blacklist + Level mínimo do Free Fire em todos os jogadores da line.
+    Retorna `(titulo_erro, descricao_erro)` se houver bloqueio, ou `None` se tudo estiver limpo."""
+    nivel_min = await obter_ff_nivel_min(guild_id)
+    for j in jogadores_validados:
+        uid_j = str(j.get("uid") or "").strip()
+        nome_j = str(j.get("nome") or "???").strip()
+        nivel_j = int(j.get("nivel") or 0)
+
+        ban = await obter_blacklist_ff(guild_id, uid_j)
+        if ban:
+            return (
+                "🚫 Jogador na Blacklist",
+                f"O ID `{uid_j}` (**{ban.get('ff_nome') or nome_j}**) está **banido** neste servidor e não pode participar de diários.\n\n"
+                f"• **Motivo:** {ban.get('motivo') or 'Restrição ativa'}\n"
+                f"-# Qualquer membro pode consultar restrições em `/verificar`",
+            )
+
+        if nivel_min > 0 and nivel_j < nivel_min:
+            return (
+                "🛡️ Level Abaixo do Mínimo",
+                f"A conta **{nome_j}** (ID `{uid_j}`) está no **Level {nivel_j}**.\n"
+                f"• **Level mínimo exigido neste servidor:** `Level {nivel_min}`",
+            )
+    return None
+
+
+async def checar_uid_duplicado_horario(horario_id: int, uids: list, ignorar_slot_id: int = 0) -> Optional[dict]:
+    """Verifica se algum ID numérico de `uids` já está inscrito/reservado no mesmo `horario_id`."""
+    uids_limpos = [re.sub(r"\D", "", str(u or "")) for u in uids if str(u or "").strip()]
+    if not uids_limpos:
+        return None
+    placeholders = ", ".join("?" for _ in uids_limpos)
+    params = [int(horario_id)] + uids_limpos
+    sql = (
+        f"SELECT sj.ff_uid, sj.ff_nome, s.id AS slot_id, s.confirmado "
+        f"FROM slot_jogadores sj "
+        f"JOIN slots s ON s.id = sj.slot_id "
+        f"WHERE s.horario_id = ? AND sj.ff_uid IN ({placeholders})"
+    )
+    if ignorar_slot_id:
+        sql += " AND s.id != ?"
+        params.append(int(ignorar_slot_id))
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        dup = await (await db.execute(sql, tuple(params))).fetchone()
+    return dict(dup) if dup else None
+
+
+# ==================== LINES SALVAS POR MODO (1 FAVORITA + ATÉ 3 EXTRAS) ====================
+
+MAX_LINES_NORMAIS_POR_MODO = 3  # A Favorita NÃO consome espaço dessas 3 (total máx = 4 por modo)
+
+
+def _decodificar_line_row(row) -> dict:
+    d = dict(row)
+    try:
+        d["uids"] = json.loads(d.get("uids_json") or "[]")
+    except Exception:
+        d["uids"] = []
+    try:
+        d["nicks"] = json.loads(d.get("nicks_json") or "[]")
+    except Exception:
+        d["nicks"] = []
+    d["favorita"] = int(d.get("favorita") or 0) == 1
+    return d
+
+
+async def listar_lines_usuario(guild_id: int, user_id: int, modo: str) -> list:
+    """Retorna as lines salvas do jogador para `modo`, SEMPRE com a ⭐ Favorita no topo."""
+    modo_norm = str(modo or "").lower().strip()
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT * FROM lines_salvas WHERE guild_id = ? AND user_id = ? AND modo = ? "
+            "ORDER BY favorita DESC, id ASC",
+            (int(guild_id), int(user_id), modo_norm),
+        )).fetchall()
+    return [_decodificar_line_row(r) for r in rows]
+
+
+async def obter_line_por_id(line_id: int, guild_id: int, user_id: int) -> Optional[dict]:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute(
+            "SELECT * FROM lines_salvas WHERE id = ? AND guild_id = ? AND user_id = ?",
+            (int(line_id), int(guild_id), int(user_id)),
+        )).fetchone()
+    return _decodificar_line_row(row) if row else None
+
+
+async def salvar_nova_line(
+    guild_id: int,
+    user_id: int,
+    modo: str,
+    nome_line: str,
+    jogadores_validados: list,
+    como_favorita: bool = False,
+) -> tuple:
+    """Salva uma nova line respeitando a regra:
+    1 Line ⭐ Favorita (fixa no topo, não conta no limite das 3) + até 3 lines normais = até 4 por modo."""
+    modo_norm = str(modo or "").lower().strip()
+    nome_limpo = (nome_line or f"Line {modo_norm.capitalize()}").strip()[:32]
+    uids = [str(j["uid"]) for j in jogadores_validados]
+    nicks = [str(j["nome"]) for j in jogadores_validados]
+    agora_iso = agora_brt().isoformat()
+
+    atuais = await listar_lines_usuario(guild_id, user_id, modo_norm)
+    fav_atual = next((x for x in atuais if x["favorita"]), None)
+    normais_atuais = [x for x in atuais if not x["favorita"]]
+
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        if como_favorita:
+            if fav_atual is None:
+                cur = await db.execute(
+                    "INSERT INTO lines_salvas (guild_id, user_id, modo, nome_line, uids_json, nicks_json, favorita, criado_em, atualizado_em) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                    (int(guild_id), int(user_id), modo_norm, nome_limpo,
+                     json.dumps(uids, ensure_ascii=False), json.dumps(nicks, ensure_ascii=False),
+                     agora_iso, agora_iso),
+                )
+                await db.commit()
+                marcar_sujo()
+                return True, f"⭐ Line **{nome_limpo}** salva como **Favorita** no modo **{modo_norm.upper()}**!", cur.lastrowid
+            else:
+                if len(normais_atuais) < MAX_LINES_NORMAIS_POR_MODO:
+                    await db.execute(
+                        "UPDATE lines_salvas SET favorita = 0, atualizado_em = ? WHERE id = ?",
+                        (agora_iso, int(fav_atual["id"])),
+                    )
+                    cur = await db.execute(
+                        "INSERT INTO lines_salvas (guild_id, user_id, modo, nome_line, uids_json, nicks_json, favorita, criado_em, atualizado_em) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                        (int(guild_id), int(user_id), modo_norm, nome_limpo,
+                         json.dumps(uids, ensure_ascii=False), json.dumps(nicks, ensure_ascii=False),
+                         agora_iso, agora_iso),
+                    )
+                    await db.commit()
+                    marcar_sujo()
+                    return (
+                        True,
+                        f"⭐ **{nome_limpo}** agora é sua **Line Favorita** (e **{fav_atual['nome_line']}** foi mantida nas suas lines salvas)!",
+                        cur.lastrowid,
+                    )
+                return (
+                    False,
+                    f"Você já atingiu a capacidade máxima deste modo (**1 Favorita + {MAX_LINES_NORMAIS_POR_MODO} lines salvas**).\n"
+                    f"Use **✏️ Editar Line** (inclusive na Favorita) ou exclua uma line antiga em `/lines`.",
+                    None,
+                )
+        else:
+            if len(normais_atuais) >= MAX_LINES_NORMAIS_POR_MODO:
+                if fav_atual is None:
+                    return (
+                        False,
+                        f"Você já tem **{MAX_LINES_NORMAIS_POR_MODO}/{MAX_LINES_NORMAIS_POR_MODO}** lines normais neste modo, "
+                        f"mas ainda tem **1 vaga livre de ⭐ Line Favorita**! Salve marcando como Favorita ou edite uma existente em `/lines`.",
+                        None,
+                    )
+                return (
+                    False,
+                    f"Limite atingido neste modo (**1 Favorita + {MAX_LINES_NORMAIS_POR_MODO} lines salvas**).\n"
+                    f"Você pode **editar qualquer uma delas** (inclusive a ⭐ Favorita) em `/lines`!",
+                    None,
+                )
+            cur = await db.execute(
+                "INSERT INTO lines_salvas (guild_id, user_id, modo, nome_line, uids_json, nicks_json, favorita, criado_em, atualizado_em) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                (int(guild_id), int(user_id), modo_norm, nome_limpo,
+                 json.dumps(uids, ensure_ascii=False), json.dumps(nicks, ensure_ascii=False),
+                 agora_iso, agora_iso),
+            )
+            await db.commit()
+            marcar_sujo()
+            return True, f"💾 Line **{nome_limpo}** salva com sucesso no modo **{modo_norm.upper()}**!", cur.lastrowid
+
+
+async def editar_line_existente(
+    line_id: int,
+    guild_id: int,
+    user_id: int,
+    nome_line: str,
+    jogadores_validados: list,
+) -> tuple:
+    """Edita nome e IDs/Nicks de QUALQUER line salva (seja a ⭐ Favorita ou uma das 3 normais)."""
+    atual = await obter_line_por_id(line_id, guild_id, user_id)
+    if not atual:
+        return False, "Line não encontrada."
+    nome_limpo = (nome_line or atual["nome_line"]).strip()[:32]
+    uids = [str(j["uid"]) for j in jogadores_validados]
+    nicks = [str(j["nome"]) for j in jogadores_validados]
+    agora_iso = agora_brt().isoformat()
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute(
+            "UPDATE lines_salvas SET nome_line = ?, uids_json = ?, nicks_json = ?, atualizado_em = ? "
+            "WHERE id = ? AND guild_id = ? AND user_id = ?",
+            (nome_limpo, json.dumps(uids, ensure_ascii=False), json.dumps(nicks, ensure_ascii=False),
+             agora_iso, int(line_id), int(guild_id), int(user_id)),
+        )
+        await db.commit()
+    marcar_sujo()
+    selo = "⭐ Favorita" if atual["favorita"] else "💾 Salva"
+    return True, f"Line **{nome_limpo}** ({selo}) atualizada com sucesso!"
+
+
+async def alternar_favorita_line(line_id: int, guild_id: int, user_id: int) -> tuple:
+    """Define `line_id` como ⭐ Favorita do seu modo (trocando com a Favorita anterior se houver)."""
+    alvo = await obter_line_por_id(line_id, guild_id, user_id)
+    if not alvo:
+        return False, "Line não encontrada."
+    modo_norm = alvo["modo"]
+    atuais = await listar_lines_usuario(guild_id, user_id, modo_norm)
+    normais_qtd = sum(1 for x in atuais if not x["favorita"])
+    agora_iso = agora_brt().isoformat()
+
+    if alvo["favorita"]:
+        if normais_qtd >= MAX_LINES_NORMAIS_POR_MODO:
+            return (
+                False,
+                f"Você já possui {MAX_LINES_NORMAIS_POR_MODO} outras lines salvas neste modo. "
+                f"Escolha outra line para assumir o posto de ⭐ Favorita!",
+            )
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute(
+                "UPDATE lines_salvas SET favorita = 0, atualizado_em = ? WHERE id = ?",
+                (agora_iso, int(line_id)),
+            )
+            await db.commit()
+        marcar_sujo()
+        return True, f"A line **{alvo['nome_line']}** deixou de ser Favorita e foi movida para suas lines normais."
+
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute(
+            "UPDATE lines_salvas SET favorita = 0, atualizado_em = ? WHERE guild_id = ? AND user_id = ? AND modo = ?",
+            (agora_iso, int(guild_id), int(user_id), modo_norm),
+        )
+        await db.execute(
+            "UPDATE lines_salvas SET favorita = 1, atualizado_em = ? WHERE id = ?",
+            (agora_iso, int(line_id)),
+        )
+        await db.commit()
+    marcar_sujo()
+    return True, f"⭐ **{alvo['nome_line']}** agora está fixada no topo como sua **Line Favorita**!"
+
+
+async def excluir_line_salva(line_id: int, guild_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cur = await db.execute(
+            "DELETE FROM lines_salvas WHERE id = ? AND guild_id = ? AND user_id = ?",
+            (int(line_id), int(guild_id), int(user_id)),
+        )
+        await db.commit()
+        ok = cur.rowcount > 0
+    if ok:
+        marcar_sujo()
+    return ok
+
+
+# ==================== FILA DE ESPERA INTELIGENTE (v12.3) ====================
+
+async def esta_na_fila_espera(horario_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        row = await (await db.execute(
+            "SELECT 1 FROM fila_espera WHERE horario_id = ? AND user_id = ?",
+            (int(horario_id), int(user_id)),
+        )).fetchone()
+    return row is not None
+
+
+async def entrar_fila_espera(guild_id: int, horario_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO fila_espera (guild_id, horario_id, user_id, criado_em) VALUES (?, ?, ?, ?)",
+            (int(guild_id), int(horario_id), int(user_id), agora_brt().isoformat()),
+        )
+        await db.commit()
+        inseriu = cur.rowcount > 0
+    if inseriu:
+        marcar_sujo()
+    return inseriu
+
+
+async def sair_fila_espera(horario_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        cur = await db.execute(
+            "DELETE FROM fila_espera WHERE horario_id = ? AND user_id = ?",
+            (int(horario_id), int(user_id)),
+        )
+        await db.commit()
+        saiu = cur.rowcount > 0
+    if saiu:
+        marcar_sujo()
+    return saiu
+
+
+async def contar_fila_espera(horario_id: int) -> int:
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        row = await (await db.execute(
+            "SELECT COUNT(*) FROM fila_espera WHERE horario_id = ?",
+            (int(horario_id),),
+        )).fetchone()
+    return int(row[0] or 0) if row else 0
 
 
 def pode_comprar_vaga(horario_str: str, lotes_usados: int, lotes_total: int,
@@ -1943,15 +2389,700 @@ async def obter_slots_data(horario_id: int) -> list:
     return resultado
 
 
+# ==================== PAINEL MINIMALISTA DO CANAL DA SALA (v12.3) ====================
+
+_SALAS_VIEWS_REGISTRADAS = set()
+
+
+def _garantir_view_sala_registrada(horario_id: int) -> "SalaTabelaPainelView":
+    hid = int(horario_id)
+    view = SalaTabelaPainelView(hid)
+    if hid not in _SALAS_VIEWS_REGISTRADAS:
+        try:
+            bot.add_view(view)
+            _SALAS_VIEWS_REGISTRADAS.add(hid)
+        except Exception:
+            pass
+    return view
+
+
+class SubstituirJogadorModal(discord.ui.Modal, title="🔄 Substituir Jogador da Line"):
+    novo_uid = discord.ui.TextInput(
+        label="Novo ID numérico do Free Fire",
+        placeholder="Ex: 158492031 (apenas números, 5 a 15 dígitos)",
+        min_length=5,
+        max_length=15,
+        required=True,
+    )
+
+    def __init__(self, horario_id: int, slot_id: int, posicao: int, nick_antigo: str):
+        super().__init__()
+        self.horario_id = int(horario_id)
+        self.slot_id = int(slot_id)
+        self.posicao = int(posicao)
+        self.nick_antigo = nick_antigo
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not interaction.guild:
+            return
+        uid = re.sub(r"\D", "", self.novo_uid.value or "")
+        if not (5 <= len(uid) <= 15):
+            return await interaction.followup.send(
+                embed=criar_embed("❌ ID Inválido", "Informe apenas os números do ID do Free Fire (5 a 15 dígitos).", "Vermelho"),
+                ephemeral=True,
+            )
+
+        sub_min = await obter_substituicao_min(interaction.guild.id)
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (self.horario_id,))).fetchone()
+            slot = await (await db.execute(
+                "SELECT * FROM slots WHERE id = ? AND horario_id = ? AND confirmado = 1",
+                (self.slot_id, self.horario_id),
+            )).fetchone()
+
+        if not horario or not slot:
+            return await interaction.followup.send(
+                embed=criar_embed("❌ Vaga não localizada", "Esta sala ou inscrição não está mais ativa.", "Vermelho"),
+                ephemeral=True,
+            )
+        if int(slot["comprador_id"]) != interaction.user.id and not await e_dono_ou_gerente(interaction.user):
+            return await interaction.followup.send(
+                embed=criar_embed("🔒 Apenas o Capitão", "Somente quem comprou a vaga (ou Dono/Gerente) pode alterar esta line.", "Vermelho"),
+                ephemeral=True,
+            )
+
+        faltam_seg = (horario_para_datetime(horario["horario"]) - agora_brt()).total_seconds()
+        if bool(dict(horario).get("encerrado_hoje", 0)) or faltam_seg < sub_min * 60:
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "⏱️ Prazo de Substituição Encerrado",
+                    f"Substituições na line são permitidas até **{sub_min} min antes** do início (`{horario['horario']}`).",
+                    "Amarelo",
+                ),
+                ephemeral=True,
+            )
+
+        # Anti-duplicidade em todo o horário (incluindo a própria line)
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            dup = await (await db.execute(
+                "SELECT sj.ff_uid, sj.ff_nome, sj.slot_id, sj.posicao "
+                "FROM slot_jogadores sj JOIN slots s ON s.id = sj.slot_id "
+                "WHERE s.horario_id = ? AND sj.ff_uid = ? AND NOT (sj.slot_id = ? AND sj.posicao = ?) LIMIT 1",
+                (self.horario_id, uid, self.slot_id, self.posicao),
+            )).fetchone()
+        if dup:
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "⚠️ ID já inscrito neste horário",
+                    f"O ID `{uid}` (`{dup['ff_nome']}`) já está inscrito neste mesmo diário.",
+                    "Amarelo",
+                ),
+                ephemeral=True,
+            )
+
+        res = await verificar_ff(uid)
+        if not res.get("ok"):
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "❌ ID não validado no Free Fire",
+                    res.get("mensagem", "Não foi possível validar esse ID agora."),
+                    "Vermelho",
+                ),
+                ephemeral=True,
+            )
+
+        jogador_val = {
+            "uid": uid,
+            "nome": str(res.get("nome") or uid).strip(),
+            "nivel": int(res.get("nivel") or 0),
+        }
+        bloqueio_regra = await validar_regras_jogadores_ff(interaction.guild.id, [jogador_val])
+        if bloqueio_regra:
+            return await interaction.followup.send(
+                embed=criar_embed(bloqueio_regra[0], bloqueio_regra[1], "Vermelho"),
+                ephemeral=True,
+            )
+
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute(
+                "UPDATE slot_jogadores SET ff_uid = ?, ff_nome = ?, ff_nivel = ? WHERE slot_id = ? AND posicao = ?",
+                (jogador_val["uid"], jogador_val["nome"], jogador_val["nivel"], self.slot_id, self.posicao),
+            )
+            await db.commit()
+        marcar_sujo()
+
+        try:
+            await atualizar_tabela(interaction.guild, self.horario_id)
+        except Exception:
+            pass
+
+        await registrar_log(
+            interaction.guild,
+            "🔄 SUBSTITUIÇÃO",
+            "🔄 Jogador substituído na tabela",
+            f"• **Horário:** `{horario['horario']}` ({formatar_rotulo_diario(horario['tipo'], horario['categoria'])})\n"
+            f"• **Vaga:** `#{slot['numero']}` • Capitão: {interaction.user.mention}\n"
+            f"• **Saiu (J{self.posicao}):** `{self.nick_antigo}`\n"
+            f"• **Entrou (J{self.posicao}):** `{jogador_val['nome']}` (Nv. {jogador_val['nivel']} • ID `{jogador_val['uid']}`)",
+            "Esmeralda",
+        )
+        await interaction.followup.send(
+            embed=criar_embed(
+                "✅ Substituição Concluída",
+                f"**Posição J{self.posicao}** atualizada na tabela!\n\n"
+                f"• **Saiu:** `{self.nick_antigo}`\n"
+                f"• **Entrou:** `{jogador_val['nome']}` (Nv. `{jogador_val['nivel']}` • ID `{jogador_val['uid']}`)",
+                "Esmeralda",
+            ),
+            ephemeral=True,
+        )
+
+
+class SubstituirJogadorSelectView(discord.ui.View):
+    def __init__(self, horario_id: int, slot_id: int, jogadores: list):
+        super().__init__(timeout=180)
+        self.horario_id = int(horario_id)
+        self.slot_id = int(slot_id)
+        self.mapa = {int(j["posicao"]): j for j in jogadores}
+        opcoes = [
+            discord.SelectOption(
+                label=f"J{j['posicao']} • {str(j['ff_nome'] or '???')[:75]}",
+                value=str(j["posicao"]),
+                emoji="🔄",
+                description=f"ID atual: {j['ff_uid']} (Nv. {j['ff_nivel'] or 0})"[:100],
+            )
+            for j in jogadores[:25]
+        ]
+        sel = discord.ui.Select(
+            placeholder="🔄 Escolha qual jogador da sua line deseja trocar...",
+            options=opcoes,
+        )
+        sel.callback = self._escolher
+        self.add_item(sel)
+
+    async def _escolher(self, interaction: discord.Interaction):
+        pos = int(interaction.data["values"][0])
+        j = self.mapa.get(pos, {})
+        await interaction.response.send_modal(
+            SubstituirJogadorModal(self.horario_id, self.slot_id, pos, str(j.get("ff_nome") or "???"))
+        )
+
+
+class LiberarVisaoLineView(discord.ui.View):
+    """Permite ao capitão da vaga liberar APENAS leitura do canal da sala para colegas da sua line."""
+
+    def __init__(self, horario_id: int, max_membros: int):
+        super().__init__(timeout=180)
+        self.horario_id = int(horario_id)
+        self.max_membros = max(1, min(int(max_membros), 4))
+        usel = discord.ui.UserSelect(
+            placeholder="👥 Selecione o(s) membro(s) da sua line...",
+            min_values=1,
+            max_values=self.max_membros,
+        )
+        usel.callback = self._liberar
+        self.add_item(usel)
+
+    async def _liberar(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            return
+        canal = interaction.channel
+        liberados = []
+        for alvo in interaction.data.get("resolved", {}).get("users", {}).keys():
+            membro = await membro_do_guild(interaction.guild, int(alvo))
+            if not membro or membro.bot:
+                continue
+            try:
+                await canal.set_permissions(
+                    membro,
+                    view_channel=True,
+                    read_message_history=True,
+                    send_messages=False,
+                    add_reactions=False,
+                    create_public_threads=False,
+                    create_private_threads=False,
+                )
+                liberados.append(membro.mention)
+            except Exception:
+                continue
+
+        if not liberados:
+            return await interaction.followup.send(
+                embed=criar_embed("⚠️ Nenhum membro liberado", "Não foi possível conceder leitura a esse usuário.", "Amarelo"),
+                ephemeral=True,
+            )
+
+        await interaction.followup.send(
+            embed=criar_embed(
+                "🔓 Visão Liberada (Somente Leitura)",
+                f"Acesso de visualização liberado neste canal para: {', '.join(liberados)}.\n"
+                f"-# O bate-papo continua bloqueado — eles verão apenas a tabela e o ID/Senha da sala.",
+                "Esmeralda",
+            ),
+            ephemeral=True,
+        )
+
+
+class DefinirSalaCanalModal(discord.ui.Modal, title="🔑 Definir ID e Senha desta Sala"):
+    sala_id = discord.ui.TextInput(
+        label="ID da Sala personalizada no Free Fire",
+        placeholder="Ex: 8492019",
+        min_length=3,
+        max_length=25,
+        required=True,
+    )
+    senha = discord.ui.TextInput(
+        label="Senha da Sala",
+        placeholder="Ex: 12",
+        min_length=1,
+        max_length=20,
+        required=True,
+    )
+
+    def __init__(self, horario_id: int):
+        super().__init__()
+        self.horario_id = int(horario_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not interaction.guild:
+            return
+        if not await e_staff(interaction.user):
+            return await interaction.followup.send(
+                embed=criar_embed("❌ Sem Permissão", "Apenas ADM, Gerente ou Dono pode definir o ID e Senha.", "Vermelho"),
+                ephemeral=True,
+            )
+
+        sid = (self.sala_id.value or "").strip()
+        snh = (self.senha.value or "").strip()
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (self.horario_id,))).fetchone()
+            if not horario:
+                return await interaction.followup.send(
+                    embed=criar_embed("❌ Sala não encontrada", "Este horário não está mais ativo.", "Vermelho"),
+                    ephemeral=True,
+                )
+            await db.execute(
+                "DELETE FROM salas WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? AND enviado = 0",
+                (interaction.guild.id, horario["tipo"], horario["categoria"], horario["horario"]),
+            )
+            await db.execute(
+                "INSERT INTO salas (guild_id, tipo, categoria, horario, sala_id, sala_senha, enviado, criado_em) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+                (interaction.guild.id, horario["tipo"], horario["categoria"], horario["horario"],
+                 sid, snh, agora_brt().isoformat()),
+            )
+            await db.execute(
+                "UPDATE horarios SET sala_id = ?, sala_senha = ?, alerta_ish_enviado = 1 WHERE id = ?",
+                (sid, snh, self.horario_id),
+            )
+            await db.commit()
+        marcar_sujo()
+
+        diferenca = (horario_para_datetime(horario["horario"]) - agora_brt()).total_seconds()
+        rotulo_h = formatar_rotulo_diario(horario["tipo"], horario["categoria"])
+        embed_ok = criar_embed(
+            "✅ ID e Senha Configurados",
+            f"**{rotulo_h}** — `{horario['horario']}`\n\n"
+            f"• **🆔 ID:** `{sid}`\n"
+            f"• **🔑 Senha:** `{snh}`",
+            "Esmeralda",
+        )
+
+        if diferenca <= 300:
+            total_env = await enviar_sala(
+                interaction.guild, horario["tipo"], horario["categoria"], horario["horario"], sid, snh
+            )
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                await db.execute(
+                    "UPDATE salas SET enviado = 1 WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? AND enviado = 0",
+                    (interaction.guild.id, horario["tipo"], horario["categoria"], horario["horario"]),
+                )
+                await db.commit()
+            embed_ok.add_field(
+                name="🚨 Publicado Agora",
+                value=f"Sala publicada imediatamente neste canal para **{total_env}** inscrito(s)!",
+                inline=False,
+            )
+        else:
+            embed_ok.add_field(
+                name="⏱️ Envio Automático Agendado",
+                value=f"O bot publicará automaticamente neste canal **5 minutos antes** (`~{int(diferenca // 60)} min`).",
+                inline=False,
+            )
+
+        await registrar_log(
+            interaction.guild,
+            "🔑 SALA DEFINIDA",
+            "🔑 ID/Senha registrados pelo painel da sala",
+            f"{interaction.user.mention} configurou `{rotulo_h}` às `{horario['horario']}` (ID `{sid}`).",
+            "Esmeralda",
+        )
+        await interaction.followup.send(embed=embed_ok, ephemeral=True)
+
+
+class ConfirmarCancelamentoQuorumView(discord.ui.View):
+    """Confirmação minimalista (Dono/Gerente) para cancelar sala sem quórum e estornar todos em moedas."""
+
+    def __init__(self, horario_id: int):
+        super().__init__(timeout=120)
+        self.horario_id = int(horario_id)
+        sel = discord.ui.Select(
+            placeholder="⚠️ Confirme o cancelamento e estorno em moedas...",
+            options=[
+                discord.SelectOption(
+                    label="Confirmar Cancelamento + Estorno em Moedas",
+                    value="confirmar",
+                    emoji="✅",
+                    description="Credita moedas na carteira de todos os inscritos e encerra o horário",
+                ),
+                discord.SelectOption(
+                    label="Abortar (Manter sala ativa)",
+                    value="abortar",
+                    emoji="↩️",
+                    description="Não faz nenhuma alteração",
+                ),
+            ],
+        )
+        sel.callback = self._decidir
+        self.add_item(sel)
+
+    async def _decidir(self, interaction: discord.Interaction):
+        escolha = interaction.data["values"][0]
+        if escolha == "abortar":
+            return await interaction.response.edit_message(
+                embed=criar_embed("↩️ Operação Abortada", "A sala permanece ativa sem alterações.", "Cinza Escuro"),
+                view=None,
+            )
+        if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente pode cancelar salas e estornar vagas.", "Vermelho"),
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (self.horario_id,))).fetchone()
+            if not horario:
+                return await interaction.followup.send(
+                    embed=criar_embed("❌ Horário não encontrado", "Este horário já foi removido.", "Vermelho"),
+                    ephemeral=True,
+                )
+            slots_todos = await (await db.execute(
+                "SELECT * FROM slots WHERE horario_id = ?", (self.horario_id,)
+            )).fetchall()
+
+        estornados_qtd = 0
+        total_estornado = 0.0
+        canais_pendentes = []
+
+        for s in slots_todos:
+            s_d = dict(s)
+            comp_id = int(s_d["comprador_id"])
+            confirmado = int(s_d.get("confirmado") or 0) == 1
+            pago_moedas = int(s_d.get("pago_moedas") or 0) == 1
+            valor_estorno = 0.0
+
+            if confirmado:
+                if pago_moedas:
+                    valor_estorno = arredondar(
+                        float(s_d.get("valor_moedas") or s_d.get("valor_cobrado") or 0)
+                        + float(s_d.get("taxa_adm_pix") or 0)
+                    )
+                else:
+                    valor_estorno = arredondar(float(s_d.get("valor_cobrado") or horario["valor"] or 0))
+            elif pago_moedas:
+                valor_estorno = arredondar(float(s_d.get("valor_moedas") or s_d.get("valor_cobrado") or 0))
+
+            if not confirmado and s_d.get("canal_pag"):
+                canais_pendentes.append(int(s_d["canal_pag"]))
+
+            if valor_estorno > 0:
+                novo_saldo = await creditar_saldo(
+                    comp_id,
+                    interaction.guild.id,
+                    valor_estorno,
+                    "estorno_quorum",
+                    f"Estorno sala cancelada (sem quórum) • {horario['horario']}",
+                    ref=f"quorum:{s_d['id']}",
+                )
+                estornados_qtd += 1
+                total_estornado = arredondar(total_estornado + valor_estorno)
+                await avisar_jogador(
+                    comp_id,
+                    embed=criar_embed(
+                        "🪙 Sala Cancelada — Estorno Automático em Moedas",
+                        f"O diário **{formatar_rotulo_diario(horario['tipo'], horario['categoria'])}** das **`{horario['horario']}`** "
+                        f"foi cancelado por falta de quórum.\n\n"
+                        f"• **Estorno creditado:** **`{formatar_moeda(valor_estorno)}`** em moedas\n"
+                        f"• **Novo saldo na sua carteira:** `{formatar_moeda(novo_saldo)}`\n"
+                        f"-# Use suas moedas em qualquer próximo horário disponível!",
+                        "Dourado",
+                    ),
+                )
+
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            for s in slots_todos:
+                await db.execute("DELETE FROM slot_jogadores WHERE slot_id = ?", (s["id"],))
+            await db.execute("DELETE FROM slots WHERE horario_id = ?", (self.horario_id,))
+            await db.execute("DELETE FROM fila_espera WHERE horario_id = ?", (self.horario_id,))
+            await db.execute(
+                "UPDATE horarios SET lotes_usados = 0, encerrado_hoje = 1 WHERE id = ?",
+                (self.horario_id,),
+            )
+            await db.commit()
+        marcar_sujo()
+
+        for cid in canais_pendentes:
+            ch = interaction.guild.get_channel(cid)
+            if ch:
+                await _apagar_canal_seguro(ch, "Sala cancelada sem quórum")
+
+        try:
+            await rebuild_painel(interaction.guild, int(horario["painel_id"]))
+        except Exception:
+            pass
+        try:
+            await atualizar_tabela(interaction.guild, self.horario_id)
+        except Exception:
+            pass
+
+        if isinstance(interaction.channel, discord.TextChannel):
+            try:
+                await interaction.channel.send(
+                    embed=criar_embed(
+                        "↩️ Sala Cancelada (Sem Quórum)",
+                        f"Este horário (`{horario['horario']}`) foi encerrado pela gerência ({interaction.user.mention}).\n"
+                        f"• **Jogadores estornados em moedas:** `{estornados_qtd}` (`{formatar_moeda(total_estornado)}`)\n"
+                        f"-# Quando desejar apagar este canal, use **🔒 Fechar e Apagar Canal desta Sala** no seletor.",
+                        "Dourado",
+                    )
+                )
+            except Exception:
+                pass
+
+        await registrar_log(
+            interaction.guild,
+            "↩️ SEM QUÓRUM",
+            "↩️ Sala cancelada + estorno em massa concluído",
+            f"• **Responsável:** {interaction.user.mention}\n"
+            f"• **Diário:** {formatar_rotulo_diario(horario['tipo'], horario['categoria'])} às `{horario['horario']}`\n"
+            f"• **Estornos creditados:** `{estornados_qtd}` jogador(es) • Total `{formatar_moeda(total_estornado)}`",
+            "Dourado",
+        )
+        await interaction.edit_original_response(
+            embed=criar_embed(
+                "✅ Cancelamento e Estornos Concluídos",
+                f"• **Inscritos estornados:** `{estornados_qtd}`\n"
+                f"• **Total devolvido em moedas:** `{formatar_moeda(total_estornado)}`",
+                "Esmeralda",
+            ),
+            view=None,
+        )
+
+
+class SalaTabelaPainelView(discord.ui.View):
+    """Painel minimalista único no canal da tabela da sala:
+    • Jogadores confirmados: substituir membro da line / liberar visão somente-leitura p/ equipe
+    • Staff (ADM/Gerente/Dono): definir ID e Senha direto na sala
+    • Dono e Gerente: cancelar sem quórum (estorno em moedas) / fechar e apagar o canal manualmente."""
+
+    def __init__(self, horario_id: int):
+        super().__init__(timeout=None)
+        self.horario_id = int(horario_id)
+        sel = discord.ui.Select(
+            custom_id=f"ff_tab_sel:{self.horario_id}",
+            placeholder="⚙️ Opções desta sala (Line • ID/Senha • Gerência)...",
+            options=[
+                discord.SelectOption(
+                    label="Substituir Jogador da Minha Line",
+                    value="substituir",
+                    emoji="🔄",
+                    description="Capitão troca um ID da sua line antes do horário limite",
+                ),
+                discord.SelectOption(
+                    label="Liberar Visão p/ Membro da Minha Line",
+                    value="liberar_amigo",
+                    emoji="👥",
+                    description="Concede somente leitura desta sala aos membros da sua equipe",
+                ),
+                discord.SelectOption(
+                    label="Definir ID e Senha desta Sala",
+                    value="ish",
+                    emoji="🔑",
+                    description="ADM/Gerente/Dono registra ID e Senha direto neste canal",
+                ),
+                discord.SelectOption(
+                    label="Cancelar Sala (Sem Quórum) + Estornar",
+                    value="cancelar_quorum",
+                    emoji="↩️",
+                    description="Dono/Gerente: devolve em moedas a todos os inscritos",
+                ),
+                discord.SelectOption(
+                    label="Fechar e Apagar Canal desta Sala",
+                    value="fechar_canal",
+                    emoji="🔒",
+                    description="Dono/Gerente: encerra manualmente e apaga este canal",
+                ),
+            ],
+        )
+        sel.callback = self._rotear
+        self.add_item(sel)
+
+    async def _rotear(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        acao = interaction.data["values"][0]
+        try:
+            await interaction.message.edit(view=SalaTabelaPainelView(self.horario_id))
+        except Exception:
+            pass
+
+        if acao == "ish":
+            if not await e_staff(interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Restrito à Equipe", "Apenas ADM, Gerente ou Dono pode definir o ID e Senha da sala.", "Vermelho"),
+                    ephemeral=True,
+                )
+            return await interaction.response.send_modal(DefinirSalaCanalModal(self.horario_id))
+
+        if acao == "cancelar_quorum":
+            if not await e_dono_ou_gerente(interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente **Dono** ou **Gerente** pode cancelar uma sala e estornar inscritos.", "Vermelho"),
+                    ephemeral=True,
+                )
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "⚠️ Cancelar Sala por Falta de Quórum?",
+                    "Ao confirmar, todas as vagas confirmadas (ou pagas em moedas) deste horário receberão **100% de estorno automático em moedas** na carteira pessoal e serão avisadas na DM.",
+                    "Dourado",
+                ),
+                view=ConfirmarCancelamentoQuorumView(self.horario_id),
+                ephemeral=True,
+            )
+
+        if acao == "fechar_canal":
+            if not await e_dono_ou_gerente(interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente **Dono** ou **Gerente** pode fechar e apagar o canal da sala.", "Vermelho"),
+                    ephemeral=True,
+                )
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Encerrando Canal da Sala", "Salvando registro no log e apagando este canal em 3 segundos...", "Cinza Escuro"),
+                ephemeral=True,
+            )
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                await db.execute(
+                    "UPDATE horarios SET canal_tabela = NULL, msg_tabela = NULL WHERE id = ?",
+                    (self.horario_id,),
+                )
+                await db.commit()
+            marcar_sujo()
+            await asyncio.sleep(3)
+            await _apagar_canal_seguro(
+                interaction.channel,
+                f"Canal da sala #{self.horario_id} fechado por {interaction.user.display_name}",
+            )
+            return
+
+        # Opções do Capitão da vaga (substituir / liberar_amigo)
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (self.horario_id,))).fetchone()
+            slot = await (await db.execute(
+                "SELECT * FROM slots WHERE horario_id = ? AND comprador_id = ? AND confirmado = 1",
+                (self.horario_id, interaction.user.id),
+            )).fetchone()
+
+        if not horario:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sala não encontrada", "Este horário não está mais ativo.", "Vermelho"),
+                ephemeral=True,
+            )
+        if not slot:
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "🔒 Apenas Capitães Confirmados",
+                    "Você precisa ter uma vaga **confirmada** neste horário para gerenciar sua line aqui.",
+                    "Amarelo",
+                ),
+                ephemeral=True,
+            )
+
+        if acao == "liberar_amigo":
+            qtd_modo = JOGADORES_POR_LOTE.get(horario["tipo"], 1)
+            if qtd_modo <= 1:
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Modo Solo", "Salas Solo possuem apenas 1 jogador por vaga (você já tem acesso).", "Cinza Escuro"),
+                    ephemeral=True,
+                )
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "👥 Liberar Visão p/ Sua Line",
+                    f"Selecione abaixo até **{qtd_modo - 1}** colega(s) do seu time para enxergarem a tabela e o ID/Senha *(somente leitura, sem abrir o chat)*:",
+                    "Cinza Escuro",
+                ),
+                view=LiberarVisaoLineView(self.horario_id, qtd_modo - 1),
+                ephemeral=True,
+            )
+
+        if acao == "substituir":
+            sub_min = await obter_substituicao_min(interaction.guild.id)
+            faltam_seg = (horario_para_datetime(horario["horario"]) - agora_brt()).total_seconds()
+            if bool(dict(horario).get("encerrado_hoje", 0)) or faltam_seg < sub_min * 60:
+                return await interaction.response.send_message(
+                    embed=criar_embed(
+                        "⏱️ Prazo de Substituição Encerrado",
+                        f"A substituição de jogadores na line fica disponível até **{sub_min} min antes** do início (`{horario['horario']}`).",
+                        "Amarelo",
+                    ),
+                    ephemeral=True,
+                )
+
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                db.row_factory = aiosqlite.Row
+                jogadores = await (await db.execute(
+                    "SELECT posicao, ff_uid, ff_nome, ff_nivel FROM slot_jogadores WHERE slot_id = ? ORDER BY posicao",
+                    (slot["id"],),
+                )).fetchall()
+            jogadores_lista = [dict(j) for j in jogadores]
+            if not jogadores_lista:
+                return await interaction.response.send_message(
+                    embed=criar_embed("⚠️ Sem jogadores", "Não há jogadores vinculados a esta vaga.", "Amarelo"),
+                    ephemeral=True,
+                )
+            if len(jogadores_lista) == 1:
+                j0 = jogadores_lista[0]
+                return await interaction.response.send_modal(
+                    SubstituirJogadorModal(self.horario_id, int(slot["id"]), int(j0["posicao"]), str(j0["ff_nome"] or "???"))
+                )
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "🔄 Substituir Jogador da Line",
+                    f"Selecione qual posição da sua **{texto_slot(horario['tipo'])} #{slot['numero']}** você deseja substituir:",
+                    "Cinza Escuro",
+                ),
+                view=SubstituirJogadorSelectView(self.horario_id, int(slot["id"]), jogadores_lista),
+                ephemeral=True,
+            )
+
+
 async def atualizar_tabela(guild: discord.Guild, horario_id: int):
-    """Edita (ou publica) a tabela em texto no canal do diário."""
+    """Edita (ou publica) a tabela em texto + painel minimalista no canal do diário."""
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (horario_id,))).fetchone()
         if not horario or not horario["canal_tabela"]:
             return
         ocupadas = (await (await db.execute(
-            "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (horario_id,)
+            "SELECT COUNT(*) FROM slots WHERE horario_id = ? AND confirmado = 1", (horario_id,)
         )).fetchone())[0]
 
     canal = guild.get_channel(horario["canal_tabela"])
@@ -1963,16 +3094,20 @@ async def atualizar_tabela(guild: discord.Guild, horario_id: int):
         dict(horario), dados_slots, ocupadas,
         atualizado_em=agora_brt().strftime("%H:%M:%S")
     )
+    view_sala = _garantir_view_sala_registrada(horario_id)
 
     if horario["msg_tabela"]:
         try:
             mensagem = await canal.fetch_message(horario["msg_tabela"])
-            await mensagem.edit(embed=embed)
+            if mensagem.components:
+                await mensagem.edit(embed=embed)
+            else:
+                await mensagem.edit(embed=embed, view=view_sala)
             return
         except discord.NotFound:
             pass
 
-    nova_msg = await canal.send(embed=embed)
+    nova_msg = await canal.send(embed=embed, view=view_sala)
     async with aiosqlite.connect(DATABASE_FILE) as db:
         await db.execute("UPDATE horarios SET msg_tabela = ? WHERE id = ?", (nova_msg.id, horario_id))
         await db.commit()
@@ -2130,6 +3265,23 @@ async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[in
         rotulo_vagas = texto_slot(tipo).lower() if restantes == 1 else rotulo_plural.lower()
 
         if not pode:
+            fila_aberta = (
+                ocupadas >= total
+                and not encerrado_hoje
+                and diferenca > max(0, int(bloqueio_min)) * 60
+            )
+            if fila_aberta:
+                linhas_visiveis.append(
+                    f"🔔 `{h_dict['horario']}` • **{formatar_moeda(h_dict['valor'])}** — *Lotado ({ocupadas}/{total}) • Fila de Espera*"
+                )
+                opcoes_select.append(discord.SelectOption(
+                    label=f"{h_dict['horario']}  •  {formatar_moeda(h_dict['valor'])} (Lotado)",
+                    value=str(h_dict["id"]),
+                    description=f"Lotado ({ocupadas}/{total}) • Toque p/ entrar na Fila de Espera"[:100],
+                    emoji="🔔",
+                ))
+                continue
+
             fechados += 1
             if encerrado_hoje or diferenca < 0:
                 status_vis = "Encerrado • reabre amanhã" if repetir else "Encerrado"
@@ -2305,17 +3457,46 @@ class HorarioSelectMenu(discord.ui.Select):
             )
 
         h_dict = dict(horario)
+        total_modo = LOTES_POR_MODO[h_dict["tipo"]]
+        diferenca_seg = (horario_para_datetime(h_dict["horario"]) - agora_brt()).total_seconds()
+        encerrado_hoje = bool(h_dict.get("encerrado_hoje", 0))
         pode, motivo = pode_comprar_vaga(
-            h_dict["horario"], ocupadas, LOTES_POR_MODO[h_dict["tipo"]],
+            h_dict["horario"], ocupadas, total_modo,
             bloqueio_min=bloqueio_min,
             repetir=bool(h_dict.get("repetir_diario", 0)),
-            encerrado_hoje=bool(h_dict.get("encerrado_hoje", 0))
+            encerrado_hoje=encerrado_hoje
         )
         if not pode:
             await rebuild_painel(interaction.guild, int(h_dict["painel_id"]))
+            if ocupadas >= total_modo and not encerrado_hoje and diferenca_seg > max(0, int(bloqueio_min)) * 60:
+                ja_fila = await esta_na_fila_espera(horario_id, interaction.user.id)
+                qtd_fila = await contar_fila_espera(horario_id)
+                status_fila = "✅ Você **já está** na fila de espera deste horário." if ja_fila else "🔔 Quer receber aviso na DM se abrir vaga?"
+                return await interaction.response.send_message(
+                    embed=criar_embed(
+                        f"🔔 Sala Lotada ({ocupadas}/{total_modo}) — Fila de Espera",
+                        f"**{formatar_rotulo_diario(h_dict['tipo'], h_dict['categoria'])}** às **`{h_dict['horario']}`**\n\n"
+                        f"• {status_fila}\n"
+                        f"• **Jogadores aguardando:** `{qtd_fila}`\n"
+                        f"-# Se uma reserva pendente expirar ou for recusada, avisaremos você imediatamente na DM!",
+                        "Dourado",
+                    ),
+                    view=FilaEsperaView(horario_id, h_dict),
+                    ephemeral=True,
+                )
             return await interaction.response.send_message(
                 embed=criar_embed("🔒 Compra bloqueada", motivo, "Vermelho"),
                 ephemeral=True
+            )
+
+        lines_salvas = await listar_lines_usuario(interaction.guild.id, interaction.user.id, h_dict["tipo"])
+        if lines_salvas:
+            await rebuild_painel(interaction.guild, int(h_dict["painel_id"]))
+            embed_rap = _montar_embed_inscricao_rapida(h_dict, lines_salvas)
+            return await interaction.response.send_message(
+                embed=embed_rap,
+                view=InscricaoRapidaView(horario_id, h_dict, lines_salvas),
+                ephemeral=True,
             )
 
         modal = ComprarSlotModal(
@@ -2384,15 +3565,879 @@ class PainelInscricaoView(discord.ui.View):
             self.add_item(PainelPaginaSelect(painel_id, page, total_paginas))
 
 
+# ==================== FILA DE ESPERA, LINES SALVAS E INSCRIÇÃO 1 TOQUE (v12.3) ====================
+
+async def notificar_fila_espera(guild: discord.Guild, horario_id: int) -> int:
+    """Se uma vaga abriu num horário que ainda aceita compras, avisa na DM quem estava na fila."""
+    if not guild:
+        return 0
+    bloqueio_min = await obter_bloqueio_compra_min(guild.id)
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        horario = await (await db.execute(
+            "SELECT h.*, p.channel_id AS painel_canal_id, COALESCE(p.repetir_diario, 0) AS repetir_diario "
+            "FROM horarios h LEFT JOIN paineis p ON h.painel_id = p.id WHERE h.id = ?",
+            (int(horario_id),),
+        )).fetchone()
+        if not horario or not horario["ativo"]:
+            return 0
+        ocupadas = (await (await db.execute(
+            "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (int(horario_id),)
+        )).fetchone())[0]
+        inscritos_fila = await (await db.execute(
+            "SELECT user_id FROM fila_espera WHERE horario_id = ? ORDER BY id ASC",
+            (int(horario_id),),
+        )).fetchall()
+
+    if not inscritos_fila:
+        return 0
+
+    h_d = dict(horario)
+    total_vagas = LOTES_POR_MODO.get(h_d["tipo"], 12)
+    pode, _ = pode_comprar_vaga(
+        h_d["horario"],
+        ocupadas,
+        total_vagas,
+        bloqueio_min=bloqueio_min,
+        repetir=bool(h_d.get("repetir_diario", 0)),
+        encerrado_hoje=bool(h_d.get("encerrado_hoje", 0)),
+    )
+    if not pode:
+        return 0
+
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        await db.execute("DELETE FROM fila_espera WHERE horario_id = ?", (int(horario_id),))
+        await db.commit()
+    marcar_sujo()
+
+    restantes = max(1, total_vagas - ocupadas)
+    canal_painel_txt = f"<#{h_d['painel_canal_id']}>" if h_d.get("painel_canal_id") else f"**{guild.name}**"
+    embed_dm = criar_embed(
+        "🔔 Vaga Liberada no Diário!",
+        f"Abriu **{restantes}** vaga(s) no diário que você estava aguardando em **{guild.name}**!\n\n"
+        f"• **Modo:** {formatar_rotulo_diario(h_d['tipo'], h_d['categoria'])}\n"
+        f"• **Horário:** `{h_d['horario']}` • **Valor:** `{formatar_moeda(h_d['valor'])}`\n"
+        f"• **Garanta agora em:** {canal_painel_txt}",
+        "Esmeralda",
+    )
+    enviados = 0
+    for row in inscritos_fila:
+        ok = await avisar_jogador(int(row["user_id"]), embed=embed_dm)
+        if ok:
+            enviados += 1
+    return enviados
+
+
+class FilaEsperaView(discord.ui.View):
+    def __init__(self, horario_id: int, horario_dict: dict):
+        super().__init__(timeout=180)
+        self.horario_id = int(horario_id)
+        self.horario_dict = dict(horario_dict)
+        sel = discord.ui.Select(
+            placeholder="🔔 Gerenciar alerta de vaga...",
+            options=[
+                discord.SelectOption(
+                    label="Me avisar na DM se abrir vaga",
+                    value="entrar",
+                    emoji="🔔",
+                    description="Envia alerta automático caso uma reserva expire ou seja recusada",
+                ),
+                discord.SelectOption(
+                    label="Sair da fila de espera",
+                    value="sair",
+                    emoji="🔕",
+                    description="Cancela o alerta para este horário",
+                ),
+            ],
+        )
+        sel.callback = self._acao
+        self.add_item(sel)
+
+    async def _acao(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        escolha = interaction.data["values"][0]
+        if escolha == "entrar":
+            inseriu = await entrar_fila_espera(interaction.guild.id, self.horario_id, interaction.user.id)
+            qtd = await contar_fila_espera(self.horario_id)
+            msg = (
+                f"Você entrou na fila de espera das **`{self.horario_dict['horario']}`** (`{qtd}` aguardando).\n"
+                f"Mantenha sua **DM aberta** para receber o aviso assim que surgir vaga!"
+                if inseriu
+                else f"Você já está na fila de espera das **`{self.horario_dict['horario']}`** (`{qtd}` aguardando)."
+            )
+            return await interaction.response.edit_message(
+                embed=criar_embed("🔔 Alerta Ativado", msg, "Esmeralda"),
+                view=None,
+            )
+        saiu = await sair_fila_espera(self.horario_id, interaction.user.id)
+        return await interaction.response.edit_message(
+            embed=criar_embed(
+                "🔕 Alerta Removido",
+                "Você saiu da fila de espera deste horário." if saiu else "Você não estava na fila deste horário.",
+                "Cinza Escuro",
+            ),
+            view=None,
+        )
+
+
+def _montar_embed_inscricao_rapida(horario_dict: dict, lines_salvas: list) -> discord.Embed:
+    rotulo = formatar_rotulo_diario(horario_dict["tipo"], horario_dict["categoria"])
+    partes = []
+    for ln in lines_salvas:
+        icone = "⭐" if ln["favorita"] else "⚡"
+        tag = " *(Favorita)*" if ln["favorita"] else ""
+        nicks_str = ", ".join(f"`{n}`" for n in (ln.get("nicks") or ln.get("uids") or []))
+        partes.append(f"{icone} **{ln['nome_line']}**{tag} — {nicks_str}")
+    bloco = "\n".join(partes)
+    return criar_embed(
+        f"⚡ Inscrição em 1 Toque — {rotulo}",
+        f"**Horário:** `{horario_dict['horario']}`  •  **Valor:** `{formatar_moeda(horario_dict['valor'])}`\n\n"
+        f"**Suas Lines Salvas ({horario_dict['tipo'].upper()})**\n{bloco}\n\n"
+        f"-# Selecione uma line abaixo para reservar em 1 toque, digite outros IDs ou edite suas lines.",
+        "Dourado" if any(ln["favorita"] for ln in lines_salvas) else "Cinza Escuro",
+    )
+
+
+def _montar_embed_gerenciar_lines(modo: str, lines_salvas: list) -> discord.Embed:
+    modo_up = modo.upper()
+    qtd_jog = JOGADORES_POR_LOTE.get(modo, 1)
+    fav = next((x for x in lines_salvas if x["favorita"]), None)
+    normais = [x for x in lines_salvas if not x["favorita"]]
+
+    if fav:
+        det_fav = " • ".join(
+            f"`{nick}` (`{uid}`)" for uid, nick in zip(fav.get("uids") or [], fav.get("nicks") or [])
+        )
+        txt_fav = f"⭐ **{fav['nome_line']}**\n> {det_fav}"
+    else:
+        txt_fav = "*Nenhuma Line Favorita salva ainda (1 vaga exclusiva livre!).*"
+
+    if normais:
+        linhas_norm = []
+        for idx, ln in enumerate(normais, 1):
+            det = " • ".join(
+                f"`{nick}` (`{uid}`)" for uid, nick in zip(ln.get("uids") or [], ln.get("nicks") or [])
+            )
+            linhas_norm.append(f"**{idx}. {ln['nome_line']}**\n> {det}")
+        txt_norm = "\n".join(linhas_norm)
+    else:
+        txt_norm = "*Nenhuma line extra salva ainda.*"
+
+    return criar_embed(
+        f"⚡ Minhas Lines — Modo {modo_up}",
+        f"-# {qtd_jog} jogador(es) por vaga • A ⭐ Favorita fica sempre no topo e **não conta** no limite das 3 lines extras!\n\n"
+        f"**⭐ Line Favorita (Fixa no Topo)**\n{txt_fav}\n\n"
+        f"**💾 Outras Lines Salvas ({len(normais)}/{MAX_LINES_NORMAIS_POR_MODO})**\n{txt_norm}",
+        "Dourado" if fav else "Cinza Escuro",
+    )
+
+
+class SalvarEditarLineModal(discord.ui.Modal):
+    """Cria ou edita QUALQUER line salva (inclusive a ⭐ Favorita e as 3 extras)."""
+
+    def __init__(
+        self,
+        modo: str,
+        line_existente: Optional[dict] = None,
+        como_favorita: bool = False,
+    ):
+        self.modo = str(modo).lower().strip()
+        self.line_existente = line_existente
+        self.como_favorita = bool(como_favorita)
+        qtd = JOGADORES_POR_LOTE.get(self.modo, 1)
+        titulo_acao = "✏️ Editar Line" if line_existente else ("⭐ Nova Line Favorita" if como_favorita else "💾 Salvar Nova Line")
+        super().__init__(title=f"{titulo_acao} — {self.modo.title()}")
+
+        self.nome_input = discord.ui.TextInput(
+            label="Nome da Line",
+            placeholder=f"Ex: Minha {self.modo.title()} Principal",
+            default=(line_existente.get("nome_line") if line_existente else ""),
+            min_length=2,
+            max_length=32,
+            required=True,
+        )
+        self.add_item(self.nome_input)
+
+        uids_atuais = list(line_existente.get("uids") or []) if line_existente else []
+        self.campos_uids = []
+        for idx in range(1, qtd + 1):
+            padrao_uid = uids_atuais[idx - 1] if idx - 1 < len(uids_atuais) else ""
+            campo = discord.ui.TextInput(
+                label=f"ID Free Fire — Jogador {idx}" + (" (você)" if idx == 1 else ""),
+                placeholder="Somente números do ID (5 a 15 dígitos)",
+                default=str(padrao_uid),
+                min_length=5,
+                max_length=15,
+                required=True,
+            )
+            self.add_item(campo)
+            self.campos_uids.append(campo)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not interaction.guild:
+            return
+        uids = []
+        for idx, c in enumerate(self.campos_uids, 1):
+            u = (c.value or "").strip()
+            if not u.isdigit() or not (5 <= len(u) <= 15):
+                return await interaction.followup.send(
+                    embed=criar_embed(
+                        "❌ ID Inválido",
+                        f"**Jogador {idx}:** informe apenas os números do ID do Free Fire (5 a 15 dígitos).",
+                        "Vermelho",
+                    ),
+                    ephemeral=True,
+                )
+            uids.append(u)
+
+        if len(set(uids)) != len(uids):
+            return await interaction.followup.send(
+                embed=criar_embed("❌ IDs Repetidos", "Cada jogador da line precisa ter um ID diferente.", "Vermelho"),
+                ephemeral=True,
+            )
+
+        resultados = await asyncio.gather(*(verificar_ff(u) for u in uids))
+        validados = []
+        for idx, (u, res) in enumerate(zip(uids, resultados), 1):
+            if not res.get("ok"):
+                return await interaction.followup.send(
+                    embed=criar_embed(
+                        "❌ ID não validado no Free Fire",
+                        f"**Jogador {idx} (ID `{u}`):** {res.get('mensagem', 'Não foi possível validar.')}",
+                        "Vermelho",
+                    ),
+                    ephemeral=True,
+                )
+            validados.append({
+                "uid": u,
+                "nome": str(res.get("nome") or u).strip(),
+                "nivel": int(res.get("nivel") or 0),
+            })
+
+        bloqueio = await validar_regras_jogadores_ff(interaction.guild.id, validados)
+        if bloqueio:
+            return await interaction.followup.send(
+                embed=criar_embed(bloqueio[0], bloqueio[1], "Vermelho"),
+                ephemeral=True,
+            )
+
+        nome_ln = (self.nome_input.value or "").strip()
+        if self.line_existente:
+            ok, msg = await editar_line_existente(
+                int(self.line_existente["id"]),
+                interaction.guild.id,
+                interaction.user.id,
+                nome_ln,
+                validados,
+            )
+        else:
+            ok, msg, _ = await salvar_nova_line(
+                interaction.guild.id,
+                interaction.user.id,
+                self.modo,
+                nome_ln,
+                validados,
+                como_favorita=self.como_favorita,
+            )
+
+        lines_atualizadas = await listar_lines_usuario(interaction.guild.id, interaction.user.id, self.modo)
+        embed_painel = _montar_embed_gerenciar_lines(self.modo, lines_atualizadas)
+        embed_painel.add_field(
+            name="✅ Status" if ok else "⚠️ Aviso",
+            value=msg,
+            inline=False,
+        )
+        await interaction.followup.send(
+            embed=embed_painel,
+            view=LinesGerenciarModoView(interaction.guild.id, interaction.user.id, self.modo, lines_atualizadas),
+            ephemeral=True,
+        )
+
+
+class LinesModoSelectView(discord.ui.View):
+    """Hub minimalista `/lines` para o jogador escolher o modo (Solo, Duo, Trio, Squad)."""
+
+    def __init__(self):
+        super().__init__(timeout=180)
+        sel = discord.ui.Select(
+            placeholder="🎮 Escolha o modo para ver ou editar suas Lines...",
+            options=[
+                discord.SelectOption(label="Modo Solo", value="solo", emoji="👤", description="1 Favorita + até 3 contas Solo salvas"),
+                discord.SelectOption(label="Modo Duo", value="duo", emoji="👥", description="1 Favorita + até 3 Duos salvos"),
+                discord.SelectOption(label="Modo Trio", value="trio", emoji="🔱", description="1 Favorita + até 3 Trios salvos"),
+                discord.SelectOption(label="Modo Squad", value="squad", emoji="🛡️", description="1 Favorita + até 3 Squads salvos"),
+            ],
+        )
+        sel.callback = self._abrir_modo
+        self.add_item(sel)
+
+    async def _abrir_modo(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        modo = interaction.data["values"][0]
+        lines_atuais = await listar_lines_usuario(interaction.guild.id, interaction.user.id, modo)
+        await interaction.response.edit_message(
+            embed=_montar_embed_gerenciar_lines(modo, lines_atuais),
+            view=LinesGerenciarModoView(interaction.guild.id, interaction.user.id, modo, lines_atuais),
+        )
+
+
+class LinesGerenciarModoView(discord.ui.View):
+    """Gerenciador completo por modo: criar Favorita, criar até 3 extras, editar QUALQUER uma, fixar Favorita ou excluir."""
+
+    def __init__(self, guild_id: int, user_id: int, modo: str, lines_salvas: list):
+        super().__init__(timeout=240)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.modo = str(modo).lower().strip()
+        self.lines_salvas = list(lines_salvas)
+
+        fav = next((x for x in self.lines_salvas if x["favorita"]), None)
+        normais = [x for x in self.lines_salvas if not x["favorita"]]
+        opcoes = []
+
+        if fav is None or len(normais) < MAX_LINES_NORMAIS_POR_MODO:
+            opcoes.append(discord.SelectOption(
+                label="Salvar Nova Line ⭐ Favorita",
+                value="nova_fav",
+                emoji="⭐",
+                description="Fica fixa no topo e não consome vaga das 3 extras",
+            ))
+        if len(normais) < MAX_LINES_NORMAIS_POR_MODO:
+            opcoes.append(discord.SelectOption(
+                label=f"Salvar Nova Line ({len(normais)}/{MAX_LINES_NORMAIS_POR_MODO} usadas)",
+                value="nova_normal",
+                emoji="➕",
+                description=f"Adiciona uma line salva no modo {self.modo.upper()}",
+            ))
+
+        for ln in self.lines_salvas:
+            selo = "⭐ Favorita" if ln["favorita"] else "💾 Salva"
+            opcoes.append(discord.SelectOption(
+                label=f"Editar: {ln['nome_line']}"[:100],
+                value=f"edit:{ln['id']}",
+                emoji="✏️",
+                description=f"Trocar IDs ou nome ({selo})"[:100],
+            ))
+
+        for ln in normais:
+            opcoes.append(discord.SelectOption(
+                label=f"Tornar Favorita: {ln['nome_line']}"[:100],
+                value=f"fav:{ln['id']}",
+                emoji="🌟",
+                description="Fixa esta line no topo como sua ⭐ Favorita",
+            ))
+
+        for ln in self.lines_salvas:
+            opcoes.append(discord.SelectOption(
+                label=f"Excluir: {ln['nome_line']}"[:100],
+                value=f"del:{ln['id']}",
+                emoji="🗑️",
+                description="Remove esta line salva",
+            ))
+
+        opcoes.append(discord.SelectOption(
+            label="Trocar Modo (Solo / Duo / Trio / Squad)",
+            value="voltar_modos",
+            emoji="🔙",
+            description="Voltar para a seleção de modos",
+        ))
+
+        sel = discord.ui.Select(
+            placeholder=f"⚙️ Gerenciar minhas lines ({self.modo.upper()})...",
+            options=opcoes[:25],
+        )
+        sel.callback = self._rotear
+        self.add_item(sel)
+
+    async def _rotear(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.user.id != self.user_id:
+            return await interaction.response.send_message(
+                embed=criar_embed("🔒 Painel Pessoal", "Use `/lines` para abrir o seu próprio gerenciador.", "Vermelho"),
+                ephemeral=True,
+            )
+        val = interaction.data["values"][0]
+        if val == "voltar_modos":
+            return await interaction.response.edit_message(
+                embed=criar_embed(
+                    "⚡ Minhas Lines Salvas (1 Toque)",
+                    "Salve **1 Line ⭐ Favorita** (fixa no topo) + **até 3 outras lines** em cada modo (`Solo`, `Duo`, `Trio`, `Squad`).\n"
+                    "Você pode editar os IDs de qualquer line sempre que alguém sair ou entrar no time!",
+                    "Cinza Escuro",
+                ),
+                view=LinesModoSelectView(),
+            )
+        if val == "nova_fav":
+            return await interaction.response.send_modal(SalvarEditarLineModal(self.modo, como_favorita=True))
+        if val == "nova_normal":
+            return await interaction.response.send_modal(SalvarEditarLineModal(self.modo, como_favorita=False))
+        if val.startswith("edit:"):
+            lid = int(val.split(":", 1)[1])
+            alvo = await obter_line_por_id(lid, interaction.guild.id, interaction.user.id)
+            if not alvo:
+                return await interaction.response.send_message(
+                    embed=criar_embed("❌ Line não encontrada", "Atualize o painel.", "Vermelho"), ephemeral=True
+                )
+            return await interaction.response.send_modal(SalvarEditarLineModal(self.modo, line_existente=alvo))
+        if val.startswith("fav:"):
+            lid = int(val.split(":", 1)[1])
+            ok, msg = await alternar_favorita_line(lid, interaction.guild.id, interaction.user.id)
+            novas = await listar_lines_usuario(interaction.guild.id, interaction.user.id, self.modo)
+            emb = _montar_embed_gerenciar_lines(self.modo, novas)
+            emb.add_field(name="⭐ Favorita" if ok else "⚠️ Aviso", value=msg, inline=False)
+            return await interaction.response.edit_message(
+                embed=emb,
+                view=LinesGerenciarModoView(interaction.guild.id, interaction.user.id, self.modo, novas),
+            )
+        if val.startswith("del:"):
+            lid = int(val.split(":", 1)[1])
+            await excluir_line_salva(lid, interaction.guild.id, interaction.user.id)
+            novas = await listar_lines_usuario(interaction.guild.id, interaction.user.id, self.modo)
+            emb = _montar_embed_gerenciar_lines(self.modo, novas)
+            emb.add_field(name="🗑️ Removida", value="Line excluída com sucesso.", inline=False)
+            return await interaction.response.edit_message(
+                embed=emb,
+                view=LinesGerenciarModoView(interaction.guild.id, interaction.user.id, self.modo, novas),
+            )
+
+
+class InscricaoRapidaView(discord.ui.View):
+    """Seletor instantâneo ao clicar num horário: ⭐ Favorita no topo + até 3 lines + digitar manual + editar lines."""
+
+    def __init__(self, horario_id: int, horario_dict: dict, lines_salvas: list):
+        super().__init__(timeout=180)
+        self.horario_id = int(horario_id)
+        self.horario_dict = dict(horario_dict)
+        self.lines_salvas = list(lines_salvas)
+
+        opcoes = []
+        for ln in self.lines_salvas:
+            nicks_resumo = ", ".join(ln.get("nicks") or ln.get("uids") or [])
+            if ln["favorita"]:
+                opcoes.append(discord.SelectOption(
+                    label=f"[Favorita] {ln['nome_line']}"[:100],
+                    value=f"line:{ln['id']}",
+                    emoji="⭐",
+                    description=f"Inscrever agora: {nicks_resumo}"[:100],
+                ))
+            else:
+                opcoes.append(discord.SelectOption(
+                    label=f"{ln['nome_line']}"[:100],
+                    value=f"line:{ln['id']}",
+                    emoji="⚡",
+                    description=f"Inscrever agora: {nicks_resumo}"[:100],
+                ))
+
+        opcoes.append(discord.SelectOption(
+            label="Digitar outros IDs manualmente",
+            value="manual",
+            emoji="✍️",
+            description="Preencher IDs avulsos (com opção de salvar nova line)",
+        ))
+        opcoes.append(discord.SelectOption(
+            label=f"Editar / Gerenciar minhas Lines ({self.horario_dict['tipo'].upper()})",
+            value="gerenciar",
+            emoji="⚙️",
+            description="Trocar jogador que saiu da line, editar Favorita ou criar nova",
+        ))
+
+        sel = discord.ui.Select(
+            placeholder="⚡ Escolha sua Line em 1 toque ou digite IDs...",
+            options=opcoes[:25],
+        )
+        sel.callback = self._escolher
+        self.add_item(sel)
+
+    async def _escolher(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        escolha = interaction.data["values"][0]
+        h = self.horario_dict
+        if escolha == "manual":
+            return await interaction.response.send_modal(
+                ComprarSlotModal(
+                    horario_id=self.horario_id,
+                    tipo=h["tipo"],
+                    jogadores_qtd=JOGADORES_POR_LOTE[h["tipo"]],
+                    valor=h["valor"],
+                    horario_str=h["horario"],
+                    categoria=h["categoria"],
+                )
+            )
+        if escolha == "gerenciar":
+            atuais = await listar_lines_usuario(interaction.guild.id, interaction.user.id, h["tipo"])
+            return await interaction.response.edit_message(
+                embed=_montar_embed_gerenciar_lines(h["tipo"], atuais),
+                view=LinesGerenciarModoView(interaction.guild.id, interaction.user.id, h["tipo"], atuais),
+            )
+        if escolha.startswith("line:"):
+            lid = int(escolha.split(":", 1)[1])
+            alvo = await obter_line_por_id(lid, interaction.guild.id, interaction.user.id)
+            if not alvo:
+                return await interaction.response.send_message(
+                    embed=criar_embed("❌ Line não encontrada", "Essa line foi removida.", "Vermelho"),
+                    ephemeral=True,
+                )
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await _executar_reserva_slot(
+                interaction,
+                horario_id=self.horario_id,
+                uids=list(alvo.get("uids") or []),
+                line_usada_id=int(alvo["id"]),
+            )
+
+
+# ==================== MOTOR UNIFICADO DE RESERVA DE VAGA ====================
+
+async def _executar_reserva_slot(
+    interaction: discord.Interaction,
+    horario_id: int,
+    uids: list,
+    salvar_nome_line: str = "",
+    line_usada_id: int = 0,
+):
+    """Fluxo unificado de reserva (Modal manual OU Line Salva em 1 Toque):
+    valida formato, anti-ID duplicado no horário, API Free Fire, Blacklist, Level mínimo
+    e cria atomicamente o canal de pagamento + reserva."""
+    if interaction.guild and await usuario_staff_em_servico(interaction.user):
+        return await interaction.followup.send(
+            embed=criar_embed(
+                "🔴 Diário indisponível durante o serviço",
+                "Quem está em serviço não pode se inscrever nos diários. Saia de serviço no painel **/staff** para jogar.",
+                "Amarelo"
+            ),
+            ephemeral=True,
+        )
+
+    uids_limpos = []
+    for indice, raw_uid in enumerate(uids, 1):
+        uid = str(raw_uid or "").strip()
+        if not uid.isdigit() or not (5 <= len(uid) <= 15):
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "❌ Informe exatamente o ID do Free Fire",
+                    f"**Jogador {indice}:** você informou `{uid[:30]}`.\n"
+                    f"É obrigatório colocar **exatamente o ID numérico** da conta no Free Fire "
+                    f"(apenas números, de 5 a 15 dígitos — **não** digite o nick!).",
+                    "Vermelho"
+                ),
+                ephemeral=True,
+            )
+        uids_limpos.append(uid)
+
+    if len(set(uids_limpos)) != len(uids_limpos):
+        return await interaction.followup.send(
+            embed=criar_embed("❌ IDs repetidos", "Cada jogador precisa ter um ID do Free Fire diferente.", "Vermelho"),
+            ephemeral=True,
+        )
+
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (horario_id,))).fetchone()
+        if not horario or not interaction.guild or int(horario["guild_id"]) != interaction.guild.id:
+            return await interaction.followup.send(
+                embed=criar_embed("❌ Erro", "Horário não encontrado neste servidor.", "Vermelho"),
+                ephemeral=True,
+            )
+        if not horario["ativo"]:
+            return await interaction.followup.send(
+                embed=criar_embed("⏸️ Inscrições encerradas", "Este diário foi arquivado ou encerrado.", "Amarelo"),
+                ephemeral=True,
+            )
+        qtd_esperada = JOGADORES_POR_LOTE.get(horario["tipo"], 1)
+        if len(uids_limpos) != qtd_esperada:
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "⚠️ Quantidade de IDs incompatível",
+                    f"Este diário exige **{qtd_esperada}** ID(s) no modo **{horario['tipo'].upper()}**. Edite sua line em `/lines`.",
+                    "Amarelo",
+                ),
+                ephemeral=True,
+            )
+        painel_info = await (await db.execute(
+            "SELECT repetir_diario FROM paineis WHERE id = ?", (horario["painel_id"],)
+        )).fetchone()
+        ocupadas = (await (await db.execute(
+            "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (horario_id,)
+        )).fetchone())[0]
+        placeholders_uid = ",".join("?" for _ in uids_limpos)
+        uid_repetido_sala = await (await db.execute(
+            f"SELECT j.ff_uid, j.ff_nome FROM slot_jogadores j "
+            f"JOIN slots s ON s.id = j.slot_id "
+            f"WHERE s.horario_id = ? AND j.ff_uid IN ({placeholders_uid}) LIMIT 1",
+            (horario_id, *uids_limpos),
+        )).fetchone()
+
+    if uid_repetido_sala:
+        return await interaction.followup.send(
+            embed=criar_embed(
+                "⚠️ ID já inscrito neste horário",
+                f"O ID `{uid_repetido_sala['ff_uid']}` (`{uid_repetido_sala['ff_nome']}`) já está registrado neste diário.",
+                "Amarelo",
+            ),
+            ephemeral=True,
+        )
+
+    bloqueio_min = await obter_bloqueio_compra_min(interaction.guild.id)
+    repetir_painel = bool(painel_info["repetir_diario"]) if painel_info and painel_info["repetir_diario"] else False
+    h_dict_ini = dict(horario)
+    total_vagas = LOTES_POR_MODO[horario["tipo"]]
+    pode, motivo = pode_comprar_vaga(
+        horario["horario"], ocupadas, total_vagas,
+        bloqueio_min=bloqueio_min, repetir=repetir_painel,
+        encerrado_hoje=bool(h_dict_ini.get("encerrado_hoje", 0))
+    )
+    if not pode:
+        return await interaction.followup.send(
+            embed=criar_embed("🔒 Compra bloqueada", motivo, "Vermelho"),
+            ephemeral=True,
+        )
+
+    # ---- Consulta automática na API do Free Fire (em paralelo para todos os jogadores) ----
+    resultados_ff = await asyncio.gather(*(verificar_ff(uid) for uid in uids_limpos))
+    jogadores_validados = []
+    for indice, (uid, res) in enumerate(zip(uids_limpos, resultados_ff), 1):
+        if not res.get("ok"):
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "❌ ID não validado no Free Fire",
+                    f"**Jogador {indice} (ID `{uid}`):** {res.get('mensagem', 'Não foi possível validar esse ID.')}",
+                    "Vermelho",
+                ),
+                ephemeral=True,
+            )
+        jogadores_validados.append({
+            "uid": uid,
+            "nome": str(res.get("nome") or uid).strip(),
+            "nivel": int(res.get("nivel") or 0),
+            "regiao": str(res.get("regiao") or "BR").strip(),
+        })
+
+    # ---- Blacklist + Level Mínimo ----
+    bloqueio_regra = await validar_regras_jogadores_ff(interaction.guild.id, jogadores_validados)
+    if bloqueio_regra:
+        return await interaction.followup.send(
+            embed=criar_embed(bloqueio_regra[0], bloqueio_regra[1], "Vermelho"),
+            ephemeral=True,
+        )
+
+    # ---- Atualiza nicks da line usada (se algum amigo trocou nick no FF) ou salva nova line ----
+    aviso_line_salva = ""
+    if line_usada_id:
+        ln_atual = await obter_line_por_id(line_usada_id, interaction.guild.id, interaction.user.id)
+        if ln_atual:
+            await editar_line_existente(
+                line_usada_id, interaction.guild.id, interaction.user.id, ln_atual["nome_line"], jogadores_validados
+            )
+    elif salvar_nome_line and salvar_nome_line.strip():
+        atuais_modo = await listar_lines_usuario(interaction.guild.id, interaction.user.id, horario["tipo"])
+        tem_fav = any(x["favorita"] for x in atuais_modo)
+        ok_ln, msg_ln, _ = await salvar_nova_line(
+            interaction.guild.id,
+            interaction.user.id,
+            horario["tipo"],
+            salvar_nome_line.strip(),
+            jogadores_validados,
+            como_favorita=(not tem_fav),
+        )
+        aviso_line_salva = f"\n• {msg_ln}" if ok_ln else f"\n• ⚠️ Line não salva: {msg_ln}"
+
+    nicks = [j["nome"] for j in jogadores_validados]
+
+    if await usuario_staff_em_servico(interaction.user):
+        return await interaction.followup.send(
+            embed=criar_embed(
+                "🔴 Diário indisponível durante o serviço",
+                "Seu status mudou para **em serviço** antes da reserva. Saia de serviço no painel **/staff** para jogar.",
+                "Amarelo"
+            ),
+            ephemeral=True,
+        )
+
+    membro_equipe_para_diario = await usuario_equipe_com_suporte(interaction.user)
+    cfg = await obter_config(interaction.guild.id)
+    cat_pag = interaction.guild.get_channel(cfg.get("cat_pagamentos"))
+
+    overwrites = {
+        interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True),
+        interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)
+    }
+    for cargo_key in ["cargo_dono", "cargo_gerente", "cargo_mediador"]:
+        if cfg.get(cargo_key):
+            role = interaction.guild.get_role(cfg[cargo_key])
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+    canal_pagamento = await interaction.guild.create_text_channel(
+        f"💳│{interaction.user.display_name}",
+        category=cat_pag,
+        overwrites=overwrites
+    )
+
+    tipo_h = horario["tipo"]
+    categoria_h = horario["categoria"]
+    horario_str = horario["horario"]
+    rotulo = texto_slot(tipo_h)
+
+    # ---- registro atômico da RESERVA: revalida horário, lote, IDs e duplicidade ----
+    async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        if membro_equipe_para_diario:
+            linha_servico = await (await db.execute(
+                "SELECT online FROM staff_status WHERE user_id = ? AND guild_id = ?",
+                (interaction.user.id, interaction.guild.id)
+            )).fetchone()
+            if linha_servico and bool(linha_servico[0]):
+                await db.rollback()
+                try:
+                    await canal_pagamento.delete(reason="Reserva bloqueada: membro em serviço")
+                except Exception:
+                    pass
+                return await interaction.followup.send(
+                    embed=criar_embed(
+                        "🔴 Diário indisponível durante o serviço",
+                        "Seu status está **em serviço**. Saia de serviço no painel **/staff** para jogar.",
+                        "Amarelo"
+                    ),
+                    ephemeral=True,
+                )
+        horario_atual = await (await db.execute(
+            "SELECT * FROM horarios WHERE id = ? AND guild_id = ? AND ativo = 1",
+            (horario_id, interaction.guild.id)
+        )).fetchone()
+        duplicada = await (await db.execute(
+            "SELECT 1 FROM slots WHERE horario_id = ? AND comprador_id = ? LIMIT 1",
+            (horario_id, interaction.user.id)
+        )).fetchone()
+        placeholders_uid = ",".join("?" for _ in uids_limpos)
+        uid_duplicado_tx = await (await db.execute(
+            f"SELECT j.ff_uid FROM slot_jogadores j "
+            f"JOIN slots s ON s.id = j.slot_id "
+            f"WHERE s.horario_id = ? AND j.ff_uid IN ({placeholders_uid}) LIMIT 1",
+            (horario_id, *uids_limpos),
+        )).fetchone()
+        ocupadas_atual = (await (await db.execute(
+            "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (horario_id,)
+        )).fetchone())[0]
+        h_atual_dict = dict(horario_atual) if horario_atual else {}
+        pode_atual, motivo_atual = (pode_comprar_vaga(
+            horario_atual["horario"], ocupadas_atual, LOTES_POR_MODO.get(horario_atual["tipo"], 0),
+            bloqueio_min=bloqueio_min, repetir=repetir_painel,
+            encerrado_hoje=bool(h_atual_dict.get("encerrado_hoje", 0))
+        ) if horario_atual else (False, "Este diário foi arquivado ou encerrado."))
+        if not horario_atual or duplicada or uid_duplicado_tx or not pode_atual:
+            await db.rollback()
+            try:
+                await canal_pagamento.delete(reason="Reserva não criada: horário indisponível")
+            except Exception:
+                pass
+            if duplicada:
+                mensagem = "Você já tem uma reserva/inscrição neste horário."
+            elif uid_duplicado_tx:
+                mensagem = f"O ID `{uid_duplicado_tx['ff_uid']}` acabou de ser inscrito neste horário."
+            else:
+                mensagem = motivo_atual
+            return await interaction.followup.send(
+                embed=criar_embed("⏸️ Não foi possível reservar", mensagem, "Amarelo"),
+                ephemeral=True,
+            )
+
+        cursor = await db.execute(
+            "INSERT INTO slots (horario_id, guild_id, comprador_id, comprador_nome, apelidos, numero, "
+            "confirmado, canal_pag, criado_em, valor_cobrado, pago_moedas, valor_moedas, taxa_adm_pix) "
+            "VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 0, 0, 0)",
+            (horario_id, interaction.guild.id, interaction.user.id, interaction.user.display_name,
+             "|".join([apelidos_do_usuario(interaction.user)] + [str(n).strip() for n in nicks if str(n).strip()])[:200],
+             canal_pagamento.id, agora_brt().isoformat(), horario_atual["valor"])
+        )
+        slot_id = cursor.lastrowid
+
+        for pos, j in enumerate(jogadores_validados, 1):
+            await db.execute(
+                "INSERT INTO slot_jogadores (slot_id, posicao, ff_uid, ff_nome, ff_nivel, discord_nome) VALUES (?, ?, ?, ?, ?, ?)",
+                (slot_id, pos, j["uid"], j["nome"], j["nivel"], interaction.user.display_name if pos == 1 else "")
+            )
+        await db.execute(
+            "DELETE FROM fila_espera WHERE horario_id = ? AND user_id = ?",
+            (horario_id, interaction.user.id),
+        )
+        await db.commit()
+        horario = horario_atual
+        valor_final = float(horario_atual["valor"])
+
+    lista_nicks = "\n".join(
+        f"> 👤 **J{i}:** `{j['nome']}` • **Level `{j['nivel']}`** • ID: `{j['uid']}`"
+        for i, j in enumerate(jogadores_validados, 1)
+    )
+
+    embed_pagamento = criar_embed(
+        titulo=f"💳 Reserva de Vaga • {formatar_rotulo_diario(tipo_h, categoria_h)}",
+        descricao=(
+            f"Olá {interaction.user.mention}, sua vaga foi pré-reservada.\n\n"
+            f"• **Horário:** `{horario_str}`\n"
+            f"• **Valor:** **`{formatar_moeda(valor_final)}`**\n"
+            f"• **Conta(s) verificada(s):**\n{lista_nicks}\n\n"
+            f"**Como concluir**\n"
+            f"• **Com PIX:** aguarde o ADM assumir para receber o QR Code PIX dele neste canal.\n"
+            f"• **Com Moedas:** escolha **Pagar com Moedas** no seletor abaixo *(+{formatar_moeda(TAXA_MOEDAS_ADM_PIX)} via PIX ao ADM)*.\n"
+            f"• **Cupom:** tem desconto? Use `/cupom <codigo>` antes de pagar."
+        ),
+        cor_nome="Cinza Escuro",
+        thumb=interaction.user.display_avatar.url,
+        footer=f"Fire Force • Reserva #{slot_id}",
+    )
+
+    mencoes_staff = []
+    for cargo_key in ["cargo_dono", "cargo_gerente", "cargo_mediador"]:
+        if cfg.get(cargo_key):
+            role = interaction.guild.get_role(cfg[cargo_key])
+            if role:
+                mencoes_staff.append(role.mention)
+
+    try:
+        evento = await evento_ativo(interaction.guild.id, valor_final, tipo_h, categoria_h)
+        if evento:
+            await registrar_participante(evento, slot_id, interaction.user.id, valor_final)
+            embed_pagamento.add_field(
+                name=f"🎉 Evento Ativo • {evento['nome']}",
+                value=(
+                    f"• Inscrição participante (`{formatar_moeda(valor_final)}` ≥ `{formatar_moeda(evento['aposta_min'])}`)\n"
+                    f"• Meta: `{evento['kills_min']}` kills"
+                    + (f" ou `top {evento['top_min']}`" if evento['top_min'] else "")
+                    + f" → Bônus de **`{formatar_moeda(evento['bonus'])}`**"
+                ),
+                inline=False,
+            )
+    except Exception as erro:
+        _log_arquivo(f"[EVENTO] erro ao inscrever: {erro}")
+
+    await canal_pagamento.send(
+        content=f"{interaction.user.mention} {' '.join(mencoes_staff)}".strip(),
+        embed=embed_pagamento,
+        view=PagamentoAcaoView(),
+    )
+
+    await interaction.followup.send(
+        embed=criar_embed(
+            "✅ Reserva Criada",
+            f"{rotulo} reservado(a) para **{horario_str}**.\n"
+            f"• Continue o atendimento em {canal_pagamento.mention}{aviso_line_salva}",
+            "Cinza Escuro",
+        ),
+        ephemeral=True,
+    )
+    await rebuild_painel(interaction.guild, horario["painel_id"])
+
+
 # ==================== MODAL DE COMPRA DE SLOT ====================
 
 class ComprarSlotModal(discord.ui.Modal):
     """Inscrição obrigatória por ID numérico do Free Fire: valida na API oficial
-    (`verificar_ff`) e preenche automaticamente o Nome da conta e o Level.
-
-    Importante: ao enviar, o bot cria apenas o canal de pagamento e uma
-    RESERVA pendente. A vaga de verdade, o número do lote e o acesso ao canal
-    do diário só são liberados quando o ADM confirmar o pagamento."""
+    (`verificar_ff`), checa Blacklist/Level mínimo e permite salvar a Line para 1 Toque."""
 
     def __init__(self, horario_id: int, tipo: str, jogadores_qtd: int, valor: float, horario_str: str, categoria: str):
         self.horario_id = horario_id
@@ -2417,299 +4462,30 @@ class ComprarSlotModal(discord.ui.Modal):
             self.add_item(campo)
             self.campos_jogadores.append(campo)
 
+        self.salvar_line_input = discord.ui.TextInput(
+            label="💾 Salvar Line p/ 1 Toque? (Opcional)",
+            placeholder="Digite um nome (ex: Minha Squad) ou deixe vazio",
+            max_length=32,
+            required=False,
+        )
+        self.add_item(self.salvar_line_input)
+
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        if interaction.guild and await usuario_staff_em_servico(interaction.user):
-            return await interaction.followup.send(
-                embed=criar_embed(
-                    "🔴 Diário indisponível durante o serviço",
-                    "Quem está em serviço não pode se inscrever nos diários. Saia de serviço no painel **/staff** para jogar.",
-                    "Amarelo"
-                ), ephemeral=True
-            )
-
-        uids = []
-        for indice, campo in enumerate(self.campos_jogadores, 1):
-            uid = (campo.value or "").strip()
-            if not uid.isdigit() or not (5 <= len(uid) <= 15):
-                return await interaction.followup.send(
-                    embed=criar_embed(
-                        "❌ Informe exatamente o ID do Free Fire",
-                        f"**Jogador {indice}:** você digitou `{uid[:30]}`.\n"
-                        f"É obrigatório colocar **exatamente o ID numérico** da conta no Free Fire "
-                        f"(apenas números, de 5 a 15 dígitos — **não** digite o nick!).",
-                        "Vermelho"
-                    ),
-                    ephemeral=True
-                )
-            uids.append(uid)
-
-        if len(set(uids)) != len(uids):
-            return await interaction.followup.send(
-                embed=criar_embed("❌ IDs repetidos", "Cada jogador precisa ter um ID do Free Fire diferente.", "Vermelho"),
-                ephemeral=True
-            )
-
-        async with aiosqlite.connect(DATABASE_FILE) as db:
-            db.row_factory = aiosqlite.Row
-            horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (self.horario_id,))).fetchone()
-            if (not horario or not interaction.guild
-                    or int(horario["guild_id"]) != interaction.guild.id):
-                return await interaction.followup.send(
-                    embed=criar_embed("❌ Erro", "Horário não encontrado neste servidor.", "Vermelho"),
-                    ephemeral=True
-                )
-            if not horario["ativo"]:
-                return await interaction.followup.send(
-                    embed=criar_embed("⏸️ Inscrições encerradas", "Este diário foi arquivado ou encerrado.", "Amarelo"),
-                    ephemeral=True
-                )
-            painel_info = await (await db.execute(
-                "SELECT repetir_diario FROM paineis WHERE id = ?", (horario["painel_id"],)
-            )).fetchone()
-            ocupadas = (await (await db.execute(
-                "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (self.horario_id,)
-            )).fetchone())[0]
-            placeholders_uid = ",".join("?" for _ in uids)
-            uid_repetido_sala = await (await db.execute(
-                f"SELECT j.ff_uid, j.ff_nome FROM slot_jogadores j "
-                f"JOIN slots s ON s.id = j.slot_id "
-                f"WHERE s.horario_id = ? AND j.ff_uid IN ({placeholders_uid}) LIMIT 1",
-                (self.horario_id, *uids),
-            )).fetchone()
-
-        if uid_repetido_sala:
-            return await interaction.followup.send(
-                embed=criar_embed(
-                    "⚠️ ID já inscrito neste horário",
-                    f"O ID `{uid_repetido_sala['ff_uid']}` (`{uid_repetido_sala['ff_nome']}`) já está registrado neste diário.",
-                    "Amarelo",
-                ),
-                ephemeral=True,
-            )
-
-        bloqueio_min = await obter_bloqueio_compra_min(interaction.guild.id)
-        repetir_painel = bool(painel_info["repetir_diario"]) if painel_info and painel_info["repetir_diario"] else False
-        h_dict_ini = dict(horario)
-        total_vagas = LOTES_POR_MODO[horario["tipo"]]
-        pode, motivo = pode_comprar_vaga(
-            horario["horario"], ocupadas, total_vagas,
-            bloqueio_min=bloqueio_min, repetir=repetir_painel,
-            encerrado_hoje=bool(h_dict_ini.get("encerrado_hoje", 0))
+        uids = [(c.value or "").strip() for c in self.campos_jogadores]
+        nome_salvar = (self.salvar_line_input.value or "").strip()
+        await _executar_reserva_slot(
+            interaction,
+            horario_id=self.horario_id,
+            uids=uids,
+            salvar_nome_line=nome_salvar,
         )
-        if not pode:
-            return await interaction.followup.send(
-                embed=criar_embed("🔒 Compra bloqueada", motivo, "Vermelho"),
-                ephemeral=True
-            )
-
-        # ---- Consulta automática na API do Free Fire (em paralelo para todos os jogadores) ----
-        resultados_ff = await asyncio.gather(*(verificar_ff(uid) for uid in uids))
-        jogadores_validados = []
-        for indice, (uid, res) in enumerate(zip(uids, resultados_ff), 1):
-            if not res.get("ok"):
-                return await interaction.followup.send(
-                    embed=criar_embed(
-                        "❌ ID não validado no Free Fire",
-                        f"**Jogador {indice} (ID `{uid}`):** {res.get('mensagem', 'Não foi possível validar esse ID.')}",
-                        "Vermelho",
-                    ),
-                    ephemeral=True,
-                )
-            nome_conta = str(res.get("nome") or uid).strip()
-            nivel_conta = int(res.get("nivel") or 0)
-            regiao_conta = str(res.get("regiao") or "BR").strip()
-            jogadores_validados.append({
-                "uid": uid,
-                "nome": nome_conta,
-                "nivel": nivel_conta,
-                "regiao": regiao_conta,
-            })
-
-        nicks = [j["nome"] for j in jogadores_validados]
-
-        if await usuario_staff_em_servico(interaction.user):
-            return await interaction.followup.send(
-                embed=criar_embed(
-                    "🔴 Diário indisponível durante o serviço",
-                    "Seu status mudou para **em serviço** antes da reserva. Saia de serviço no painel **/staff** para jogar.",
-                    "Amarelo"
-                ), ephemeral=True
-            )
-
-        membro_equipe_para_diario = await usuario_equipe_com_suporte(interaction.user)
-        cfg = await obter_config(interaction.guild.id)
-        cat_pag = interaction.guild.get_channel(cfg.get("cat_pagamentos"))
-
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True),
-            interaction.guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True)
-        }
-        for cargo_key in ["cargo_dono", "cargo_gerente", "cargo_mediador"]:
-            if cfg.get(cargo_key):
-                role = interaction.guild.get_role(cfg[cargo_key])
-                if role:
-                    overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
-
-        canal_pagamento = await interaction.guild.create_text_channel(
-            f"💳│{interaction.user.display_name}",
-            category=cat_pag,
-            overwrites=overwrites
-        )
-
-        rotulo = texto_slot(self.tipo)
-
-        # ---- registro atômico da RESERVA: revalida horário, lote, IDs e duplicidade ----
-        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
-            db.row_factory = aiosqlite.Row
-            await db.execute("BEGIN IMMEDIATE")
-            if membro_equipe_para_diario:
-                linha_servico = await (await db.execute(
-                    "SELECT online FROM staff_status WHERE user_id = ? AND guild_id = ?",
-                    (interaction.user.id, interaction.guild.id)
-                )).fetchone()
-                if linha_servico and bool(linha_servico[0]):
-                    await db.rollback()
-                    try:
-                        await canal_pagamento.delete(reason="Reserva bloqueada: membro em serviço")
-                    except Exception:
-                        pass
-                    return await interaction.followup.send(
-                        embed=criar_embed(
-                            "🔴 Diário indisponível durante o serviço",
-                            "Seu status está **em serviço**. Saia de serviço no painel **/staff** para jogar.",
-                            "Amarelo"
-                        ), ephemeral=True
-                    )
-            horario_atual = await (await db.execute(
-                "SELECT * FROM horarios WHERE id = ? AND guild_id = ? AND ativo = 1",
-                (self.horario_id, interaction.guild.id)
-            )).fetchone()
-            duplicada = await (await db.execute(
-                "SELECT 1 FROM slots WHERE horario_id = ? AND comprador_id = ? LIMIT 1",
-                (self.horario_id, interaction.user.id)
-            )).fetchone()
-            placeholders_uid = ",".join("?" for _ in uids)
-            uid_duplicado_tx = await (await db.execute(
-                f"SELECT j.ff_uid FROM slot_jogadores j "
-                f"JOIN slots s ON s.id = j.slot_id "
-                f"WHERE s.horario_id = ? AND j.ff_uid IN ({placeholders_uid}) LIMIT 1",
-                (self.horario_id, *uids),
-            )).fetchone()
-            ocupadas_atual = (await (await db.execute(
-                "SELECT COUNT(*) FROM slots WHERE horario_id = ?", (self.horario_id,)
-            )).fetchone())[0]
-            h_atual_dict = dict(horario_atual) if horario_atual else {}
-            pode_atual, motivo_atual = (pode_comprar_vaga(
-                horario_atual["horario"], ocupadas_atual, LOTES_POR_MODO.get(horario_atual["tipo"], 0),
-                bloqueio_min=bloqueio_min, repetir=repetir_painel,
-                encerrado_hoje=bool(h_atual_dict.get("encerrado_hoje", 0))
-            ) if horario_atual else (False, "Este diário foi arquivado ou encerrado."))
-            if not horario_atual or duplicada or uid_duplicado_tx or not pode_atual:
-                await db.rollback()
-                try:
-                    await canal_pagamento.delete(reason="Reserva não criada: horário indisponível")
-                except Exception:
-                    pass
-                if duplicada:
-                    mensagem = "Você já tem uma reserva/inscrição neste horário."
-                elif uid_duplicado_tx:
-                    mensagem = f"O ID `{uid_duplicado_tx['ff_uid']}` acabou de ser inscrito neste horário."
-                else:
-                    mensagem = motivo_atual
-                return await interaction.followup.send(
-                    embed=criar_embed("⏸️ Não foi possível reservar", mensagem, "Amarelo"),
-                    ephemeral=True)
-
-            cursor = await db.execute(
-                "INSERT INTO slots (horario_id, guild_id, comprador_id, comprador_nome, apelidos, numero, "
-                "confirmado, canal_pag, criado_em, valor_cobrado, pago_moedas, valor_moedas, taxa_adm_pix) "
-                "VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 0, 0, 0)",
-                (self.horario_id, interaction.guild.id, interaction.user.id, interaction.user.display_name,
-                 "|".join([apelidos_do_usuario(interaction.user)] + [str(n).strip() for n in nicks if str(n).strip()])[:200],
-                 canal_pagamento.id, agora_brt().isoformat(), horario_atual["valor"])
-            )
-            slot_id = cursor.lastrowid
-
-            for pos, j in enumerate(jogadores_validados, 1):
-                await db.execute(
-                    "INSERT INTO slot_jogadores (slot_id, posicao, ff_uid, ff_nome, ff_nivel, discord_nome) VALUES (?, ?, ?, ?, ?, ?)",
-                    (slot_id, pos, j["uid"], j["nome"], j["nivel"], interaction.user.display_name if pos == 1 else "")
-                )
-            await db.commit()
-            horario = horario_atual
-            self.valor = float(horario_atual["valor"])
-
-        lista_nicks = "\n".join(
-            f"> 👤 **J{i}:** `{j['nome']}` • **Level `{j['nivel']}`** • ID: `{j['uid']}`"
-            for i, j in enumerate(jogadores_validados, 1)
-        )
-
-        embed_pagamento = criar_embed(
-            titulo=f"💳 Reserva de Vaga • {formatar_rotulo_diario(self.tipo, self.categoria)}",
-            descricao=(
-                f"Olá {interaction.user.mention}, sua vaga foi pré-reservada.\n\n"
-                f"• **Horário:** `{self.horario_str}`\n"
-                f"• **Valor:** **`{formatar_moeda(self.valor)}`**\n"
-                f"• **Conta(s) verificada(s):**\n{lista_nicks}\n\n"
-                f"**Como concluir**\n"
-                f"• **Com PIX:** aguarde o ADM assumir para receber o QR Code PIX dele neste canal.\n"
-                f"• **Com Moedas:** escolha **Pagar com Moedas** no seletor abaixo *(+{formatar_moeda(TAXA_MOEDAS_ADM_PIX)} via PIX ao ADM)*.\n"
-                f"• **Cupom:** tem desconto? Use `/cupom <codigo>` antes de pagar."
-            ),
-            cor_nome="Cinza Escuro",
-            thumb=interaction.user.display_avatar.url,
-            footer=f"Fire Force • Reserva #{slot_id}",
-        )
-
-        mencoes_staff = []
-        for cargo_key in ["cargo_dono", "cargo_gerente", "cargo_mediador"]:
-            if cfg.get(cargo_key):
-                role = interaction.guild.get_role(cfg[cargo_key])
-                if role:
-                    mencoes_staff.append(role.mention)
-
-        # 🎉 evento rolando? avisa (e inscreve) quem está dentro da aposta mínima
-        try:
-            evento = await evento_ativo(interaction.guild.id, self.valor, self.tipo, self.categoria)
-            if evento:
-                await registrar_participante(evento, slot_id, interaction.user.id, self.valor)
-                embed_pagamento.add_field(
-                    name=f"🎉 Evento Ativo • {evento['nome']}",
-                    value=(
-                        f"• Inscrição participante (`{formatar_moeda(self.valor)}` ≥ `{formatar_moeda(evento['aposta_min'])}`)\n"
-                        f"• Meta: `{evento['kills_min']}` kills"
-                        + (f" ou `top {evento['top_min']}`" if evento['top_min'] else "")
-                        + f" → Bônus de **`{formatar_moeda(evento['bonus'])}`**"
-                    ),
-                    inline=False,
-                )
-        except Exception as erro:
-            _log_arquivo(f"[EVENTO] erro ao inscrever: {erro}")
-
-        await canal_pagamento.send(
-            content=f"{interaction.user.mention} {' '.join(mencoes_staff)}".strip(),
-            embed=embed_pagamento,
-            view=PagamentoAcaoView(),
-        )
-
-        await interaction.followup.send(
-            embed=criar_embed(
-                "✅ Reserva Criada",
-                f"{rotulo} reservado(a) para **{self.horario_str}**.\n"
-                f"• Continue o atendimento em {canal_pagamento.mention}",
-                "Cinza Escuro",
-            ),
-            ephemeral=True,
-        )
-        await rebuild_painel(interaction.guild, horario["painel_id"])
 
 
 # ==================== GERENCIAMENTO DE PAGAMENTOS ====================
 
 async def _fechar_canal_reserva(canal, mensagem: str, titulo: str = "⌛ Reserva Encerrada"):
-    """Avisa no canal de pagamento e apaga ele depois de alguns segundos."""
+    """Avisa no canal de pagamento, registra transcrição no log privado e apaga depois de alguns segundos."""
     try:
         embed = criar_embed(titulo, mensagem, "Cinza Escuro")
         try:
@@ -2717,7 +4493,7 @@ async def _fechar_canal_reserva(canal, mensagem: str, titulo: str = "⌛ Reserva
         except Exception:
             await canal.send(mensagem)
         await asyncio.sleep(25)
-        await canal.delete()
+        await _apagar_canal_seguro(canal, f"{titulo}: {mensagem[:120]}")
     except Exception:
         pass
 
@@ -3399,6 +5175,10 @@ class PagamentoAcaoView(discord.ui.View):
 
         if horario:
             await rebuild_painel(interaction.guild, horario["painel_id"])
+            try:
+                await notificar_fila_espera(interaction.guild, int(horario["id"]))
+            except Exception:
+                pass
 
         texto_cancel = (
             "Reserva cancelada e as moedas utilizadas foram devolvidas à carteira do jogador. Este canal será excluído em 10s."
@@ -3409,10 +5189,10 @@ class PagamentoAcaoView(discord.ui.View):
             embed=criar_embed("❌ Reserva Cancelada", texto_cancel, "Vermelho Escuro")
         )
         await asyncio.sleep(10)
-        try:
-            await interaction.channel.delete()
-        except Exception:
-            pass
+        await _apagar_canal_seguro(
+            interaction.channel,
+            f"Reserva recusada por {interaction.user.display_name}",
+        )
 
 
 async def _jogadores_do_slot(slot_id: int) -> list:
@@ -4719,19 +6499,21 @@ async def processar_repeticao_diaria() -> list[tuple[int, int]]:
                         "SELECT 1 FROM horarios WHERE painel_id = ? AND horario = ? AND ativo = 1 AND data_ciclo = ?",
                         (h["painel_id"], h["horario"], hoje),
                     )).fetchone()
+                    await db.execute("DELETE FROM fila_espera WHERE horario_id = ?", (h["id"],))
                     if not ja_existe_hoje:
                         await db.execute(
                             "INSERT INTO horarios (guild_id, painel_id, tipo, categoria, horario, valor, premiacao, "
-                            "vagas_total, lotes_usados, ativo, data_ciclo, encerrado_hoje) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 0)",
+                            "vagas_total, lotes_usados, ativo, data_ciclo, encerrado_hoje, alerta_ish_enviado) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, 0, 0)",
                             (
                                 h["guild_id"], h["painel_id"], h["tipo"], h["categoria"],
                                 h["horario"], h["valor"], h["premiacao"], h.get("vagas_total") or 48, hoje,
                             ),
                         )
                 else:
+                    await db.execute("DELETE FROM fila_espera WHERE horario_id = ?", (h["id"],))
                     await db.execute(
-                        "UPDATE horarios SET data_ciclo = ?, lotes_usados = 0, encerrado_hoje = 0, "
+                        "UPDATE horarios SET data_ciclo = ?, lotes_usados = 0, encerrado_hoje = 0, alerta_ish_enviado = 0, "
                         "sala_id = NULL, sala_senha = NULL, canal_tabela = NULL, msg_tabela = NULL "
                         "WHERE id = ?",
                         (hoje, h["id"]),
@@ -4785,6 +6567,7 @@ async def loop_expirar():
                     (limite,),
                 )).fetchall()
 
+                horarios_vaga_aberta = set()
                 for p in pendentes_antigas:
                     if p["cupom_id"]:
                         await db.execute("UPDATE cupons SET usos_atuais = MAX(0, usos_atuais - 1) WHERE id = ?", (p["cupom_id"],))
@@ -4792,6 +6575,12 @@ async def loop_expirar():
                             "UPDATE cupons_usados SET usos = MAX(0, usos - 1) WHERE cupom_id = ? AND user_id = ?",
                             (p["cupom_id"], p["comprador_id"]),
                         )
+                    h_exp = await (await db.execute(
+                        "SELECT painel_id FROM horarios WHERE id = ?", (p["horario_id"],)
+                    )).fetchone()
+                    if h_exp:
+                        paineis_para_atualizar.append((int(p["guild_id"]), int(h_exp["painel_id"])))
+                    horarios_vaga_aberta.add((int(p["guild_id"]), int(p["horario_id"])))
                     await db.execute("DELETE FROM slot_jogadores WHERE slot_id = ?", (p["id"],))
                     await db.execute("DELETE FROM slots WHERE id = ?", (p["id"],))
                     guild = bot.get_guild(p["guild_id"])
@@ -4881,6 +6670,14 @@ async def loop_expirar():
                     except Exception:
                         pass
 
+            for guild_id_f, horario_id_f in horarios_vaga_aberta:
+                guild_f = bot.get_guild(guild_id_f)
+                if guild_f:
+                    try:
+                        await notificar_fila_espera(guild_f, horario_id_f)
+                    except Exception:
+                        pass
+
             for canal, titulo, mensagem in avisos:
                 asyncio.create_task(_fechar_canal_reserva(canal, mensagem, titulo))
 
@@ -4894,10 +6691,72 @@ async def loop_salas():
     while not bot.is_closed():
         try:
             agora = agora_brt()
+            hoje_str = agora.strftime("%Y-%m-%d")
             async with aiosqlite.connect(DATABASE_FILE) as db:
                 db.row_factory = aiosqlite.Row
                 salas = await (await db.execute("SELECT * FROM salas WHERE enviado = 0")).fetchall()
+                candidatos_alerta = await (await db.execute(
+                    "SELECT * FROM horarios WHERE ativo = 1 AND COALESCE(encerrado_hoje, 0) = 0 AND COALESCE(alerta_ish_enviado, 0) = 0"
+                )).fetchall()
 
+            # 1) Alerta automático 10 minutos antes se houver jogadores confirmados e nenhum ID/Senha cadastrado
+            for h in candidatos_alerta:
+                h_d = dict(h)
+                dif_h = (horario_para_datetime(h_d["horario"]) - agora).total_seconds()
+                if not (0 < dif_h <= 600):
+                    continue
+                async with aiosqlite.connect(DATABASE_FILE) as db:
+                    confirmados_h = (await (await db.execute(
+                        "SELECT COUNT(*) FROM slots WHERE horario_id = ? AND confirmado = 1", (h_d["id"],)
+                    )).fetchone())[0]
+                    ja_tem_sala = await (await db.execute(
+                        "SELECT 1 FROM salas WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? "
+                        "AND (enviado = 0 OR substr(COALESCE(criado_em, ''), 1, 10) = ?) LIMIT 1",
+                        (h_d["guild_id"], h_d["tipo"], h_d["categoria"], h_d["horario"], hoje_str),
+                    )).fetchone()
+                    if confirmados_h <= 0 or ja_tem_sala or h_d.get("sala_id"):
+                        if ja_tem_sala or h_d.get("sala_id"):
+                            await db.execute("UPDATE horarios SET alerta_ish_enviado = 1 WHERE id = ?", (h_d["id"],))
+                            await db.commit()
+                        continue
+                    await db.execute("UPDATE horarios SET alerta_ish_enviado = 1 WHERE id = ?", (h_d["id"],))
+                    await db.commit()
+
+                guild_h = bot.get_guild(int(h_d["guild_id"]))
+                if guild_h:
+                    cfg_h = await obter_config(guild_h.id)
+                    mencoes = []
+                    for ck in ("cargo_dono", "cargo_gerente", "cargo_mediador"):
+                        if cfg_h.get(ck):
+                            rl = guild_h.get_role(int(cfg_h[ck]))
+                            if rl:
+                                mencoes.append(rl.mention)
+                    canal_tab_ref = f"<#{h_d['canal_tabela']}>" if h_d.get("canal_tabela") else "`canal da sala`"
+                    canal_alerta_id = cfg_h.get("canal_logs_suporte") or cfg_h.get("canal_logs")
+                    canal_alerta = guild_h.get_channel(int(canal_alerta_id)) if canal_alerta_id else None
+                    emb_alerta = criar_embed(
+                        "⏰ Alerta 10 Minutos — Sala Sem ID e Senha!",
+                        f"O diário **{formatar_rotulo_diario(h_d['tipo'], h_d['categoria'])}** das **`{h_d['horario']}`** "
+                        f"tem **`{confirmados_h}`** vaga(s) confirmada(s) e começa em **`~{max(1, int(dif_h // 60))} min`**, "
+                        f"mas ainda **não possui ID e Senha** registrados!\n\n"
+                        f"• Abra {canal_tab_ref} e selecione **🔑 Definir ID e Senha desta Sala** *(ou use `/ish`)*.",
+                        "Amarelo",
+                    )
+                    if canal_alerta:
+                        try:
+                            await canal_alerta.send(content=" ".join(mencoes).strip() or None, embed=emb_alerta)
+                        except Exception:
+                            pass
+                    else:
+                        await registrar_log(
+                            guild_h,
+                            "⏰ ALERTA SALA",
+                            "⏰ Sala sem ID/Senha a 10 min do início",
+                            f"{formatar_rotulo_diario(h_d['tipo'], h_d['categoria'])} às `{h_d['horario']}` ({confirmados_h} confirmados).",
+                            "Amarelo",
+                        )
+
+            # 2) Envio automático do ID e Senha 5 minutos antes
             for s in salas:
                 diferenca = (horario_para_datetime(s["horario"]) - agora).total_seconds()
                 if 0 < diferenca <= 300:  # 5 minutos
@@ -5550,8 +7409,17 @@ async def cmd_ish(interaction: discord.Interaction, tipo: app_commands.Choice[st
             )
 
         await db.execute(
+            "DELETE FROM salas WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? AND enviado = 0",
+            (interaction.guild.id, tipo.value, categoria.value, horario_fmt)
+        )
+        await db.execute(
             "INSERT INTO salas (guild_id, tipo, categoria, horario, sala_id, sala_senha, enviado, criado_em) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
             (interaction.guild.id, tipo.value, categoria.value, horario_fmt, sala_id, senha, agora_brt().isoformat())
+        )
+        await db.execute(
+            "UPDATE horarios SET sala_id = ?, sala_senha = ?, alerta_ish_enviado = 1 "
+            "WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? AND ativo = 1",
+            (sala_id, senha, interaction.guild.id, tipo.value, categoria.value, horario_fmt)
         )
         await db.commit()
 
@@ -5621,8 +7489,8 @@ async def cmd_embed(interaction: discord.Interaction):
     )
 
 
-def _embed_jogador_ff(dados: dict, local: Optional[dict] = None) -> discord.Embed:
-    """Monta a ficha do jogador consultado na API."""
+def _embed_jogador_ff(dados: dict, local: Optional[dict] = None, blacklist: Optional[dict] = None) -> discord.Embed:
+    """Monta a ficha do jogador consultado na API + status público na Blacklist do servidor."""
     origem = "cache local" if dados.get("cache") else f"consulta ao vivo ({dados.get('provedor', '—')})"
     descricao = f"> 📡 Fonte: `{origem}`"
     if dados.get("cache") and dados.get("atualizado"):
@@ -5634,10 +7502,30 @@ def _embed_jogador_ff(dados: dict, local: Optional[dict] = None) -> discord.Embe
     if dados.get("aviso"):
         descricao += f"\n> ⚠️ {dados['aviso']}"
 
-    embed = criar_embed("🎮 Jogador Encontrado", descricao, "Esmeralda")
+    titulo_card = "🚨 JOGADOR NA BLACKLIST" if blacklist else "🎮 Jogador Encontrado"
+    cor_card = "Vermelho" if blacklist else "Esmeralda"
+    embed = criar_embed(titulo_card, descricao, cor_card)
     embed.add_field(name="👤 Nick", value=f"`{dados.get('nome') or '—'}`", inline=True)
     embed.add_field(name="📊 Level", value=f"`{dados.get('nivel') or '—'}`", inline=True)
     embed.add_field(name="🌎 Região", value=f"`{dados.get('regiao') or '—'}`", inline=True)
+
+    if blacklist:
+        data_ban = str(blacklist.get("criado_em") or "")[:10]
+        embed.add_field(
+            name="🚨 Status na Blacklist",
+            value=(
+                f"⛔ **BANIDO NESTE SERVIDOR**\n"
+                f"• **Motivo:** {blacklist.get('motivo') or 'Violação de regras'}"
+                + (f"\n• **Registrado em:** `{data_ban}`" if data_ban else "")
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="🛡️ Status na Blacklist",
+            value="✅ **Limpo** — sem restrições neste servidor",
+            inline=False,
+        )
 
     linha_extra = []
     if dados.get("rank"):
@@ -5685,6 +7573,7 @@ class VerificarAtualizarView(discord.ui.View):
     async def _atualizar(self, interaction: discord.Interaction):
         await interaction.response.defer()
         dados = await verificar_ff(self.uid, forcar=True)
+        ban = await obter_blacklist_ff(interaction.guild.id, self.uid) if interaction.guild else None
         if not dados.get("ok"):
             await interaction.followup.send(
                 embed=criar_embed("⚠️ Consulta falhou", dados.get("mensagem", "Tente novamente."), "Amarelo"),
@@ -5694,37 +7583,55 @@ class VerificarAtualizarView(discord.ui.View):
         dados["uid"] = self.uid
         local = await consultar_jogador_local(dados["nome"])
         await interaction.edit_original_response(
-            embed=_embed_jogador_ff(dados, local),
+            embed=_embed_jogador_ff(dados, local, blacklist=ban),
             view=VerificarAtualizarView(self.uid),
         )
 
 
-@bot.tree.command(name="verificar", description="🔍 Consultar um ID do Free Fire (nick, level, rank, clã, região)")
+@bot.tree.command(name="verificar", description="🔍 Consultar um ID do Free Fire e checar se está na Blacklist")
 @app_commands.guild_only()
 @app_commands.describe(busca="ID numérico do Free Fire (5 a 15 dígitos) ou o nick usado nas inscrições")
 async def cmd_verificar(interaction: discord.Interaction, busca: str):
     await interaction.response.defer(ephemeral=True)
     busca = (busca or "").strip()
 
-    # ---------- ID numérico -> API do Free Fire ----------
+    # ---------- ID numérico -> API do Free Fire + Blacklist do servidor ----------
     if busca.isdigit():
+        ban = await obter_blacklist_ff(interaction.guild.id, busca)
         dados = await verificar_ff(busca)
         if dados.get("ok"):
             dados["uid"] = busca
             local = await consultar_jogador_local(dados["nome"])
             await interaction.followup.send(
-                embed=_embed_jogador_ff(dados, local),
+                embed=_embed_jogador_ff(dados, local, blacklist=ban),
                 view=VerificarAtualizarView(busca),
                 ephemeral=True
             )
         else:
-            titulo = {
+            titulo = "🚨 ID NA BLACKLIST" if ban else {
                 "formato": "❌ ID inválido",
                 "nao_encontrado": "🔎 ID não encontrado",
                 "offline": "⚠️ Consulta indisponível",
             }.get(dados.get("motivo"), "⚠️ Consulta indisponível")
-            embed = criar_embed(titulo, dados.get("mensagem", "Tente novamente."), "Vermelho" if dados.get("motivo") != "offline" else "Amarelo")
+            cor_fb = "Vermelho" if (ban or dados.get("motivo") != "offline") else "Amarelo"
+            embed = criar_embed(titulo, dados.get("mensagem", "Tente novamente."), cor_fb)
             embed.add_field(name="🆔 ID consultado", value=f"`{busca}`", inline=True)
+            if ban:
+                embed.add_field(
+                    name="🚨 Status na Blacklist",
+                    value=(
+                        f"⛔ **BANIDO NESTE SERVIDOR**\n"
+                        f"• **Nick registrado:** `{ban.get('ff_nome') or '—'}`\n"
+                        f"• **Motivo:** {ban.get('motivo') or 'Restrição ativa'}"
+                    ),
+                    inline=False,
+                )
+            elif 5 <= len(busca) <= 15:
+                embed.add_field(
+                    name="🛡️ Status na Blacklist",
+                    value="✅ **Limpo** — este ID não consta na Blacklist do servidor",
+                    inline=False,
+                )
             await interaction.followup.send(
                 embed=embed,
                 view=VerificarAtualizarView(busca) if dados.get("motivo") == "offline" else None,
@@ -5740,20 +7647,487 @@ async def cmd_verificar(interaction: discord.Interaction, busca: str):
         embed.add_field(name="🎮 Diários jogados", value=f"`{local['partidas']}`", inline=True)
         embed.add_field(name="🕒 Última inscrição", value=f"> {local['ultimo']}", inline=False)
         embed.add_field(
-            name="💡 Quer os dados do jogo?",
-            value="> Use `/verificar` com o **ID numérico** para ver nick, level, rank e clã direto do Free Fire.",
+            name="💡 Quer checar Level, Clã e Blacklist?",
+            value="> Use `/verificar` informando o **ID numérico** da conta no Free Fire.",
             inline=False
         )
     else:
         embed = criar_embed(
             "🔎 Não encontrado",
             f"Não achei **`{busca}`** nas inscrições do bot.\n\n"
-            f"> • Se for um **ID numérico**, mande ele completo (5 a 15 dígitos) que eu consulto no Free Fire.\n"
+            f"> • Se for um **ID numérico**, mande ele completo (5 a 15 dígitos) que eu consulto no Free Fire e na Blacklist.\n"
             f"> • Se for o **nick**, confira a escrita — uso exatamente o que foi digitado na inscrição.",
             "Amarelo"
         )
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ==================== /LINES • /BLACKLIST • /RELATORIO (v12.3) ====================
+
+@bot.tree.command(name="lines", description="⚡ Gerenciar suas Lines Salvas e Favoritas (Solo, Duo, Trio, Squad)")
+@app_commands.guild_only()
+async def cmd_lines(interaction: discord.Interaction):
+    resumo_modos = []
+    for m_slug, m_nome in (("solo", "Solo"), ("duo", "Duo"), ("trio", "Trio"), ("squad", "Squad")):
+        lns = await listar_lines_usuario(interaction.guild.id, interaction.user.id, m_slug)
+        fav = next((x for x in lns if x["favorita"]), None)
+        extras = [x for x in lns if not x["favorita"]]
+        fav_txt = f"⭐ `{fav['nome_line']}`" if fav else "*sem favorita*"
+        resumo_modos.append(f"• **{m_nome}:** {fav_txt}  •  `{len(extras)}/{MAX_LINES_NORMAIS_POR_MODO}` extras")
+
+    embed = criar_embed(
+        "⚡ Minhas Lines Salvas (Inscrição em 1 Toque)",
+        "Cadastre **1 Line ⭐ Favorita** *(sempre fixa no topo, sem gastar espaço)* + **até 3 outras lines** por modo.\n"
+        "Quando alguém sair do time, você pode **editar qualquer line** (inclusive a Favorita) a qualquer momento!\n\n"
+        + "\n".join(resumo_modos),
+        "Dourado",
+    )
+    await interaction.response.send_message(embed=embed, view=LinesModoSelectView(), ephemeral=True)
+
+
+class BanirBlacklistModal(discord.ui.Modal, title="🚫 Banir ID na Blacklist"):
+    ff_uid = discord.ui.TextInput(
+        label="ID numérico do Free Fire",
+        placeholder="Ex: 158492031 (somente números)",
+        min_length=5,
+        max_length=15,
+        required=True,
+    )
+    motivo = discord.ui.TextInput(
+        label="Motivo do banimento",
+        placeholder="Ex: Uso de xit / golpe / anti-jogo comprovado",
+        min_length=3,
+        max_length=200,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
+            return
+        uid = re.sub(r"\D", "", self.ff_uid.value or "")
+        if not (5 <= len(uid) <= 15):
+            return await interaction.followup.send(
+                embed=criar_embed("❌ ID Inválido", "Digite apenas os números do ID do Free Fire (5 a 15 dígitos).", "Vermelho"),
+                ephemeral=True,
+            )
+        nome_ff = ""
+        try:
+            consulta = await verificar_ff(uid)
+            if consulta.get("ok"):
+                nome_ff = str(consulta.get("nome") or "").strip()
+        except Exception:
+            pass
+
+        reg = await banir_id_ff(interaction.guild.id, uid, self.motivo.value, interaction.user.id, ff_nome=nome_ff)
+        await registrar_log(
+            interaction.guild,
+            "🚫 BLACKLIST",
+            "🚫 ID adicionado à Blacklist",
+            f"• **ID Free Fire:** `{reg['ff_uid']}`"
+            + (f" (`{reg['ff_nome']}`)" if reg.get("ff_nome") else "")
+            + f"\n• **Motivo:** {reg['motivo']}\n• **Responsável:** {interaction.user.mention}",
+            "Vermelho",
+        )
+        lista_atual = await listar_blacklist_ff(interaction.guild.id)
+        await interaction.followup.send(
+            embed=criar_embed(
+                "🚫 ID Banido na Blacklist",
+                f"• **ID:** `{reg['ff_uid']}`"
+                + (f" • **Nick:** `{reg['ff_nome']}`" if reg.get("ff_nome") else "")
+                + f"\n• **Motivo:** {reg['motivo']}\n"
+                f"-# Bloqueado automaticamente em inscrições, lines e substituições (visível em `/verificar`).",
+                "Vermelho",
+            ),
+            view=BlacklistHubView(lista_atual),
+            ephemeral=True,
+        )
+
+
+class DesbanirManualModal(discord.ui.Modal, title="✅ Remover ID da Blacklist"):
+    ff_uid = discord.ui.TextInput(
+        label="ID numérico do Free Fire a desbanir",
+        placeholder="Ex: 158492031",
+        min_length=5,
+        max_length=15,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
+            return
+        uid = re.sub(r"\D", "", self.ff_uid.value or "")
+        removido = await remover_blacklist_ff(interaction.guild.id, uid)
+        if removido:
+            await registrar_log(
+                interaction.guild,
+                "✅ BLACKLIST",
+                "✅ ID removido da Blacklist",
+                f"• **ID Free Fire:** `{uid}`\n• **Removido por:** {interaction.user.mention}",
+                "Esmeralda",
+            )
+        lista_atual = await listar_blacklist_ff(interaction.guild.id)
+        await interaction.followup.send(
+            embed=criar_embed(
+                "✅ ID Removido da Blacklist" if removido else "ℹ️ ID Não Constava na Blacklist",
+                f"O ID `{uid}` está liberado novamente neste servidor." if removido else f"O ID `{uid}` não estava banido.",
+                "Esmeralda" if removido else "Cinza Escuro",
+            ),
+            view=BlacklistHubView(lista_atual),
+            ephemeral=True,
+        )
+
+
+class RemoverBlacklistSelectView(discord.ui.View):
+    def __init__(self, banidos: list):
+        super().__init__(timeout=180)
+        opcoes = []
+        for b in banidos[:23]:
+            nome_b = f" ({b['ff_nome']})" if b.get("ff_nome") else ""
+            opcoes.append(discord.SelectOption(
+                label=f"Desbanir ID {b['ff_uid']}{nome_b}"[:100],
+                value=f"uid:{b['ff_uid']}",
+                emoji="✅",
+                description=str(b.get("motivo") or "Remover restrição")[:100],
+            ))
+        opcoes.append(discord.SelectOption(
+            label="Digitar outro ID manualmente",
+            value="manual",
+            emoji="⌨️",
+            description="Informar o ID numérico para remover",
+        ))
+        opcoes.append(discord.SelectOption(
+            label="Voltar ao Painel da Blacklist",
+            value="voltar",
+            emoji="🔙",
+            description="Retornar ao menu principal",
+        ))
+        sel = discord.ui.Select(placeholder="✅ Selecione qual ID deseja remover da Blacklist...", options=opcoes)
+        sel.callback = self._remover
+        self.add_item(sel)
+
+    async def _remover(self, interaction: discord.Interaction):
+        if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
+            return
+        val = interaction.data["values"][0]
+        if val == "manual":
+            return await interaction.response.send_modal(DesbanirManualModal())
+        if val == "voltar":
+            atuais = await listar_blacklist_ff(interaction.guild.id)
+            return await interaction.response.edit_message(
+                embed=_montar_embed_blacklist(atuais),
+                view=BlacklistHubView(atuais),
+            )
+        uid = val.split(":", 1)[1]
+        removido = await remover_blacklist_ff(interaction.guild.id, uid)
+        if removido:
+            await registrar_log(
+                interaction.guild,
+                "✅ BLACKLIST",
+                "✅ ID removido da Blacklist",
+                f"• **ID Free Fire:** `{uid}`\n• **Removido por:** {interaction.user.mention}",
+                "Esmeralda",
+            )
+        atuais = await listar_blacklist_ff(interaction.guild.id)
+        emb = _montar_embed_blacklist(atuais)
+        emb.add_field(
+            name="✅ Desbanido" if removido else "ℹ️ Aviso",
+            value=f"O ID `{uid}` foi removido da Blacklist." if removido else f"O ID `{uid}` já havia sido removido.",
+            inline=False,
+        )
+        await interaction.response.edit_message(embed=emb, view=BlacklistHubView(atuais))
+
+
+def _montar_embed_blacklist(banidos: list) -> discord.Embed:
+    if not banidos:
+        corpo = "*Nenhum ID do Free Fire banido neste servidor no momento.*"
+    else:
+        linhas = []
+        for b in banidos[:20]:
+            nick_b = f" (`{b['ff_nome']}`)" if b.get("ff_nome") else ""
+            linhas.append(f"• **`{b['ff_uid']}`**{nick_b} — {b.get('motivo') or 'Restrição'}")
+        if len(banidos) > 20:
+            linhas.append(f"-# + {len(banidos) - 20} ID(s) na lista")
+        corpo = "\n".join(linhas)
+    return criar_embed(
+        f"🚫 Blacklist de IDs Free Fire ({len(banidos)})",
+        f"IDs banidos ficam bloqueados automaticamente em inscrições e substituições, e aparecem como **🚨 NA BLACKLIST** quando qualquer pessoa usa `/verificar`.\n\n{corpo}",
+        "Cinza Escuro",
+    )
+
+
+class BlacklistHubView(discord.ui.View):
+    def __init__(self, banidos: list):
+        super().__init__(timeout=240)
+        self.banidos = list(banidos)
+        opcoes = [
+            discord.SelectOption(
+                label="Banir ID na Blacklist",
+                value="banir",
+                emoji="🚫",
+                description="Adiciona um ID numérico do Free Fire com motivo",
+            ),
+            discord.SelectOption(
+                label="Remover ID da Blacklist (Desbanir)",
+                value="remover",
+                emoji="✅",
+                description="Retira um ID da Blacklist para voltar a jogar",
+            ),
+            discord.SelectOption(
+                label="Atualizar Lista Completa",
+                value="atualizar",
+                emoji="📋",
+                description="Recarrega todos os IDs banidos",
+            ),
+        ]
+        sel = discord.ui.Select(placeholder="🛡️ Gerenciar Blacklist do servidor...", options=opcoes)
+        sel.callback = self._acao
+        self.add_item(sel)
+
+    async def _acao(self, interaction: discord.Interaction):
+        if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas Dono e Gerente podem alterar a Blacklist.", "Vermelho"),
+                ephemeral=True,
+            )
+        escolha = interaction.data["values"][0]
+        if escolha == "banir":
+            return await interaction.response.send_modal(BanirBlacklistModal())
+        if escolha == "remover":
+            atuais = await listar_blacklist_ff(interaction.guild.id)
+            if not atuais:
+                return await interaction.response.edit_message(
+                    embed=_montar_embed_blacklist([]),
+                    view=BlacklistHubView([]),
+                )
+            return await interaction.response.edit_message(
+                embed=criar_embed(
+                    "✅ Remover ID da Blacklist",
+                    "Selecione na lista abaixo o ID que deseja **desbanir** *(ou escolha digitar manualmente)*:",
+                    "Esmeralda",
+                ),
+                view=RemoverBlacklistSelectView(atuais),
+            )
+        atuais = await listar_blacklist_ff(interaction.guild.id)
+        await interaction.response.edit_message(embed=_montar_embed_blacklist(atuais), view=BlacklistHubView(atuais))
+
+
+@bot.tree.command(name="blacklist", description="🚫 Gerenciar Blacklist de IDs do Free Fire (banir, remover e listar)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_channels=True)
+async def cmd_blacklist(interaction: discord.Interaction):
+    if not await e_dono_ou_gerente(interaction.user):
+        return await interaction.response.send_message(
+            embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente podem gerenciar a Blacklist.", "Vermelho"),
+            ephemeral=True,
+        )
+    banidos = await listar_blacklist_ff(interaction.guild.id)
+    await interaction.response.send_message(
+        embed=_montar_embed_blacklist(banidos),
+        view=BlacklistHubView(banidos),
+        ephemeral=True,
+    )
+
+
+async def _montar_embed_relatorio_executivo(guild: discord.Guild, dias_filtro: int = 7) -> discord.Embed:
+    agora = agora_brt()
+    if dias_filtro == 1:
+        corte_iso = agora.strftime("%Y-%m-%d")
+        rotulo_per = "Hoje"
+    elif dias_filtro > 1:
+        corte_iso = (agora - datetime.timedelta(days=dias_filtro)).isoformat()
+        rotulo_per = f"Últimos {dias_filtro} dias"
+    else:
+        corte_iso = ""
+        rotulo_per = "Todo o período"
+
+    cond_data = "AND criado_em >= ?" if corte_iso else ""
+    params_base = (guild.id, corte_iso) if corte_iso else (guild.id,)
+
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+
+        # 1) Diários / Vagas confirmadas
+        slots_rows = await (await db.execute(
+            f"SELECT valor_cobrado, pago_moedas, valor_moedas, taxa_adm_pix, assumido_por "
+            f"FROM slots WHERE guild_id = ? AND confirmado = 1 {cond_data}",
+            params_base,
+        )).fetchall()
+
+        qtd_vagas = len(slots_rows)
+        receita_pix_adm = 0.0
+        moedas_usadas = 0.0
+        ranking_adm = {}
+        for s in slots_rows:
+            sd = dict(s)
+            if int(sd.get("pago_moedas") or 0) == 1:
+                moedas_usadas += float(sd.get("valor_moedas") or sd.get("valor_cobrado") or 0)
+                pix_v = float(sd.get("taxa_adm_pix") or TAXA_MOEDAS_ADM_PIX)
+            else:
+                pix_v = float(sd.get("valor_cobrado") or 0)
+            receita_pix_adm += pix_v
+            adm_id = sd.get("assumido_por")
+            if adm_id:
+                info_a = ranking_adm.setdefault(int(adm_id), {"qtd": 0, "pix": 0.0})
+                info_a["qtd"] += 1
+                info_a["pix"] += pix_v
+
+        # 2) Depósitos aprovados na carteira (PIX aos Donos/Gerentes)
+        deps_rows = await (await db.execute(
+            f"SELECT valor, assumido_por FROM depositos WHERE guild_id = ? AND status = 'creditado' {cond_data}",
+            params_base,
+        )).fetchall()
+        total_dep = sum(float(d["valor"] or 0) for d in deps_rows)
+        por_resp_dep = {}
+        for d in deps_rows:
+            rid = d["assumido_por"]
+            if rid:
+                por_resp_dep[int(rid)] = por_resp_dep.get(int(rid), 0.0) + float(d["valor"] or 0)
+
+        # 3) Saques e circulação
+        saques_pagos = (await (await db.execute(
+            f"SELECT COALESCE(SUM(valor), 0), COUNT(*) FROM saques WHERE guild_id = ? AND status = 'pago' {cond_data}",
+            params_base,
+        )).fetchone())
+        saques_fila = (await (await db.execute(
+            "SELECT COALESCE(SUM(valor), 0), COUNT(*) FROM saques WHERE guild_id = ? AND status IN ('na_fila', 'liberado')",
+            (guild.id,),
+        )).fetchone())
+        circ_pessoal = (await (await db.execute(
+            "SELECT COALESCE(SUM(saldo), 0) FROM carteira WHERE guild_id = ?",
+            (guild.id,),
+        )).fetchone())[0]
+        circ_trabalho = (await (await db.execute(
+            "SELECT COALESCE(SUM(saldo), 0) FROM carteira_trabalho WHERE guild_id = ?",
+            (guild.id,),
+        )).fetchone())[0]
+        circulacao = (circ_pessoal, circ_trabalho)
+
+        # 4) Parcerias & Divulgações
+        parc_qtd = (await (await db.execute(
+            f"SELECT COUNT(*) FROM parceiros WHERE guild_id = ? AND status = 'aprovada' {cond_data}",
+            params_base,
+        )).fetchone())[0]
+        div_row = (await (await db.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(valor_acordado), 0) FROM divulgacoes WHERE guild_id = ? AND status = 'publicada' {cond_data}",
+            params_base,
+        )).fetchone())
+
+        # 5) Mapa de ocupação por horário (quais horários mais lotam vs menor procura)
+        mapa_horarios = await (await db.execute(
+            "SELECT tipo, categoria, horario, COUNT(*) AS edicoes, COALESCE(SUM(lotes_usados), 0) AS total_vagas "
+            "FROM horarios WHERE guild_id = ? GROUP BY tipo, categoria, horario ORDER BY total_vagas DESC",
+            (guild.id,),
+        )).fetchall()
+
+    emb = criar_embed(
+        f"📊 Relatório Executivo — {rotulo_per}",
+        f"Visão consolidada de faturamento, equipe e ocupação de salas em **{guild.name}**.",
+        "Dourado",
+    )
+
+    emb.add_field(
+        name="🎮 Diários & ADMs",
+        value=(
+            f"• **Vagas confirmadas:** `{qtd_vagas}`\n"
+            f"• **PIX direto aos ADMs:** `{formatar_moeda(receita_pix_adm)}`\n"
+            f"• **Moedas consumidas:** `{formatar_moeda(moedas_usadas)}`"
+        ),
+        inline=True,
+    )
+    emb.add_field(
+        name="🏦 Carteira, Depósitos & Saques",
+        value=(
+            f"• **Depósitos aprovados:** `{formatar_moeda(total_dep)}` (`{len(deps_rows)}`)\n"
+            f"• **Saques pagos:** `{formatar_moeda(saques_pagos[0])}` (`{saques_pagos[1]}`)\n"
+            f"• **Na fila:** `{formatar_moeda(saques_fila[0])}` (`{saques_fila[1]}`)\n"
+            f"• **Moedas em circulação:** `{formatar_moeda(float(circulacao[0] or 0) + float(circulacao[1] or 0))}`"
+        ),
+        inline=True,
+    )
+    emb.add_field(
+        name="🤝 Parcerias & Divulgações",
+        value=(
+            f"• **Parcerias aprovadas:** `{parc_qtd}`\n"
+            f"• **Divulgações publicadas:** `{div_row[0]}` (`{formatar_moeda(div_row[1])}`)"
+        ),
+        inline=False,
+    )
+
+    if ranking_adm:
+        top_adms = sorted(ranking_adm.items(), key=lambda x: (x[1]["qtd"], x[1]["pix"]), reverse=True)[:5]
+        txt_adm = "\n".join(
+            f"• <@{aid}> — **{info['qtd']}** vagas (`{formatar_moeda(info['pix'])}` via PIX)"
+            for aid, info in top_adms
+        )
+        emb.add_field(name="🛡️ Top ADMs no Período", value=txt_adm, inline=False)
+
+    if por_resp_dep:
+        top_resp = sorted(por_resp_dep.items(), key=lambda x: x[1], reverse=True)[:5]
+        txt_resp = "\n".join(f"• <@{rid}> — `{formatar_moeda(val)}`" for rid, val in top_resp)
+        emb.add_field(name="👑 Depósitos Recebidos por Dono/Gerente", value=txt_resp, inline=False)
+
+    if mapa_horarios:
+        melhores = [dict(r) for r in mapa_horarios[:3] if int(r["total_vagas"] or 0) > 0]
+        fracos = [dict(r) for r in reversed(mapa_horarios) if int(r["total_vagas"] or 0) == 0][:3]
+        partes_oc = []
+        if melhores:
+            partes_oc.append(
+                "🔥 **Mais procurados:** "
+                + ", ".join(
+                    f"`{m['horario']}` ({m['tipo'].capitalize()} • {m['total_vagas']} vagas)"
+                    for m in melhores
+                )
+            )
+        if fracos:
+            partes_oc.append(
+                "💤 **Sem vendas registradas:** "
+                + ", ".join(f"`{f['horario']}` ({f['tipo'].capitalize()})" for f in fracos)
+            )
+        if partes_oc:
+            emb.add_field(name="📈 Mapa de Ocupação da Grade", value="\n".join(partes_oc), inline=False)
+
+    return emb
+
+
+class RelatorioPeriodoView(discord.ui.View):
+    def __init__(self, atual: int = 7):
+        super().__init__(timeout=240)
+        opcoes = [
+            discord.SelectOption(label="Hoje", value="1", emoji="📅", default=(atual == 1)),
+            discord.SelectOption(label="Últimos 7 dias", value="7", emoji="📆", default=(atual == 7)),
+            discord.SelectOption(label="Últimos 30 dias", value="30", emoji="🗓️", default=(atual == 30)),
+            discord.SelectOption(label="Todo o histórico", value="0", emoji="♾️", default=(atual == 0)),
+        ]
+        sel = discord.ui.Select(placeholder="📊 Alternar período do relatório...", options=opcoes)
+        sel.callback = self._trocar
+        self.add_item(sel)
+
+    async def _trocar(self, interaction: discord.Interaction):
+        if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas Dono e Gerente.", "Vermelho"), ephemeral=True
+            )
+        dias = int(interaction.data["values"][0])
+        await interaction.response.defer(ephemeral=True)
+        emb = await _montar_embed_relatorio_executivo(interaction.guild, dias)
+        await interaction.edit_original_response(embed=emb, view=RelatorioPeriodoView(dias))
+
+
+@bot.tree.command(name="relatorio", description="📊 Painel executivo de faturamento, ADMs e ocupação de horários")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_channels=True)
+async def cmd_relatorio(interaction: discord.Interaction):
+    if not await e_dono_ou_gerente(interaction.user):
+        return await interaction.response.send_message(
+            embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente podem acessar o relatório executivo.", "Vermelho"),
+            ephemeral=True,
+        )
+    await interaction.response.defer(ephemeral=True)
+    emb = await _montar_embed_relatorio_executivo(interaction.guild, 7)
+    await interaction.followup.send(embed=emb, view=RelatorioPeriodoView(7), ephemeral=True)
 
 
 @bot.tree.command(name="help", description="❓ Ver os comandos disponíveis para o seu cargo")
@@ -5770,12 +8144,13 @@ async def cmd_help(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🎮 Jogador",
-        value="• `/carteira` — Saldo pessoal, depósito e saque PIX\n"
+        value="• `/lines` — Salvar e editar suas Lines Favoritas (1 Toque)\n"
+              "• `/verificar` — Consultar ID do Free Fire e checar Blacklist\n"
+              "• `/carteira` — Saldo pessoal, depósito e saque PIX\n"
               "• `/extrato` — Histórico da sua carteira\n"
               "• `/transferir` — Transferir saldo para outro jogador\n"
               "• `/cupom` — Aplicar código de desconto na inscrição\n"
               "• `/perfil` — Estatísticas e vitórias no servidor\n"
-              "• `/verificar` — Consultar ID do Free Fire\n"
               "• `/meu_ticket_fechar` — Encerrar seu atendimento aberto",
         inline=False
     )
@@ -5800,7 +8175,7 @@ async def cmd_help(interaction: discord.Interaction):
         )
         embed.add_field(
             name="👑 Exclusivo Dono & Gerente",
-            value="• `/setup` • `/diagnostico` • `/config` • `/logs` • `/saude`\n"
+            value="• `/relatorio` • `/blacklist` • `/setup` • `/diagnostico` • `/config` • `/logs` • `/saude`\n"
                   "• `/diario` • `/painel` • `/ish` • `/painelcupom` • `/reset`\n"
                   "• `/painelcarteira` • `/addsaldo` • `/ticket` • `/staff`\n"
                   "• `/parceria` • `/divulgacao` • `/vaga` • `/anunciar` • `/embed`\n"
@@ -8622,6 +10997,8 @@ async def cmd_saude(interaction: discord.Interaction):
                        saque_min="Saque mínimo (padrão 5)",
                        deposito_min="Depósito mínimo (padrão 1)",
                        bloqueio_diario="Minutos antes do início para bloquear a compra do diário (ex: 5, 10, 20)",
+                       nivel_min_ff="Level mínimo da conta no Free Fire para jogar (padrão 20)",
+                       substituicao_min="Até quantos minutos antes do diário pode substituir jogador na line (padrão 5)",
                        canal_logs="Canal de logs geral (pagamentos, depósitos, saques)",
                        canal_logs_adm="Canal privado de logs de ganhos/confirmações dos ADMs",
                        canal_logs_suporte="Canal de logs do atendimento (tickets e avaliações)",
@@ -8639,6 +11016,8 @@ async def cmd_config(interaction: discord.Interaction,
                      saque_min: Optional[str] = None,
                      deposito_min: Optional[str] = None,
                      bloqueio_diario: Optional[int] = None,
+                     nivel_min_ff: Optional[int] = None,
+                     substituicao_min: Optional[int] = None,
                      canal_logs: Optional[discord.TextChannel] = None,
                      canal_logs_adm: Optional[discord.TextChannel] = None,
                      canal_logs_suporte: Optional[discord.TextChannel] = None,
@@ -8666,6 +11045,12 @@ async def cmd_config(interaction: discord.Interaction,
     if bloqueio_diario is not None:
         novos["bloqueio_compra_min"] = max(0, min(int(bloqueio_diario), 720))
         mudancas.append(f"> 🔒 Bloqueio de compra do diário: `{novos['bloqueio_compra_min']} min` antes do início")
+    if nivel_min_ff is not None:
+        novos["ff_nivel_min"] = max(0, min(int(nivel_min_ff), 100))
+        mudancas.append(f"> 🛡️ Level mínimo no Free Fire: `Level {novos['ff_nivel_min']}`")
+    if substituicao_min is not None:
+        novos["substituicao_min"] = max(0, min(int(substituicao_min), 720))
+        mudancas.append(f"> 🔄 Limite para substituição na line: até `{novos['substituicao_min']} min` antes do início")
     for nome_campo, canal, chave in (("Logs gerais", canal_logs, "canal_logs"),
                                      ("Logs de ganhos ADM", canal_logs_adm, "canal_log_pag_adm"),
                                      ("Logs do atendimento", canal_logs_suporte, "canal_logs_suporte"),
@@ -8689,6 +11074,8 @@ async def cmd_config(interaction: discord.Interaction,
 
         dias = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
         bloq_atual = await obter_bloqueio_compra_min(interaction.guild.id)
+        niv_atual = await obter_ff_nivel_min(interaction.guild.id)
+        sub_atual = await obter_substituicao_min(interaction.guild.id)
         embed = criar_embed(
             "⚙️ Configuração atual",
             f"> 🏦 PIX (Depósitos, Parcerias & Diários): `chave /pix individual de quem assumir`\n"
@@ -8696,6 +11083,8 @@ async def cmd_config(interaction: discord.Interaction,
             f"> 💸 Saque mínimo: `{formatar_moeda(await cfgv(interaction.guild.id, 'saque_min', CARTEIRA_SAQUE_MIN))}`\n"
             f"> 💰 Depósito mínimo: `{formatar_moeda(await cfgv(interaction.guild.id, 'deposito_min', CARTEIRA_DEPOSITO_MIN))}`\n"
             f"> 🔒 Bloqueio de compra do diário: `{bloq_atual} min` antes do início\n"
+            f"> 🛡️ Level mínimo no Free Fire: `Level {niv_atual}`\n"
+            f"> 🔄 Substituição de jogador na line: até `{sub_atual} min` antes\n"
             f"> 🧾 Logs gerais: {_canal(cfg.get('canal_logs'))}\n"
             f"> 🛡️ Logs de ganhos ADM: {_canal(cfg.get('canal_log_pag_adm') or cfg.get('canal_logs'))}\n"
             f"> 🎧 Logs do atendimento: {_canal(cfg.get('canal_logs_suporte'))}\n"
@@ -10812,10 +13201,10 @@ async def finalizar_ticket(interaction, ticket_id: int, atendente_id: int, nota:
     except Exception:
         pass
     await asyncio.sleep(TICKET_FECHAR_SEGUNDOS)
-    try:
-        await interaction.channel.delete()
-    except Exception:
-        pass
+    await _apagar_canal_seguro(
+        interaction.channel,
+        f"Ticket #{ticket_id} encerrado após avaliação ({nota:g}/5)",
+    )
 
 
 async def _fechar_ticket_sem_nota(guild, ticket, actor_id: int, motivo: str) -> bool:
@@ -10843,10 +13232,9 @@ async def _fechar_ticket_sem_nota(guild, ticket, actor_id: int, motivo: str) -> 
                     f"Este atendimento foi encerrado. Motivo: {motivo[:120]}.", "Cinza Escuro"))
             except (discord.Forbidden, discord.HTTPException) as erro:
                 _log_arquivo(f"[TICKET] aviso de fechamento #{ticket_id} falhou: {erro}")
-            try:
-                await canal.delete(reason=f"Atendimento #{ticket_id} fechado: {motivo[:300]}")
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as erro:
-                _log_arquivo(f"[TICKET] canal do ticket fechado #{ticket_id} será reconciliado no próximo boot: {erro}")
+            ok_del = await _apagar_canal_seguro(canal, f"Atendimento #{ticket_id} fechado: {motivo[:200]}")
+            if not ok_del:
+                _log_arquivo(f"[TICKET] canal do ticket fechado #{ticket_id} será reconciliado no próximo boot")
     except (discord.Forbidden, discord.HTTPException) as erro:
         _log_arquivo(f"[TICKET] canal #{ticket_id} indisponível após fechar: {erro}")
     _log_arquivo(f"[TICKET] fechado sem avaliação id={ticket_id} guild={guild.id} por={actor_id}: {motivo[:150]}")
@@ -11588,7 +13976,8 @@ async def creditar_deposito(guild, deposito, origem: str, livepix_id: str = ""):
         try:
             await canal.send(content=mencao(deposito["user_id"]),embed=criar_embed("✅ Depósito confirmado!",
                 f"Seu saldo de **{formatar_moeda(valor)}** caiu na carteira.\n> 💰 Saldo agora: `{formatar_moeda(novo)}`\n> 🎮 Já pode usar pra pagar o diário! Este canal fecha em {DEPOSITO_FECHAR_SEGUNDOS}s.","Esmeralda"))
-            await asyncio.sleep(DEPOSITO_FECHAR_SEGUNDOS);await canal.delete()
+            await asyncio.sleep(DEPOSITO_FECHAR_SEGUNDOS)
+            await _apagar_canal_seguro(canal, f"Depósito #{deposito['id']} confirmado")
         except Exception:pass
     return novo
 
@@ -12438,10 +14827,107 @@ async def avisar_jogador(guild: Optional[discord.Guild], user_id: int, embed: di
     return False
 
 
+_CANAIS_TRANSCRITOS = set()
+
+
+async def salvar_transcricao_canal(canal, motivo: str = "Atendimento encerrado") -> bool:
+    """Salva uma transcrição limpa e compacta (mensagens + links de anexos) no canal privado de logs antes de apagar."""
+    if not canal or not hasattr(canal, "history"):
+        return False
+    cid = getattr(canal, "id", 0)
+    if cid and cid in _CANAIS_TRANSCRITOS:
+        return False
+    guild = getattr(canal, "guild", None)
+    if not guild:
+        return False
+
+    try:
+        cfg = await obter_config(guild.id)
+        log_id = cfg.get("canal_logs_suporte") or cfg.get("canal_logs")
+        if not log_id:
+            return False
+        log_canal = guild.get_channel(int(log_id))
+        if not log_canal:
+            return False
+
+        mensagens = []
+        async for m in canal.history(limit=50):
+            mensagens.append(m)
+        mensagens.reverse()
+
+        if not mensagens:
+            return False
+
+        if cid:
+            _CANAIS_TRANSCRITOS.add(cid)
+            if len(_CANAIS_TRANSCRITOS) > 2000:
+                _CANAIS_TRANSCRITOS.clear()
+
+        participantes = []
+        anexos_links = []
+        linhas_txt = [
+            f"FIRE FORCE v{VERSAO_BOT} — TRANSCRIÇÃO DE CANAL",
+            f"Canal: #{getattr(canal, 'name', cid)} (ID {cid})",
+            f"Encerrado em: {agora_brt().strftime('%d/%m/%Y %H:%M:%S')} BRT",
+            f"Motivo: {motivo}",
+            "-" * 60,
+        ]
+
+        for m in mensagens:
+            autor = getattr(m, "author", None)
+            autor_nome = getattr(autor, "display_name", str(autor or "Sistema"))
+            eh_bot = bool(getattr(autor, "bot", False))
+            if autor and not eh_bot and autor.mention not in participantes:
+                participantes.append(autor.mention)
+            dt_m = getattr(m, "created_at", None)
+            hora_m = dt_m.astimezone(TZ_BRASILIA).strftime("%H:%M") if dt_m else "--:--"
+            texto_m = (getattr(m, "content", "") or "").strip()
+            if not texto_m and getattr(m, "embeds", None):
+                emb0 = m.embeds[0]
+                texto_m = f"[Card: {emb0.title or 'painel'}]"
+            if texto_m:
+                linhas_txt.append(f"[{hora_m}] {autor_nome}: {texto_m}")
+            for att in (getattr(m, "attachments", None) or []):
+                url_a = getattr(att, "url", "")
+                fn_a = getattr(att, "filename", "anexo")
+                if url_a:
+                    anexos_links.append(f"[{fn_a}]({url_a})")
+                    linhas_txt.append(f"[{hora_m}] {autor_nome} [ANEXO]: {fn_a} -> {url_a}")
+
+        everyone_ve = False
+        try:
+            everyone_ve = bool(log_canal.permissions_for(guild.default_role).view_channel)
+        except Exception:
+            everyone_ve = False
+
+        resumo_desc = (
+            f"• **Canal encerrado:** `#{getattr(canal, 'name', cid)}`\n"
+            f"• **Motivo:** {motivo[:180]}\n"
+            f"• **Mensagens registradas:** `{len(mensagens)}` • **Anexos:** `{len(anexos_links)}`\n"
+            f"• **Participantes:** {', '.join(participantes[:8]) if participantes else '*apenas sistema*'}"
+        )
+        if anexos_links and not everyone_ve:
+            resumo_desc += "\n• **Comprovantes/Anexos:** " + " • ".join(anexos_links[:5])
+
+        emb_log = criar_embed("🗂️ Transcrição de Canal Encerrado", resumo_desc[:3900], "Cinza Escuro")
+        if not everyone_ve:
+            conteudo_bytes = "\n".join(linhas_txt).encode("utf-8", errors="replace")
+            nome_arq = f"transcricao-{_slug_canal(getattr(canal, 'name', 'canal'), 'canal')}.txt"
+            arquivo_txt = discord.File(io.BytesIO(conteudo_bytes), filename=nome_arq)
+            await log_canal.send(embed=emb_log, file=arquivo_txt)
+        else:
+            await log_canal.send(embed=emb_log)
+        return True
+    except Exception as erro:
+        _log_arquivo(f"[TRANSCRIÇÃO] canal={cid}: {type(erro).__name__}: {erro}")
+        return False
+
+
 async def _apagar_canal_seguro(canal, motivo: str = "Atendimento encerrado") -> bool:
-    """Remove um canal privado com tratamento seguro de erros e log diagnóstico."""
+    """Salva transcrição compacta no log privado e remove o canal com tratamento seguro."""
     if not canal or not hasattr(canal, "delete"):
         return False
+    await salvar_transcricao_canal(canal, motivo)
     try:
         await canal.delete(reason=motivo[:250])
         return True
@@ -13984,6 +16470,18 @@ async def _inicializar_bot():
             if guild_p:
                 try:
                     await rebuild_painel(guild_p, p["id"])
+                except Exception:
+                    pass
+
+        horarios_com_tabela = await (await db.execute(
+            "SELECT id, guild_id FROM horarios WHERE canal_tabela IS NOT NULL AND canal_tabela > 0"
+        )).fetchall()
+        for ht in horarios_com_tabela:
+            _garantir_view_sala_registrada(int(ht["id"]))
+            guild_ht = bot.get_guild(int(ht["guild_id"]))
+            if guild_ht:
+                try:
+                    await atualizar_tabela(guild_ht, int(ht["id"]))
                 except Exception:
                     pass
 
