@@ -84,7 +84,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "12.1"
+VERSAO_BOT = "12.2"
 TAXA_MOEDAS_ADM_PIX = 1.00
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
 SUPABASE_KEEPALIVE_SEGUNDOS = max(3600, int(os.getenv("SUPABASE_PING_HORAS", "48")) * 3600)
@@ -2329,20 +2329,31 @@ class HorarioSelectMenu(discord.ui.Select):
         await interaction.response.send_modal(modal)
 
 
-class PainelPaginaButton(discord.ui.Button):
-    def __init__(self, painel_id: int, delta: int, rotulo: str, emoji: str, custom_id: str,
-                 disabled: bool = False):
-        super().__init__(label=rotulo, style=discord.ButtonStyle.secondary, emoji=emoji,
-                         custom_id=custom_id, row=4, disabled=disabled)
+class PainelPaginaSelect(discord.ui.Select):
+    def __init__(self, painel_id: int, page: int, total_paginas: int):
         self.painel_id = int(painel_id)
-        self.delta = int(delta)
+        opcoes = [
+            discord.SelectOption(
+                label=f"Página {idx + 1} de {total_paginas}",
+                value=str(idx),
+                emoji="📄",
+                default=(idx == page),
+                description=f"Exibir horários da página {idx + 1}",
+            )
+            for idx in range(min(total_paginas, 25))
+        ]
+        super().__init__(
+            custom_id=f"ff_ppag_{painel_id}",
+            placeholder=f"📄 Página {page + 1}/{total_paginas} — Trocar página...",
+            options=opcoes,
+            row=4,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         if not interaction.guild:
             return await interaction.response.send_message("Use este painel dentro do servidor.", ephemeral=True)
-        pagina_atual = _PAINEL_PAGINA_ATUAL.get(self.painel_id, 0)
-        await rebuild_painel(interaction.guild, self.painel_id,
-                             page=pagina_atual + self.delta, interaction=interaction)
+        nova_pagina = int(self.values[0])
+        await rebuild_painel(interaction.guild, self.painel_id, page=nova_pagina, interaction=interaction)
 
 
 class PainelInscricaoView(discord.ui.View):
@@ -2370,12 +2381,7 @@ class PainelInscricaoView(discord.ui.View):
                                                 inicio_opcoes=inicio_global))
 
         if total_paginas > 1:
-            self.add_item(PainelPaginaButton(
-                painel_id, -1, "Anterior", "⬅️",
-                custom_id=f"ff_pprev_{painel_id}", disabled=(page <= 0)))
-            self.add_item(PainelPaginaButton(
-                painel_id, 1, "Próxima", "➡️",
-                custom_id=f"ff_pnext_{painel_id}", disabled=(page >= total_paginas - 1)))
+            self.add_item(PainelPaginaSelect(painel_id, page, total_paginas))
 
 
 # ==================== MODAL DE COMPRA DE SLOT ====================
@@ -2641,18 +2647,20 @@ class ComprarSlotModal(discord.ui.Modal):
         )
 
         embed_pagamento = criar_embed(
-            titulo=f"💳 Pagamento — {rotulo} (reserva)",
-            descricao=f"**Comprador:** {interaction.user.mention}\n\n"
-                      f"╔══════════════════════════════════╗\n"
-                      f"║  🏷️  {formatar_rotulo_diario(self.tipo, self.categoria)}\n"
-                      f"║  ⏰  `{self.horario_str}`\n"
-                      f"║  💰  `{formatar_moeda(self.valor)}`\n"
-                      f"║  🎫  Reserva — vaga liberada após aprovação do ADM\n"
-                      f"╚══════════════════════════════════╝\n\n"
-                      f"**Jogadores verificados pelo ID:**\n{lista_nicks}",
-            cor_nome="Amarelo",
+            titulo=f"💳 Reserva de Vaga • {formatar_rotulo_diario(self.tipo, self.categoria)}",
+            descricao=(
+                f"Olá {interaction.user.mention}, sua vaga foi pré-reservada.\n\n"
+                f"• **Horário:** `{self.horario_str}`\n"
+                f"• **Valor:** **`{formatar_moeda(self.valor)}`**\n"
+                f"• **Conta(s) verificada(s):**\n{lista_nicks}\n\n"
+                f"**Como concluir**\n"
+                f"• **Com PIX:** aguarde o ADM assumir para receber o QR Code PIX dele neste canal.\n"
+                f"• **Com Moedas:** escolha **Pagar com Moedas** no seletor abaixo *(+{formatar_moeda(TAXA_MOEDAS_ADM_PIX)} via PIX ao ADM)*.\n"
+                f"• **Cupom:** tem desconto? Use `/cupom <codigo>` antes de pagar."
+            ),
+            cor_nome="Cinza Escuro",
             thumb=interaction.user.display_avatar.url,
-            footer="Fire Force • Reserva de vaga"
+            footer=f"Fire Force • Reserva #{slot_id}",
         )
 
         mencoes_staff = []
@@ -2662,59 +2670,38 @@ class ComprarSlotModal(discord.ui.Modal):
                 if role:
                     mencoes_staff.append(role.mention)
 
-        embed_pagamento.add_field(
-            name="💳 Pagamento via PIX (direto para o ADM)",
-            value=f"> **Valor integral:** `{formatar_moeda(self.valor)}`\n"
-                  f"> 1️⃣ Aguarde um ADM clicar em **🙋 Assumir** abaixo para exibir a chave PIX e o QR Code dele.\n"
-                  f"> 2️⃣ Faça o PIX direto para o ADM e envie o comprovante neste canal.\n"
-                  f"> 3️⃣ O ADM confere e libera sua vaga na hora!",
-            inline=False
-        )
-        embed_pagamento.add_field(
-            name="🪙 Pagar com moedas do bot (saldo da carteira)",
-            value=f"> Clique em **🪙 Pagar com moedas** abaixo para usar o saldo da sua carteira.\n"
-                  f"> ⚠️ Ao pagar com moedas, será necessário enviar **+{formatar_moeda(TAXA_MOEDAS_ADM_PIX)} via Pix** "
-                  f"para o ADM liberar sua vaga (pois moedas não contam como pagamento para ele).",
-            inline=False
-        )
-        embed_pagamento.add_field(
-            name="🎟️ Cupom de desconto",
-            value="> Tem cupom? Use `/cupom <codigo>` aqui antes de pagar.",
-            inline=False
-        )
-
         # 🎉 evento rolando? avisa (e inscreve) quem está dentro da aposta mínima
         try:
             evento = await evento_ativo(interaction.guild.id, self.valor, self.tipo, self.categoria)
             if evento:
                 await registrar_participante(evento, slot_id, interaction.user.id, self.valor)
                 embed_pagamento.add_field(
-                    name=f"🎉 EVENTO: {evento['nome']}",
-                    value=f"> ✅ **Você está participando!** Sua inscrição de `{formatar_moeda(self.valor)}` "
-                          f"bateu a aposta mínima de `{formatar_moeda(evento['aposta_min'])}`.\n"
-                          f"> 🎯 Faça `{evento['kills_min']}` kills"
-                          + (f" ou fique no `top {evento['top_min']}`" if evento['top_min'] else "")
-                          + f" e ganhe `{formatar_moeda(evento['bonus'])}` de BÔNUS na carteira!\n"
-                          + (f"> 📝 {evento['descricao'][:150]}" if evento['descricao'] else ""),
-                    inline=False)
+                    name=f"🎉 Evento Ativo • {evento['nome']}",
+                    value=(
+                        f"• Inscrição participante (`{formatar_moeda(self.valor)}` ≥ `{formatar_moeda(evento['aposta_min'])}`)\n"
+                        f"• Meta: `{evento['kills_min']}` kills"
+                        + (f" ou `top {evento['top_min']}`" if evento['top_min'] else "")
+                        + f" → Bônus de **`{formatar_moeda(evento['bonus'])}`**"
+                    ),
+                    inline=False,
+                )
         except Exception as erro:
             _log_arquivo(f"[EVENTO] erro ao inscrever: {erro}")
 
         await canal_pagamento.send(
-            content=f"{interaction.user.mention} {' '.join(mencoes_staff)}",
+            content=f"{interaction.user.mention} {' '.join(mencoes_staff)}".strip(),
             embed=embed_pagamento,
-            view=PagamentoAcaoView()
+            view=PagamentoAcaoView(),
         )
 
         await interaction.followup.send(
             embed=criar_embed(
                 "✅ Reserva Criada",
-                f"{rotulo} reservado(a) para **{self.horario_str}**!\n\n"
-                f"**Conta(s) identificada(s) pelo ID:**\n{lista_nicks}\n\n"
-                f"> Finalize o pagamento em {canal_pagamento.mention} — a vaga é liberada quando o ADM aprovar.",
-                "Esmeralda"
+                f"{rotulo} reservado(a) para **{self.horario_str}**.\n"
+                f"• Continue o atendimento em {canal_pagamento.mention}",
+                "Cinza Escuro",
             ),
-            ephemeral=True
+            ephemeral=True,
         )
         await rebuild_painel(interaction.guild, horario["painel_id"])
 
@@ -2724,7 +2711,7 @@ class ComprarSlotModal(discord.ui.Modal):
 async def _fechar_canal_reserva(canal, mensagem: str, titulo: str = "⌛ Reserva Encerrada"):
     """Avisa no canal de pagamento e apaga ele depois de alguns segundos."""
     try:
-        embed = criar_embed(titulo, mensagem, "Amarelo")
+        embed = criar_embed(titulo, mensagem, "Cinza Escuro")
         try:
             await canal.send(embed=embed)
         except Exception:
@@ -2736,36 +2723,72 @@ async def _fechar_canal_reserva(canal, mensagem: str, titulo: str = "⌛ Reserva
 
 
 class ComprovanteAcaoView(discord.ui.View):
-    """Ações abaixo do pedido de comprovante; persistentes por slot."""
+    """Seletor minimalista abaixo do pedido de comprovante; persistente por slot."""
+
     def __init__(self, slot_id: int = 0):
         super().__init__(timeout=None)
-        self.slot_id=int(slot_id) if isinstance(slot_id,int) else 0
-        sid=self.slot_id
-        ok=discord.ui.Button(label="Confirmar comprovante",style=discord.ButtonStyle.green,emoji="✅",custom_id=f"ff_comp_ok:{sid}")
-        no=discord.ui.Button(label="Reprovar comprovante",style=discord.ButtonStyle.red,emoji="❌",custom_id=f"ff_comp_no:{sid}")
-        ok.callback=self.aprovar_comprovante
-        no.callback=self.reprovar_comprovante
-        self.add_item(ok); self.add_item(no)
+        self.slot_id = int(slot_id) if isinstance(slot_id, int) else 0
+        sel = discord.ui.Select(
+            custom_id=f"ff_comp_sel:{self.slot_id}",
+            placeholder="📄 Analisar comprovante...",
+            options=[
+                discord.SelectOption(
+                    label="Confirmar Comprovante e Liberar Vaga",
+                    value="ok",
+                    emoji="✅",
+                    description="Valida o pagamento e libera o canal do diário",
+                ),
+                discord.SelectOption(
+                    label="Reprovar Comprovante",
+                    value="no",
+                    emoji="❌",
+                    description="Cancela a reserva e devolve moedas se houver",
+                ),
+            ],
+        )
+        sel.callback = self._decidir
+        self.add_item(sel)
 
     async def _autorizar(self, interaction):
-        if not await atendente_autorizado("mediador",interaction.user):
-            await interaction.response.send_message(embed=criar_embed("❌ Sem permissão","Só quem assumiu este pagamento, mediador, gerente ou dono pode decidir o comprovante.","Vermelho"),ephemeral=True); return False
-        if not await aviso_fora_de_servico(interaction): return False
+        if not await atendente_autorizado("mediador", interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Sem Permissão", "Só quem assumiu este pagamento, ADM, Gerente ou Dono pode decidir.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        if not await aviso_fora_de_servico(interaction):
+            return False
         async with aiosqlite.connect(DATABASE_FILE) as db:
-            row=await (await db.execute("SELECT assumido_por FROM slots WHERE id=? AND canal_pag=? AND confirmado=0",(self.slot_id,interaction.channel.id))).fetchone()
+            row = await (await db.execute(
+                "SELECT assumido_por FROM slots WHERE id=? AND canal_pag=? AND confirmado=0",
+                (self.slot_id, interaction.channel.id),
+            )).fetchone()
         if not row:
-            await interaction.response.send_message(embed=criar_embed("ℹ️ Pagamento resolvido","Este pagamento não está mais pendente.","Amarelo"),ephemeral=True); return False
-        if row[0] and row[0]!=interaction.user.id and not await e_gerencia(interaction.user):
-            await interaction.response.send_message(embed=criar_embed("🔒 Só quem assumiu ou gerência","A pessoa que assumiu este atendimento ou a gerência pode decidir.","Vermelho"),ephemeral=True); return False
+            await interaction.response.send_message(
+                embed=criar_embed("ℹ️ Pagamento resolvido", "Este pagamento não está mais pendente.", "Cinza Escuro"),
+                ephemeral=True,
+            )
+            return False
+        if row[0] and row[0] != interaction.user.id and not await e_gerencia(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Assumido por outro responsável", "Apenas quem assumiu este atendimento ou a gerência pode decidir.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
         return True
 
-    async def aprovar_comprovante(self, interaction):
-        if not await self._autorizar(interaction): return
-        await PagamentoAcaoView()._aprovar(interaction)
-
-    async def reprovar_comprovante(self, interaction):
-        if not await self._autorizar(interaction): return
-        await PagamentoAcaoView().recusar(interaction,None)
+    async def _decidir(self, interaction: discord.Interaction):
+        acao = interaction.data["values"][0]
+        try:
+            await interaction.message.edit(view=ComprovanteAcaoView(self.slot_id))
+        except Exception:
+            pass
+        if not await self._autorizar(interaction):
+            return
+        if acao == "ok":
+            await PagamentoAcaoView()._aprovar(interaction)
+        else:
+            await PagamentoAcaoView().recusar(interaction, None)
 
 
 AVISO_MOEDAS_ADM_PIX = (
@@ -2872,14 +2895,30 @@ class PixAdmTipoView(discord.ui.View):
 
 
 class CopiarPixAdmView(discord.ui.View):
-    """Botão que entrega o código PIX Copia e Cola puro (sem crases), facilitando copiar com 1 toque no celular."""
+    """Seletor minimalista que entrega o código PIX Copia e Cola puro no celular."""
 
     def __init__(self, payload: str):
         super().__init__(timeout=3600)
         self.payload = payload
+        sel = discord.ui.Select(
+            placeholder="📋 Copiar código PIX puro no celular...",
+            options=[
+                discord.SelectOption(
+                    label="Receber PIX Copia e Cola (Texto Puro)",
+                    value="copiar",
+                    emoji="📋",
+                    description="Envia somente o código sem formatação para copiar fácil",
+                )
+            ],
+        )
+        sel.callback = self._copiar
+        self.add_item(sel)
 
-    @discord.ui.button(label="Copiar PIX Copia e Cola", style=discord.ButtonStyle.green, emoji="📋")
-    async def copiar(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _copiar(self, interaction: discord.Interaction):
+        try:
+            await interaction.message.edit(view=CopiarPixAdmView(self.payload))
+        except Exception:
+            pass
         await interaction.response.send_message(self.payload, ephemeral=True)
 
 
@@ -2901,45 +2940,31 @@ async def montar_cobranca_pix_adm_embed(
     )
     chave_exibida = normalizar_chave_pix_emv(pix_adm.get("tipo") or "aleatoria", pix_adm["chave"])
     if pago_moedas:
-        titulo = "🪙 Quase lá! Falta enviar +R$ 1,00 via Pix ao ADM"
+        titulo = "🪙 Quase lá • +R$ 1,00 via PIX ao ADM"
         descricao = (
             f"{mencao(comprador_id)}, {AVISO_MOEDAS_ADM_PIX}\n\n"
-            f"> 🙋 **ADM responsável:** {mencao(adm_id)}\n"
-            f"> 🪙 **Pago em moedas do bot:** `{formatar_moeda(valor_moedas)}` *(não repassado ao ADM)*\n"
-            f"> 💸 **Valor a enviar via PIX ao ADM:** **`{formatar_moeda(valor_pix)}`**"
+            f"• **ADM Responsável:** {mencao(adm_id)}\n"
+            f"• **Debitado em Moedas:** `{formatar_moeda(valor_moedas)}`\n"
+            f"• **PIX ao ADM:** **`{formatar_moeda(valor_pix)}`**\n"
+            f"• **Titular:** `{pix_adm.get('titular') or 'ADM Fire Force'}`\n"
+            f"• **Chave ({(pix_adm.get('tipo') or 'chave').upper()}):** `{chave_exibida}`"
         )
         cor = "Dourado"
     else:
-        titulo = "🏦 Pagamento assumido — PIX direto para o ADM"
+        titulo = "🏦 PIX do ADM • Reserva Assumida"
         descricao = (
-            f"{mencao(adm_id)} assumiu este atendimento!\n"
-            f"{mencao(comprador_id)}, envie o valor **integral** diretamente para o PIX do ADM abaixo:\n\n"
-            f"> 💰 **Valor exato do PIX:** **`{formatar_moeda(valor_pix)}`**"
+            f"{mencao(adm_id)} assumiu este atendimento.\n"
+            f"{mencao(comprador_id)}, envie o valor abaixo para a chave PIX do ADM e mande o comprovante neste canal:\n\n"
+            f"• **Valor Exato:** **`{formatar_moeda(valor_pix)}`**\n"
+            f"• **Titular:** `{pix_adm.get('titular') or 'ADM Fire Force'}`\n"
+            f"• **Chave ({(pix_adm.get('tipo') or 'chave').upper()}):** `{chave_exibida}`"
         )
-        cor = "Esmeralda"
+        cor = "Cinza Escuro"
 
-    embed = criar_embed(titulo, descricao, cor, footer="Fire Force • QR Code PIX Oficial (BRCode)")
-    embed.add_field(
-        name="🏦 Dados PIX do ADM",
-        value=(
-            f"> 👤 **Titular:** `{pix_adm.get('titular') or 'ADM Fire Force'}`\n"
-            f"> 🔑 **Tipo:** `{(pix_adm.get('tipo') or 'chave').upper()}`\n"
-            f"> 📋 **Chave PIX:** `{chave_exibida}`"
-        ),
-        inline=False,
-    )
+    embed = criar_embed(titulo, descricao, cor, footer="Fire Force • QR Code PIX Oficial")
     embed.add_field(
         name="📲 PIX Copia e Cola",
-        value=f"```\n{payload}\n```\n> 💡 *No celular, clique no botão **📋 Copiar PIX Copia e Cola** abaixo para receber só o texto puro!*",
-        inline=False,
-    )
-    embed.add_field(
-        name="✅ Como liberar sua vaga",
-        value=(
-            "> 1️⃣ Escaneie o **QR Code** abaixo no app do seu banco (ou use o **PIX Copia e Cola**).\n"
-            "> 2️⃣ Envie o **comprovante** aqui neste canal.\n"
-            "> 3️⃣ Assim que o ADM conferir o recebimento no PIX dele, ele clicará em **Liberar Vaga / Confirmar**!"
-        ),
+        value=f"```\n{payload}\n```\n-# No celular, toque em **📋 Copiar PIX Copia e Cola** abaixo para receber o código puro",
         inline=False,
     )
 
@@ -2986,13 +3011,67 @@ async def estornar_moedas_reserva_se_necessario(guild, slot_dict: dict, motivo: 
 
 
 class PagamentoAcaoView(discord.ui.View):
-    """Botões da equipe e do jogador. A vaga só é liberada quando o ADM confirma."""
+    """Seletor minimalista de reserva/pagamento de vaga. A vaga só é liberada quando o ADM confirma."""
 
     def __init__(self):
         super().__init__(timeout=None)
+        sel = discord.ui.Select(
+            custom_id="ff_pag_sel_v12",
+            placeholder="💳 Selecione uma ação para esta reserva...",
+            options=[
+                discord.SelectOption(
+                    label="Pagar com Moedas da Carteira",
+                    value="moedas",
+                    emoji="🪙",
+                    description="Debita moedas do saldo (+R$ 1,00 via PIX ao ADM)",
+                ),
+                discord.SelectOption(
+                    label="Assumir e Enviar Meu PIX",
+                    value="assumir",
+                    emoji="🙋",
+                    description="ADM assume e exibe automaticamente seu QR Code PIX",
+                ),
+                discord.SelectOption(
+                    label="Liberar Vaga / Confirmar",
+                    value="confirmar",
+                    emoji="✅",
+                    description="ADM confirma o PIX recebido e libera o acesso",
+                ),
+                discord.SelectOption(
+                    label="Pedir Comprovante",
+                    value="comprovante",
+                    emoji="📄",
+                    description="Solicita ao jogador o print do comprovante PIX",
+                ),
+                discord.SelectOption(
+                    label="Recusar / Cancelar Reserva",
+                    value="recusar",
+                    emoji="❌",
+                    description="Cancela a reserva e devolve moedas se houver",
+                ),
+            ],
+        )
+        sel.callback = self._rotear
+        self.add_item(sel)
 
-    @discord.ui.button(label="Liberar Vaga / Confirmar", style=discord.ButtonStyle.green, emoji="✅", custom_id="ff_pagok")
-    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _rotear(self, interaction: discord.Interaction):
+        acao = interaction.data["values"][0]
+        try:
+            await interaction.message.edit(view=PagamentoAcaoView())
+        except Exception:
+            pass
+        if acao == "moedas":
+            return await self.pagar_com_saldo_botao(interaction, None)
+        if acao == "assumir":
+            return await self.assumir_pagamento(interaction, None)
+        if acao == "confirmar":
+            return await self._aprovar(interaction)
+        if acao == "comprovante":
+            return await self.pedir_comprovante(interaction, None)
+        if acao == "recusar":
+            return await self.recusar(interaction, None)
+
+    async def confirmar(self, interaction: discord.Interaction, button=None):
         await self._aprovar(interaction)
 
     async def _aprovar(self, interaction: discord.Interaction):
@@ -3136,8 +3215,7 @@ class PagamentoAcaoView(discord.ui.View):
         except Exception:
             pass
 
-    @discord.ui.button(label="Assumir", style=discord.ButtonStyle.gray, emoji="🙋", custom_id="ff_pagassumir")
-    async def assumir_pagamento(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def assumir_pagamento(self, interaction: discord.Interaction, button=None):
         """ADM assume o pagamento e exibe sua chave PIX + QR Code direto para o jogador."""
         if not await e_staff(interaction.user) or not await atendente_autorizado("mediador", interaction.user):
             return await interaction.response.send_message(
@@ -3163,7 +3241,7 @@ class PagamentoAcaoView(discord.ui.View):
                 embed=criar_embed(
                     "🏦 Cadastre sua chave PIX primeiro",
                     "O pagamento do diário vai **direto para o seu PIX**.\n"
-                    "Selecione o tipo da sua chave abaixo (ou use `/pix`) e depois clique em **🙋 Assumir** novamente!",
+                    "Selecione o tipo da sua chave abaixo (ou use `/pix`) e depois selecione **🙋 Assumir e Enviar Meu PIX** novamente!",
                     "Amarelo",
                 ),
                 view=PixAdmTipoView(),
@@ -3207,9 +3285,7 @@ class PagamentoAcaoView(discord.ui.View):
             + (f" • moedas já pagas: `{formatar_moeda(slot_dict.get('valor_moedas') or 0)}`" if pago_moedas else "")
             + ").", "Verde")
 
-    @discord.ui.button(label="Pedir comprovante", style=discord.ButtonStyle.gray, emoji="📄",
-                       custom_id="ff_pagcomp")
-    async def pedir_comprovante(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def pedir_comprovante(self, interaction: discord.Interaction, button=None):
         """Solicita o comprovante do PIX enviado ao ADM."""
         if not await e_staff(interaction.user) or not await atendente_autorizado("mediador", interaction.user):
             return await interaction.response.send_message(
@@ -3234,16 +3310,15 @@ class PagamentoAcaoView(discord.ui.View):
             if pago_moedas
             else arredondar(slot_dict["valor_cobrado"])
         )
-        aviso_extra = f"\n> 🪙 *(Inscrição paga com moedas — comprovante referente ao **+{formatar_moeda(valor_esperado)}** do ADM)*" if pago_moedas else ""
+        aviso_extra = f"\n• *(Inscrição paga com moedas — comprovante referente ao **+{formatar_moeda(valor_esperado)}** do ADM)*" if pago_moedas else ""
 
         embed = criar_embed(
-            "📄 COMPROVANTE DO PIX",
-            f"{mencao(slot_dict['comprador_id'])}, falta só uma coisa pra liberar sua vaga:\n\n"
-            f"> 📸 Mande **aqui neste canal** o **print do PIX** enviado ao ADM (com data, valor e destinatário).\n"
-            f"> 💰 Valor esperado no PIX: `{formatar_moeda(valor_esperado)}`{aviso_extra}\n\n"
-            f"🙋 **ADM:** conferiu o recebimento no seu PIX? Clique em **✅ Liberar Vaga / Confirmar**.\n"
-            f"> ❌ Não bateu? Use **Recusar / Cancelar**.",
-            "Azul")
+            "📄 Comprovante PIX Solicitado",
+            f"{mencao(slot_dict['comprador_id'])}, envie **neste canal** o print do comprovante PIX enviado ao ADM.\n\n"
+            f"• **Valor esperado:** `{formatar_moeda(valor_esperado)}`{aviso_extra}\n"
+            f"-# Após conferir na conta PIX, o ADM valida no seletor abaixo",
+            "Cinza Escuro",
+        )
         await interaction.response.send_message(content=mencao(slot_dict["comprador_id"]), embed=embed,
                                                 view=ComprovanteAcaoView(slot_dict["id"]))
         await registrar_log_suporte(
@@ -3251,8 +3326,7 @@ class PagamentoAcaoView(discord.ui.View):
             f"{mencao(interaction.user.id)} pediu o comprovante para {mencao(slot_dict['comprador_id'])} "
             f"(`{formatar_moeda(valor_esperado)}`).", "Azul")
 
-    @discord.ui.button(label="Pagar com moedas", style=discord.ButtonStyle.blurple, emoji="🪙", custom_id="ff_pagarsaldo")
-    async def pagar_com_saldo_botao(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def pagar_com_saldo_botao(self, interaction: discord.Interaction, button=None):
         """O jogador debita o valor da vaga em moedas do bot e fica aguardando +R$ 1,00 via PIX ao ADM."""
         async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory = aiosqlite.Row
@@ -3285,8 +3359,7 @@ class PagamentoAcaoView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label="Recusar / Cancelar", style=discord.ButtonStyle.red, emoji="❌", custom_id="ff_pagno")
-    async def recusar(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def recusar(self, interaction: discord.Interaction, button=None):
         if not await e_staff(interaction.user) or not await atendente_autorizado("mediador", interaction.user):
             return await interaction.response.send_message(
                 embed=criar_embed("❌ Sem Permissão", "Só mediador, gerente ou dono pode reprovar este pagamento.", "Vermelho"), ephemeral=True)
@@ -3735,6 +3808,28 @@ class RepeticaoAcaoPainelView(discord.ui.View):
         self.painel_id = int(painel_id)
         self.rotulo = rotulo
         self.ativo_atual = ativo_atual
+        sel = discord.ui.Select(
+            placeholder="🔄 Selecione o modo de repetição deste painel...",
+            options=[
+                discord.SelectOption(
+                    label="Ativar Repetição Diária",
+                    value="ativar",
+                    emoji="🔄",
+                    description="Reabre automaticamente os mesmos horários todos os dias",
+                ),
+                discord.SelectOption(
+                    label="Desativar Repetição Diária",
+                    value="desativar",
+                    emoji="⏸️",
+                    description="Os horários não se repetirão nos próximos dias",
+                ),
+            ],
+        )
+        sel.callback = self._selecionar
+        self.add_item(sel)
+
+    async def _selecionar(self, interaction: discord.Interaction):
+        await self._aplicar(interaction, interaction.data["values"][0] == "ativar")
 
     async def _aplicar(self, interaction: discord.Interaction, ativar: bool):
         if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
@@ -3778,25 +3873,17 @@ class RepeticaoAcaoPainelView(discord.ui.View):
         await interaction.response.edit_message(
             embed=criar_embed(
                 f"{'✅ Repetição Diária Ativada' if ativar else '⏸️ Repetição Diária Desativada'}",
-                f"Painel **{self.rotulo}** atualizado!\n\n"
+                f"Painel **{self.rotulo}** atualizado.\n\n"
                 + (
-                    "> 🔄 Todos os diários disponíveis neste painel agora se repetem automaticamente **todos os dias** nos mesmos horários.\n"
-                    "> 🔒 Quando faltar o tempo de bloqueio configurado (ou após iniciar), o horário fica visível porém bloqueado, liberando novamente no próximo dia."
+                    "• Todos os horários deste painel serão reabertos automaticamente todos os dias.\n"
+                    "• Ao atingir o tempo de bloqueio, o horário fica bloqueado e reabre no próximo ciclo."
                     if ativar
-                    else "> ⏸️ Os horários deste painel não se repetirão automaticamente nos próximos dias."
+                    else "• Os horários deste painel não se repetirão automaticamente nos próximos dias."
                 ),
-                "Esmeralda" if ativar else "Amarelo",
+                "Esmeralda" if ativar else "Cinza Escuro",
             ),
             view=None,
         )
-
-    @discord.ui.button(label="Ativar Repetição Diária", style=discord.ButtonStyle.green, emoji="🔄")
-    async def btn_ativar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._aplicar(interaction, True)
-
-    @discord.ui.button(label="Desativar Repetição", style=discord.ButtonStyle.red, emoji="⏸️")
-    async def btn_desativar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._aplicar(interaction, False)
 
 
 class RepeticaoPainelSelect(discord.ui.Select):
@@ -4435,13 +4522,26 @@ class EmbedCorSelect(discord.ui.Select):
 class EmbedBuilderView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
-        self.cor = "Fire Force"
+        self.cor = "Cinza Escuro"
         self.add_item(EmbedCorSelect(0))
         if len(CORES_DICCIONARIO) > 25:
             self.add_item(EmbedCorSelect(1))
+        sel = discord.ui.Select(
+            placeholder="📝 Preencher e publicar card...",
+            options=[
+                discord.SelectOption(
+                    label="Abrir Construtor de Card",
+                    value="montar",
+                    emoji="📝",
+                    description="Preenche título, texto, imagem e publica neste canal",
+                )
+            ],
+            row=2,
+        )
+        sel.callback = self._montar
+        self.add_item(sel)
 
-    @discord.ui.button(label="Montar Embed", style=discord.ButtonStyle.green, emoji="📝", row=2)
-    async def montar(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _montar(self, interaction: discord.Interaction):
         await interaction.response.send_modal(EmbedBuilderModal(self.cor))
 
 
@@ -4885,40 +4985,62 @@ async def cmd_diagnostico(interaction: discord.Interaction):
 
 
 class ResetarDiariosView(discord.ui.View):
-    """Confirmação protegida por autor para uma ação administrativa destrutiva."""
+    """Confirmação minimalista protegida por autor para arquivar painéis de diários."""
+
     def __init__(self, autor_id: int):
         super().__init__(timeout=90)
         self.autor_id = int(autor_id)
+        sel = discord.ui.Select(
+            placeholder="🧹 Confirme ou cancele o arquivamento...",
+            options=[
+                discord.SelectOption(
+                    label="Arquivar e Remover Painéis",
+                    value="confirmar",
+                    emoji="🧹",
+                    description="Arquiva os horários atuais e limpa os painéis publicados",
+                ),
+                discord.SelectOption(
+                    label="Cancelar Operação",
+                    value="cancelar",
+                    emoji="↩️",
+                    description="Mantém todos os painéis e horários como estão",
+                ),
+            ],
+        )
+        sel.callback = self._decidir
+        self.add_item(sel)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.autor_id:
             await interaction.response.send_message(
                 embed=criar_embed("🔒 Confirmação privada", "Só quem iniciou o reset pode confirmar ou cancelar.", "Vermelho"),
-                ephemeral=True)
+                ephemeral=True,
+            )
             return False
         return True
 
-    @discord.ui.button(label="Arquivar e remover painéis", style=discord.ButtonStyle.danger, emoji="🧹")
-    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _decidir(self, interaction: discord.Interaction):
+        if interaction.data["values"][0] == "cancelar":
+            return await interaction.response.edit_message(
+                embed=criar_embed("↩️ Reset Cancelado", "Nenhum painel ou diário foi alterado.", "Cinza Escuro"),
+                view=None,
+            )
         if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
             return await interaction.response.send_message(
-                embed=criar_embed("🔒 Ação não autorizada", "É necessário continuar com acesso de Dono/Gerente.", "Vermelho"),
-                ephemeral=True)
+                embed=criar_embed("🔒 Ação não autorizada", "É necessário acesso de Dono/Gerente.", "Vermelho"),
+                ephemeral=True,
+            )
         await interaction.response.defer()
-        ok, mensagem, contagem = await executar_reset_diarios(interaction.guild)
+        ok, mensagem, _ = await executar_reset_diarios(interaction.guild)
         if ok:
-            await registrar_log(interaction.guild, "🧹 RESET", "🧹 Painéis arquivados",
-                                f"Por {interaction.user.mention}. {mensagem}", "Amarelo")
+            await registrar_log(
+                interaction.guild, "🧹 RESET", "🧹 Painéis arquivados",
+                f"Por {interaction.user.mention}. {mensagem}", "Amarelo"
+            )
         await interaction.edit_original_response(
-            embed=criar_embed("✅ Reset concluído" if ok else "⏸️ Reset bloqueado", mensagem,
-                              "Esmeralda" if ok else "Amarelo"),
-            view=None if ok else self)
-
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, emoji="↩️")
-    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=criar_embed("↩️ Reset cancelado", "Nenhum painel ou diário foi alterado.", "Cinza"),
-            view=None)
+            embed=criar_embed("✅ Reset Concluído" if ok else "⏸️ Reset Bloqueado", mensagem, "Esmeralda" if ok else "Amarelo"),
+            view=None if ok else ResetarDiariosView(self.autor_id),
+        )
 
 
 async def executar_reset_diarios(guild: discord.Guild) -> tuple[bool, str, int]:
@@ -5541,26 +5663,40 @@ def _embed_jogador_ff(dados: dict, local: Optional[dict] = None) -> discord.Embe
 
 
 class VerificarAtualizarView(discord.ui.View):
-    """Botão para forçar uma nova consulta (ignora o cache)."""
+    """Seletor minimalista para forçar nova consulta da conta no Free Fire (ignora cache)."""
 
     def __init__(self, uid: str):
         super().__init__(timeout=180)
         self.uid = uid
+        sel = discord.ui.Select(
+            placeholder="🔄 Opções da consulta...",
+            options=[
+                discord.SelectOption(
+                    label="Atualizar Dados Agora",
+                    value="atualizar",
+                    emoji="🔄",
+                    description="Ignora o cache e consulta novamente no Free Fire",
+                )
+            ],
+        )
+        sel.callback = self._atualizar
+        self.add_item(sel)
 
-    @discord.ui.button(label="Consultar de novo", emoji="🔄", style=discord.ButtonStyle.secondary)
-    async def atualizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _atualizar(self, interaction: discord.Interaction):
         await interaction.response.defer()
         dados = await verificar_ff(self.uid, forcar=True)
         if not dados.get("ok"):
             await interaction.followup.send(
                 embed=criar_embed("⚠️ Consulta falhou", dados.get("mensagem", "Tente novamente."), "Amarelo"),
-                ephemeral=True
+                ephemeral=True,
             )
             return
         dados["uid"] = self.uid
         local = await consultar_jogador_local(dados["nome"])
-        await interaction.edit_original_response(embed=_embed_jogador_ff(dados, local), view=self)
-        button.disabled = False
+        await interaction.edit_original_response(
+            embed=_embed_jogador_ff(dados, local),
+            view=VerificarAtualizarView(self.uid),
+        )
 
 
 @bot.tree.command(name="verificar", description="🔍 Consultar um ID do Free Fire (nick, level, rank, clã, região)")
@@ -5759,7 +5895,8 @@ async def cmd_perfil(interaction: discord.Interaction,
 
 
 class ConfirmarAnuncioView(discord.ui.View):
-    """Prévia e confirmação antes de publicar conteúdo em um canal público."""
+    """Prévia e confirmação minimalista antes de publicar anúncio oficial."""
+
     def __init__(self, autor_id: int, guild: discord.Guild,
                  canal: discord.TextChannel, anuncio: discord.Embed,
                  cargo: Optional[discord.Role]):
@@ -5770,67 +5907,99 @@ class ConfirmarAnuncioView(discord.ui.View):
         self.canal = canal
         self.anuncio = anuncio
         self.cargo = cargo
+        sel = discord.ui.Select(
+            placeholder="📢 Confirme ou cancele a publicação...",
+            options=[
+                discord.SelectOption(
+                    label="Publicar Anúncio Agora",
+                    value="publicar",
+                    emoji="📢",
+                    description=f"Envia o anúncio em #{canal.name}"[:100],
+                ),
+                discord.SelectOption(
+                    label="Cancelar Publicação",
+                    value="cancelar",
+                    emoji="↩️",
+                    description="Descarta esta prévia sem enviar nada",
+                ),
+            ],
+        )
+        sel.callback = self._decidir
+        self.add_item(sel)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.autor_id:
             await interaction.response.send_message(
                 embed=criar_embed("🔒 Prévia privada", "Só quem preparou o anúncio pode publicar ou cancelar.", "Vermelho"),
-                ephemeral=True)
+                ephemeral=True,
+            )
             return False
         return True
 
-    @discord.ui.button(label="Publicar anúncio", style=discord.ButtonStyle.success, emoji="📢")
-    async def publicar(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _decidir(self, interaction: discord.Interaction):
+        if interaction.data["values"][0] == "cancelar":
+            return await interaction.response.edit_message(
+                content=None,
+                embeds=[criar_embed("↩️ Publicação Cancelada", "O anúncio não foi publicado.", "Cinza Escuro")],
+                view=None,
+            )
+
         if not interaction.guild or interaction.guild.id != self.guild_id:
             return await interaction.response.send_message(
                 embed=criar_embed("❌ Servidor inválido", "Esta prévia pertence a outro servidor.", "Vermelho"),
-                ephemeral=True)
+                ephemeral=True,
+            )
         if not await e_dono_ou_gerente(interaction.user):
             return await interaction.response.send_message(
                 embed=criar_embed("🔒 Ação não autorizada", "Seu acesso de Dono/Gerente foi removido; não publiquei o anúncio.", "Vermelho"),
-                ephemeral=True)
+                ephemeral=True,
+            )
         await interaction.response.defer()
         bot_member = interaction.guild.me
         perms = self.canal.permissions_for(bot_member) if bot_member else None
         if not perms or not (perms.send_messages and perms.embed_links):
             return await interaction.edit_original_response(
-                embed=criar_embed("🛠️ Permissão ausente",
-                                  f"Preciso de **Enviar mensagens** e **Inserir links/embeds** em {self.canal.mention}.",
-                                  "Vermelho"), view=self)
+                embed=criar_embed(
+                    "🛠️ Permissão ausente",
+                    f"Preciso de **Enviar mensagens** e **Inserir links/embeds** em {self.canal.mention}.",
+                    "Vermelho",
+                ),
+                view=ConfirmarAnuncioView(self.autor_id, self.guild, self.canal, self.anuncio, self.cargo),
+            )
         if self.cargo and not self.cargo.mentionable and not perms.mention_everyone:
             return await interaction.edit_original_response(
-                embed=criar_embed("📣 Menção bloqueada",
-                                  "O cargo não é mencionável e o bot não tem permissão para mencionar cargos. "
-                                  "Torne-o mencionável ou remova o alvo da notificação.", "Amarelo"), view=self)
+                embed=criar_embed(
+                    "📣 Menção bloqueada",
+                    "O cargo não é mencionável e o bot não tem permissão para mencionar cargos.",
+                    "Amarelo",
+                ),
+                view=ConfirmarAnuncioView(self.autor_id, self.guild, self.canal, self.anuncio, self.cargo),
+            )
         try:
             await self.canal.send(
                 content=self.cargo.mention if self.cargo else None,
                 embed=self.anuncio,
                 allowed_mentions=discord.AllowedMentions(
                     roles=[self.cargo] if self.cargo else [],
-                    users=False, everyone=False, replied_user=False)
+                    users=False, everyone=False, replied_user=False,
+                ),
             )
         except (discord.Forbidden, discord.HTTPException) as erro:
             _log_arquivo(f"[ANÚNCIO] publicação guild={self.guild_id} canal={self.canal.id}: {erro}")
             return await interaction.edit_original_response(
-                embed=criar_embed("⚠️ Não consegui publicar",
-                                  "A publicação falhou. Confira as permissões do canal e tente novamente.", "Amarelo"),
-                view=self)
+                embed=criar_embed("⚠️ Não consegui publicar", "Confira as permissões do canal e tente novamente.", "Amarelo"),
+                view=ConfirmarAnuncioView(self.autor_id, self.guild, self.canal, self.anuncio, self.cargo),
+            )
         await registrar_log(
             interaction.guild, "📢 ANÚNCIO", "📢 Anúncio publicado",
             f"Por {interaction.user.mention} em {self.canal.mention}."
             + (f" Notificação: {self.cargo.mention}." if self.cargo else " Sem menção de cargo."),
-            "Azul")
+            "Azul",
+        )
         await interaction.edit_original_response(
-            embed=criar_embed("✅ Anúncio publicado", f"O anúncio foi publicado em {self.canal.mention}.", "Esmeralda"),
-            view=None)
-
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, emoji="↩️")
-    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            content=None,
-            embeds=[criar_embed("↩️ Publicação cancelada", "O anúncio não foi publicado.", "Cinza")],
-            view=None)
+            embed=criar_embed("✅ Anúncio Publicado", f"Publicado com sucesso em {self.canal.mention}.", "Esmeralda"),
+            view=None,
+        )
 
 
 @bot.tree.command(name="anunciar", description="📢 Preparar e revisar um anúncio oficial antes de publicar")
@@ -6997,41 +7166,47 @@ class SaqueModal(discord.ui.Modal, title="💸 Sacar — PIX"):
 
 
 def embed_ticket_saque(saque) -> discord.Embed:
-    """Resumo privado do saque: contém a chave integral, visível só no ticket restrito."""
-    tipo=(saque["tipo"] or "jogador")
-    fonte="Carteira de trabalho da equipe" if tipo=="trabalho" else "Carteira do jogador"
-    estado=saque["status"]
-    fila={"na_fila":"⏳ Aguardando liberação do caixa", "liberado":"💳 Caixa liberado; aguardando envio do PIX",
-          "pago":"✅ Pagamento feito", "estornado":"↩️ Saque estornado"}.get(estado,"⏳ Aguardando pagamento")
-    status_ticket="✅ Pagamento feito" if estado=="pago" else ("↩️ Estornado" if estado=="estornado" else "⏳ Aguardando pagamento")
-    embed=criar_embed(f"💸 Ticket de saque — protocolo #{saque['id']}",
-        f"**Solicitante:** {mencao(saque['user_id'])}\n"
-        f"**Valor:** `{formatar_moeda(saque['valor'])}`\n"
-        f"**Origem:** {fonte}\n"
-        f"**Chave PIX ({saque['tipo_chave'] or 'tipo não informado'}):** `{saque['chave_pix']}`\n"
-        f"**Titular:** `{saque['titular'] or 'não informado'}`\n\n"
-        f"> **Status do pedido:** {status_ticket}\n"
-        f"> **Caixa:** {fila}\n"
-        f"> **Prazo informado:** de 1 minuto a 24 horas ou mais; paga manualmente o dono/gerente.",
-        "Esmeralda" if estado=="pago" else "Dourado",
-        footer="Fire Force • Canal privado: solicitante + dono/gerente")
-    if saque["ticket_assumido_por"]:
-        embed.add_field(name="🙋 Responsável",value=mencao(saque["ticket_assumido_por"]),inline=True)
-    return embed
+    """Resumo minimalista do saque privado (visível apenas no ticket restrito)."""
+    tipo = saque["tipo"] or "jogador"
+    fonte = "💼 Carteira de Trabalho (Suporte)" if tipo == "trabalho" else "🪙 Carteira Pessoal"
+    estado = saque["status"]
+    fila = {
+        "na_fila": "⏳ Na fila do caixa",
+        "liberado": "💳 Caixa liberado • Aguardando envio do PIX",
+        "pago": "✅ PIX enviado",
+        "estornado": "↩️ Estornado para a carteira",
+    }.get(estado, "⏳ Aguardando pagamento")
+    cor = "Esmeralda" if estado == "pago" else ("Amarelo" if estado == "estornado" else "Cinza Escuro")
+    resp = mencao(saque["ticket_assumido_por"]) if saque["ticket_assumido_por"] else "`Aguardando responsável`"
+
+    descricao = (
+        f"• **Solicitante:** {mencao(saque['user_id'])}\n"
+        f"• **Valor:** **`{formatar_moeda(saque['valor'])}`**\n"
+        f"• **Origem:** {fonte}\n"
+        f"• **Chave PIX ({(saque['tipo_chave'] or 'chave').upper()}):** `{saque['chave_pix']}`\n"
+        f"• **Titular:** `{saque['titular'] or 'não informado'}`\n"
+        f"• **Status:** {fila}\n"
+        f"• **Responsável:** {resp}\n"
+        f"-# Protocolo #{saque['id']} • Canal privado entre solicitante e Dono/Gerente"
+    )
+    return criar_embed(f"💸 Solicitação de Saque #{saque['id']}", descricao, cor)
 
 
 async def atualizar_ticket_saque(guild, saque_id: int):
     """Atualiza o cartão privado do saque em qualquer mudança (fila, espera ou pagamento)."""
-    if not guild:return False
+    if not guild:
+        return False
     async with aiosqlite.connect(DATABASE_FILE) as db:
-        db.row_factory=aiosqlite.Row
-        row=await (await db.execute("SELECT * FROM saques WHERE id=?",(saque_id,))).fetchone()
-    if not row or not row["canal_ticket_id"] or not row["msg_ticket_id"]:return False
-    canal=guild.get_channel(int(row["canal_ticket_id"]))
-    if not canal:return False
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute("SELECT * FROM saques WHERE id=?", (saque_id,))).fetchone()
+    if not row or not row["canal_ticket_id"] or not row["msg_ticket_id"]:
+        return False
+    canal = guild.get_channel(int(row["canal_ticket_id"]))
+    if not canal:
+        return False
     try:
-        msg=await canal.fetch_message(int(row["msg_ticket_id"]))
-        await msg.edit(embed=embed_ticket_saque(row),view=SaqueTicketView(saque_id))
+        msg = await canal.fetch_message(int(row["msg_ticket_id"]))
+        await msg.edit(embed=embed_ticket_saque(row), view=SaqueTicketView(saque_id))
         return True
     except Exception as erro:
         _log_arquivo(f"[SAQUE] ticket #{saque_id} não atualizou: {erro}")
@@ -7041,219 +7216,335 @@ async def atualizar_ticket_saque(guild, saque_id: int):
 async def abrir_ticket_saque(guild, solicitante, saque_id: int):
     """Cria o atendimento privado do saque; sem acesso de suporte/mediador."""
     async with aiosqlite.connect(DATABASE_FILE) as db:
-        db.row_factory=aiosqlite.Row
-        row=await (await db.execute("SELECT * FROM saques WHERE id=?",(saque_id,))).fetchone()
-    if not row:raise RuntimeError("protocolo de saque não encontrado")
-    cfg=await obter_config(guild.id)
-    categoria=guild.get_channel(cfg.get("cat_pagamentos")) if cfg.get("cat_pagamentos") else None
-    if not categoria and cfg.get("cat_tickets"):categoria=guild.get_channel(cfg.get("cat_tickets"))
-    overwrites={
-        guild.default_role:discord.PermissionOverwrite(view_channel=False),
-        solicitante:discord.PermissionOverwrite(view_channel=True,send_messages=True,attach_files=True,read_message_history=True),
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute("SELECT * FROM saques WHERE id=?", (saque_id,))).fetchone()
+    if not row:
+        raise RuntimeError("protocolo de saque não encontrado")
+    cfg = await obter_config(guild.id)
+    categoria = guild.get_channel(cfg.get("cat_pagamentos")) if cfg.get("cat_pagamentos") else None
+    if not categoria and cfg.get("cat_tickets"):
+        categoria = guild.get_channel(cfg.get("cat_tickets"))
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        solicitante: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
     }
-    bot_member=getattr(guild,"me",None)
+    bot_member = getattr(guild, "me", None)
     if bot_member:
-        overwrites[bot_member]=discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True,read_message_history=True)
-    cargos_permitidos=set()
-    for key in ("cargo_dono","cargo_gerente"):
-        role_id=cfg.get(key)
-        role=guild.get_role(int(role_id)) if role_id else None
+        overwrites[bot_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
+    cargos_permitidos = set()
+    for key in ("cargo_dono", "cargo_gerente"):
+        role_id = cfg.get(key)
+        role = guild.get_role(int(role_id)) if role_id else None
         if role:
             cargos_permitidos.add(role.id)
-            overwrites[role]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)
-    for key in ("cargo_suporte","cargo_mediador"):
-        role_id=cfg.get(key)
-        role=guild.get_role(int(role_id)) if role_id and int(role_id) not in cargos_permitidos else None
-        if role:overwrites[role]=discord.PermissionOverwrite(view_channel=False,send_messages=False)
-    nome=getattr(solicitante,"display_name",None) or getattr(solicitante,"name","jogador")
-    slug=re.sub(r"[^a-z0-9-]","-",str(nome).lower()).strip("-")[:35] or "jogador"
-    canal=await guild.create_text_channel(f"💸│saque-{int(saque_id)}-{slug}"[:100],category=categoria,overwrites=overwrites)
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    for key in ("cargo_suporte", "cargo_mediador"):
+        role_id = cfg.get(key)
+        role = guild.get_role(int(role_id)) if role_id and int(role_id) not in cargos_permitidos else None
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=False, send_messages=False)
+    nome = getattr(solicitante, "display_name", None) or getattr(solicitante, "name", "jogador")
+    slug = re.sub(r"[^a-z0-9-]", "-", str(nome).lower()).strip("-")[:35] or "jogador"
+    canal = await guild.create_text_channel(f"💸│saque-{int(saque_id)}-{slug}"[:100], category=categoria, overwrites=overwrites)
     try:
         async with aiosqlite.connect(DATABASE_FILE) as db:
-            await db.execute("UPDATE saques SET canal_ticket_id=?,ticket_status='aguardando_pagamento' WHERE id=?",(canal.id,saque_id))
+            await db.execute("UPDATE saques SET canal_ticket_id=?,ticket_status='aguardando_pagamento' WHERE id=?", (canal.id, saque_id))
             await db.commit()
         async with aiosqlite.connect(DATABASE_FILE) as db:
-            db.row_factory=aiosqlite.Row
-            row=await (await db.execute("SELECT * FROM saques WHERE id=?",(saque_id,))).fetchone()
-        msg=await canal.send(content=mencao(row["user_id"]),embed=embed_ticket_saque(row),view=SaqueTicketView(saque_id))
+            db.row_factory = aiosqlite.Row
+            row = await (await db.execute("SELECT * FROM saques WHERE id=?", (saque_id,))).fetchone()
+        msg = await canal.send(content=mencao(row["user_id"]), embed=embed_ticket_saque(row), view=SaqueTicketView(saque_id))
         async with aiosqlite.connect(DATABASE_FILE) as db:
-            await db.execute("UPDATE saques SET msg_ticket_id=? WHERE id=?",(msg.id,saque_id))
+            await db.execute("UPDATE saques SET msg_ticket_id=? WHERE id=?", (msg.id, saque_id))
             await db.commit()
         marcar_sujo()
         return canal
     except Exception:
-        try:await canal.delete()
-        except Exception:pass
+        try:
+            await canal.delete()
+        except Exception:
+            pass
         async with aiosqlite.connect(DATABASE_FILE) as db:
-            await db.execute("UPDATE saques SET canal_ticket_id=NULL,msg_ticket_id=NULL WHERE id=?",(saque_id,))
+            await db.execute("UPDATE saques SET canal_ticket_id=NULL,msg_ticket_id=NULL WHERE id=?", (saque_id,))
             await db.commit()
         raise
 
 
 class SaqueTicketView(discord.ui.View):
-    """Atendimento privado do saque: solicitante + dono/gerente."""
-    def __init__(self,saque_id:int=0):
-        super().__init__(timeout=None);self.saque_id=int(saque_id) if isinstance(saque_id,int) else 0
-        sid=self.saque_id
-        self.assumir.custom_id=f"ff_sqt_assumir:{sid}"
-        self.aguardar.custom_id=f"ff_sqt_aguardar:{sid}"
-        self.pago.custom_id=f"ff_sqt_pago:{sid}"
-        self.adicionar.custom_id=f"ff_sqt_adicionar:{sid}"
-        self.fechar.custom_id=f"ff_sqt_fechar:{sid}"
+    """Painel minimalista de atendimento privado do saque (Select único moderno)."""
+
+    def __init__(self, saque_id: int = 0):
+        super().__init__(timeout=None)
+        self.saque_id = int(saque_id) if isinstance(saque_id, int) else 0
+        sel = discord.ui.Select(
+            custom_id=f"ff_sqt_sel:{self.saque_id}",
+            placeholder="💸 Gerenciar solicitação de saque...",
+            options=[
+                discord.SelectOption(
+                    label="Assumir Atendimento",
+                    value="assumir",
+                    emoji="🙋",
+                    description="Dono/Gerente assume o acompanhamento deste saque",
+                ),
+                discord.SelectOption(
+                    label="Confirmar Pagamento Feito",
+                    value="pago",
+                    emoji="✅",
+                    description="Registra o PIX como enviado e avisa o solicitante",
+                ),
+                discord.SelectOption(
+                    label="Marcar Aguardando Pagamento",
+                    value="aguardar",
+                    emoji="⏳",
+                    description="Mantém o status como aguardando envio do PIX",
+                ),
+                discord.SelectOption(
+                    label="Adicionar Pessoa ao Canal",
+                    value="adicionar",
+                    emoji="➕",
+                    description="Concede acesso a outro membro neste canal",
+                ),
+                discord.SelectOption(
+                    label="Encerrar Canal de Saque",
+                    value="fechar",
+                    emoji="🔒",
+                    description="Fecha e remove este canal privado",
+                ),
+            ],
+        )
+        sel.callback = self._rotear
+        self.add_item(sel)
 
     async def _buscar(self):
         async with aiosqlite.connect(DATABASE_FILE) as db:
-            db.row_factory=aiosqlite.Row
-            return await (await db.execute("SELECT * FROM saques WHERE id=?",(self.saque_id,))).fetchone()
+            db.row_factory = aiosqlite.Row
+            return await (await db.execute("SELECT * FROM saques WHERE id=?", (self.saque_id,))).fetchone()
 
-    async def _equipe(self,interaction):
-        if await e_dono_ou_gerente(interaction.user):return True
-        await interaction.response.send_message(embed=criar_embed("❌ Sem permissão","Este ticket é exclusivo do solicitante e do dono/gerente.","Vermelho"),ephemeral=True)
+    async def _equipe(self, interaction):
+        if await e_dono_ou_gerente(interaction.user):
+            return True
+        await interaction.response.send_message(
+            embed=criar_embed("🔒 Exclusivo Dono/Gerente", "Esta ação é exclusiva do **Dono** ou **Gerente**.", "Vermelho"),
+            ephemeral=True,
+        )
         return False
 
-    @discord.ui.button(label="Assumir",style=discord.ButtonStyle.blurple,emoji="🙋")
-    async def assumir(self,interaction:discord.Interaction,button:discord.ui.Button):
-        if not await self._equipe(interaction):return
-        if not await aviso_fora_de_servico(interaction):return
-        row=await self._buscar()
-        if not row or row["status"] in ("pago","estornado"):
-            return await interaction.response.send_message(embed=criar_embed("ℹ️ Saque resolvido","Este pedido já foi pago/estornado.","Amarelo"),ephemeral=True)
-        if row["ticket_assumido_por"] and row["ticket_assumido_por"]!=interaction.user.id:
-            return await interaction.response.send_message(embed=criar_embed("🙋 Já assumido",f"{mencao(row['ticket_assumido_por'])} está responsável.","Amarelo"),ephemeral=True)
-        async with aiosqlite.connect(DATABASE_FILE) as db:
-            await db.execute("UPDATE saques SET ticket_assumido_por=? WHERE id=?",(interaction.user.id,self.saque_id));await db.commit()
-        marcar_sujo()
-        await atualizar_ticket_saque(interaction.guild,self.saque_id)
-        await interaction.response.send_message(embed=criar_embed("🙋 Ticket assumido","Você ficou responsável por acompanhar este saque.","Esmeralda"),ephemeral=True)
-
-    @discord.ui.button(label="Aguardar pagamento",style=discord.ButtonStyle.gray,emoji="⏳")
-    async def aguardar(self,interaction:discord.Interaction,button:discord.ui.Button):
-        if not await self._equipe(interaction):return
-        row=await self._buscar()
-        if not row or row["status"] in ("pago","estornado"):
-            return await interaction.response.send_message(embed=criar_embed("ℹ️ Saque resolvido","Este pedido já foi pago/estornado.","Amarelo"),ephemeral=True)
-        async with aiosqlite.connect(DATABASE_FILE) as db:
-            await db.execute("UPDATE saques SET ticket_status='aguardando_pagamento' WHERE id=?",(self.saque_id,));await db.commit()
-        marcar_sujo()
-        await atualizar_ticket_saque(interaction.guild,self.saque_id)
-        await interaction.response.send_message(embed=criar_embed("⏳ Status atualizado","O ticket está marcado como **Aguardando pagamento**.","Azul"),ephemeral=True)
-
-    @discord.ui.button(label="Pagamento feito",style=discord.ButtonStyle.green,emoji="✅")
-    async def pago(self,interaction:discord.Interaction,button:discord.ui.Button):
-        if not await self._equipe(interaction):return
-        row=await self._buscar()
-        if not row or row["status"] in ("pago","estornado"):
-            return await interaction.response.send_message(embed=criar_embed("ℹ️ Saque resolvido","Este pedido já foi pago/estornado.","Amarelo"),ephemeral=True)
-        await interaction.response.defer(ephemeral=True,thinking=True)
-        ok=await concluir_saque(self.saque_id,interaction.user.id,"pagamento marcado como feito no ticket privado")
-        await interaction.followup.send(embed=criar_embed("✅ Pagamento registrado" if ok else "ℹ️ Já resolvido",
-            "O saque foi marcado como pago; o solicitante recebeu a confirmação." if ok else "Outro responsável já resolveu este saque.",
-            "Esmeralda" if ok else "Amarelo"),ephemeral=True)
-
-    @discord.ui.button(label="Adicionar pessoa",style=discord.ButtonStyle.gray,emoji="➕")
-    async def adicionar(self,interaction:discord.Interaction,button:discord.ui.Button):
-        if not await self._equipe(interaction):return
-        row=await self._buscar()
-        if not row or row["status"] in ("pago","estornado"):
-            return await interaction.response.send_message(embed=criar_embed("ℹ️ Ticket encerrado","Não é possível alterar este ticket resolvido.","Amarelo"),ephemeral=True)
-        await interaction.response.send_message("Selecione quem adicionar a este ticket:",view=TicketAddView(),ephemeral=True)
-
-    @discord.ui.button(label="Fechar ticket",style=discord.ButtonStyle.red,emoji="🔒")
-    async def fechar(self,interaction:discord.Interaction,button:discord.ui.Button):
-        row=await self._buscar()
-        if not row:return await interaction.response.send_message(embed=criar_embed("❌ Ticket não encontrado","","Vermelho"),ephemeral=True)
-        if interaction.user.id!=row["user_id"]:
-            return await interaction.response.send_message(embed=criar_embed("🔒 Só quem pediu o saque fecha","O dono/gerente marca o pagamento; o solicitante fecha o ticket quando estiver resolvido.","Amarelo"),ephemeral=True)
-        if row["status"] not in ("pago","estornado"):
-            return await interaction.response.send_message(embed=criar_embed("⏳ Ainda aguardando pagamento","Feche depois que o PIX for enviado ou o saque for estornado.","Amarelo"),ephemeral=True)
-        await interaction.response.send_message(embed=criar_embed("🔒 Ticket encerrado","Este canal será removido em 10 segundos.","Cinza Escuro"))
-        await asyncio.sleep(10)
-        apagado=False
+    async def _rotear(self, interaction: discord.Interaction):
+        acao = interaction.data["values"][0]
         try:
-            await interaction.channel.delete();apagado=True
+            await interaction.message.edit(view=SaqueTicketView(self.saque_id))
         except Exception:
             pass
-        if apagado:
+
+        if acao == "assumir":
+            if not await self._equipe(interaction):
+                return
+            if not await aviso_fora_de_servico(interaction):
+                return
+            row = await self._buscar()
+            if not row or row["status"] in ("pago", "estornado"):
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Saque resolvido", "Este pedido já foi pago ou estornado.", "Cinza Escuro"), ephemeral=True
+                )
+            if row["ticket_assumido_por"] and row["ticket_assumido_por"] != interaction.user.id:
+                return await interaction.response.send_message(
+                    embed=criar_embed("🙋 Já assumido", f"{mencao(row['ticket_assumido_por'])} está responsável.", "Amarelo"),
+                    ephemeral=True,
+                )
             async with aiosqlite.connect(DATABASE_FILE) as db:
-                await db.execute("UPDATE saques SET canal_ticket_id=NULL,msg_ticket_id=NULL WHERE id=?",(self.saque_id,));await db.commit()
+                await db.execute("UPDATE saques SET ticket_assumido_por=? WHERE id=?", (interaction.user.id, self.saque_id))
+                await db.commit()
             marcar_sujo()
+            await atualizar_ticket_saque(interaction.guild, self.saque_id)
+            return await interaction.response.send_message(
+                embed=criar_embed("🙋 Saque Assumido", "Você ficou responsável por acompanhar este saque.", "Esmeralda"),
+                ephemeral=True,
+            )
+
+        if acao == "aguardar":
+            if not await self._equipe(interaction):
+                return
+            row = await self._buscar()
+            if not row or row["status"] in ("pago", "estornado"):
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Saque resolvido", "Este pedido já foi pago ou estornado.", "Cinza Escuro"), ephemeral=True
+                )
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                await db.execute("UPDATE saques SET ticket_status='aguardando_pagamento' WHERE id=?", (self.saque_id,))
+                await db.commit()
+            marcar_sujo()
+            await atualizar_ticket_saque(interaction.guild, self.saque_id)
+            return await interaction.response.send_message(
+                embed=criar_embed("⏳ Status Atualizado", "O saque permanece marcado como **Aguardando pagamento**.", "Cinza Escuro"),
+                ephemeral=True,
+            )
+
+        if acao == "pago":
+            if not await self._equipe(interaction):
+                return
+            row = await self._buscar()
+            if not row or row["status"] in ("pago", "estornado"):
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Saque resolvido", "Este pedido já foi pago ou estornado.", "Cinza Escuro"), ephemeral=True
+                )
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            ok = await concluir_saque(self.saque_id, interaction.user.id, "pagamento marcado como feito no ticket privado")
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "✅ Pagamento Registrado" if ok else "ℹ️ Já Resolvido",
+                    "O saque foi marcado como pago e o solicitante recebeu a confirmação." if ok else "Outro responsável já resolveu este saque.",
+                    "Esmeralda" if ok else "Cinza Escuro",
+                ),
+                ephemeral=True,
+            )
+
+        if acao == "adicionar":
+            if not await self._equipe(interaction):
+                return
+            row = await self._buscar()
+            if not row or row["status"] in ("pago", "estornado"):
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Saque resolvido", "Não é necessário adicionar membros a um saque já finalizado.", "Cinza Escuro"),
+                    ephemeral=True,
+                )
+            return await interaction.response.send_message(
+                embed=criar_embed("➕ Adicionar Pessoa", "Selecione abaixo quem deve receber acesso a este canal:", "Cinza Escuro"),
+                view=TicketAddView(),
+                ephemeral=True,
+            )
+
+        if acao == "fechar":
+            row = await self._buscar()
+            eh_vip = await e_dono_ou_gerente(interaction.user)
+            if not row:
+                if eh_vip:
+                    await interaction.response.send_message("🔒 Encerrando canal...", ephemeral=True)
+                    await _apagar_canal_seguro(interaction.channel, "Canal órfão de saque encerrado")
+                    return
+                return await interaction.response.send_message(
+                    embed=criar_embed("❌ Saque não encontrado", "", "Vermelho"), ephemeral=True
+                )
+            if interaction.user.id != row["user_id"] and not eh_vip:
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Sem Permissão", "Apenas o solicitante ou Dono/Gerente podem encerrar este canal.", "Amarelo"),
+                    ephemeral=True,
+                )
+            if row["status"] not in ("pago", "estornado") and not eh_vip:
+                return await interaction.response.send_message(
+                    embed=criar_embed("⏳ Saque em andamento", "Aguarde o PIX ser enviado ou estornado antes de fechar o canal.", "Amarelo"),
+                    ephemeral=True,
+                )
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Canal Encerrado", "Este canal será removido em 3 segundos...", "Cinza Escuro")
+            )
+            await asyncio.sleep(3)
+            apagado = await _apagar_canal_seguro(interaction.channel, f"Ticket de saque #{self.saque_id} encerrado")
+            if apagado:
+                async with aiosqlite.connect(DATABASE_FILE) as db:
+                    await db.execute("UPDATE saques SET canal_ticket_id=NULL,msg_ticket_id=NULL WHERE id=?", (self.saque_id,))
+                    await db.commit()
+                marcar_sujo()
 
 
 class SaqueAcaoView(discord.ui.View):
-    """Botões do staff no aviso de saque (persistente após restart)."""
+    """Seletor minimalista no aviso privado de saque (persistente após restart)."""
 
     def __init__(self, saque_id: int):
         super().__init__(timeout=None)
-        self.saque_id = saque_id
-        self.marcar.custom_id = f"ff_saque_pago:{saque_id}"
-        self.estornar.custom_id = f"ff_saque_estorno:{saque_id}"
-        self.marcar_auto.custom_id = f"ff_saque_auto:{saque_id}"
+        self.saque_id = int(saque_id)
+        sel = discord.ui.Select(
+            custom_id=f"ff_sqa_sel:{self.saque_id}",
+            placeholder="💸 Ação financeira do saque...",
+            options=[
+                discord.SelectOption(
+                    label="Confirmar PIX Enviado",
+                    value="pago",
+                    emoji="✅",
+                    description="Marca o saque como pago e atualiza o caixa",
+                ),
+                discord.SelectOption(
+                    label="Estornar (Devolver Saldo)",
+                    value="estorno",
+                    emoji="↩️",
+                    description="Devolve o valor integral para a carteira",
+                ),
+                discord.SelectOption(
+                    label="Reenviar Dados",
+                    value="reenviar",
+                    emoji="🔁",
+                    description="Reenvia os dados deste saque no canal financeiro",
+                ),
+            ],
+        )
+        sel.callback = self._rotear
+        self.add_item(sel)
 
     async def _buscar(self):
         async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory = aiosqlite.Row
             return await (await db.execute("SELECT * FROM saques WHERE id = ?", (self.saque_id,))).fetchone()
 
-    @discord.ui.button(label="PIX enviado ✅", style=discord.ButtonStyle.green)
-    async def marcar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await e_dono_ou_gerente(interaction.user):
-            return await interaction.response.send_message(
-                embed=criar_embed("❌ Sem Permissão", "Apenas a equipe financeira.", "Vermelho"), ephemeral=True
-            )
-        saque = await self._buscar()
-        if not saque or saque["status"] == "pago":
-            return await interaction.response.send_message(
-                embed=criar_embed("ℹ️ Já resolvido", "Este saque já foi pago ou cancelado.", "Amarelo"), ephemeral=True
-            )
-        await concluir_saque(saque["id"], interaction.user.id, "pagamento marcado pela equipe")
-        await interaction.response.send_message(
-            embed=criar_embed("✅ Saque pago", f"Protocolo `#{saque['id']}` marcado como pago.", "Esmeralda"), ephemeral=True
-        )
-
-    @discord.ui.button(label="Estornar (devolver saldo)", style=discord.ButtonStyle.gray)
-    async def estornar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await e_dono_ou_gerente(interaction.user):
-            return await interaction.response.send_message(
-                embed=criar_embed("❌ Sem Permissão", "Apenas a equipe financeira.", "Vermelho"), ephemeral=True
-            )
-        saque = await self._buscar()
-        if not saque or saque["status"] in ("pago", "estornado"):
-            return await interaction.response.send_message(
-                embed=criar_embed("ℹ️ Já resolvido", "Este saque já foi pago ou estornado.", "Amarelo"), ephemeral=True
-            )
-        async with aiosqlite.connect(DATABASE_FILE) as db:
-            await db.execute("UPDATE saques SET status='estornado',ticket_status='estornado' WHERE id=?",(saque["id"],))
-            await db.commit()
-        if saque["tipo"] == "trabalho":
-            await creditar_trabalho(saque["user_id"],saque["guild_id"],saque["valor"],"estorno",f"Estorno do saque #{saque['id']}",ref=f"saque:{saque['id']}")
-        else:
-            await creditar_saldo(saque["user_id"],saque["guild_id"],saque["valor"],"estorno",f"Estorno do saque #{saque['id']}",ref=f"saque:{saque['id']}")
-        marcar_sujo()
-        await atualizar_ticket_saque(interaction.guild,saque["id"])
-        await registrar_log(
-            interaction.guild, "💸 SAQUE", "↩️ Saque estornado",
-            f"Protocolo `#{saque['id']}` foi estornado por {interaction.user.mention}.\n"
-            f"> {mencao(saque['user_id'])} recebeu **{formatar_moeda(saque['valor'])}** de volta na carteira.",
-            "Amarelo"
-        )
+    async def _rotear(self, interaction: discord.Interaction):
+        acao = interaction.data["values"][0]
         try:
-            await interaction.message.edit(view=None)
+            await interaction.message.edit(view=SaqueAcaoView(self.saque_id))
         except Exception:
             pass
-        await interaction.response.send_message(
-            embed=criar_embed("↩️ Estornado", "O saldo voltou pra carteira do jogador.", "Amarelo"), ephemeral=True
-        )
-
-    @discord.ui.button(label="Tentar novamente", style=discord.ButtonStyle.blurple)
-    async def marcar_auto(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await e_dono_ou_gerente(interaction.user):
             return await interaction.response.send_message(
-                embed=criar_embed("❌ Sem Permissão", "Apenas a equipe financeira.", "Vermelho"), ephemeral=True
+                embed=criar_embed("🔒 Sem Permissão", "Apenas Dono ou Gerente.", "Vermelho"), ephemeral=True
             )
-        await notificar_saque(interaction.guild, self.saque_id, forcar=True)
-        await interaction.response.send_message(
-            embed=criar_embed("🔁 Reenviado", "Dados do saque reenviados.", "Azul"), ephemeral=True
-        )
+
+        if acao == "pago":
+            saque = await self._buscar()
+            if not saque or saque["status"] in ("pago", "estornado"):
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Já resolvido", "Este saque já foi pago ou estornado.", "Cinza Escuro"), ephemeral=True
+                )
+            await concluir_saque(saque["id"], interaction.user.id, "pagamento marcado pela equipe")
+            try:
+                await interaction.message.edit(view=None)
+            except Exception:
+                pass
+            return await interaction.response.send_message(
+                embed=criar_embed("✅ Saque Pago", f"Protocolo `#{saque['id']}` marcado como pago.", "Esmeralda"), ephemeral=True
+            )
+
+        if acao == "estorno":
+            saque = await self._buscar()
+            if not saque or saque["status"] in ("pago", "estornado"):
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Já resolvido", "Este saque já foi pago ou estornado.", "Cinza Escuro"), ephemeral=True
+                )
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                await db.execute("UPDATE saques SET status='estornado',ticket_status='estornado' WHERE id=?", (saque["id"],))
+                await db.commit()
+            if saque["tipo"] == "trabalho":
+                await creditar_trabalho(saque["user_id"], saque["guild_id"], saque["valor"], "estorno", f"Estorno do saque #{saque['id']}", ref=f"saque:{saque['id']}")
+            else:
+                await creditar_saldo(saque["user_id"], saque["guild_id"], saque["valor"], "estorno", f"Estorno do saque #{saque['id']}", ref=f"saque:{saque['id']}")
+            marcar_sujo()
+            await atualizar_ticket_saque(interaction.guild, saque["id"])
+            await registrar_log(
+                interaction.guild, "💸 SAQUE", "↩️ Saque estornado",
+                f"Protocolo `#{saque['id']}` foi estornado por {interaction.user.mention}.\n"
+                f"• {mencao(saque['user_id'])} recebeu **{formatar_moeda(saque['valor'])}** de volta na carteira.",
+                "Amarelo",
+            )
+            try:
+                await interaction.message.edit(view=None)
+            except Exception:
+                pass
+            return await interaction.response.send_message(
+                embed=criar_embed("↩️ Saque Estornado", "O saldo retornou integralmente para a carteira do solicitante.", "Amarelo"),
+                ephemeral=True,
+            )
+
+        if acao == "reenviar":
+            await notificar_saque(interaction.guild, self.saque_id, forcar=True)
+            return await interaction.response.send_message(
+                embed=criar_embed("🔁 Reenviado", "Dados do saque reenviados.", "Cinza Escuro"), ephemeral=True
+            )
 
 
 async def notificar_saque(guild, saque_id: int, forcar: bool = False):
@@ -7267,29 +7558,24 @@ async def notificar_saque(guild, saque_id: int, forcar: bool = False):
         return
 
     disp = await disponibilidade_saque(guild.id)
-    embed = criar_embed(
-        "💸 PIX PARA ENVIAR — Saque Solicitado",
-        f"**Protocolo:** `#{saque['id']}`\n"
-        f"**Solicitante:** {mencao(saque['user_id'])}\n\n"
-        f"> 💰 **Valor:** `{formatar_moeda(saque['valor'])}`\n"
-        f"> 🏦 **Chave PIX:** `{saque['chave_pix']}`\n"
-        f"> 👤 **Titular:** `{saque['titular'] or 'não informado'}`\n\n"
-        f"> ✅ Envie o PIX diretamente e clique em **PIX enviado ✅** abaixo (ou no ticket privado do saque).",
-        "Amarelo"
-    )
-    embed.add_field(name="📊 Caixa interno", value=f"> Saldo: `{formatar_moeda(disp['saldo'])}`\n"
-                                                   f"> Reserva: `{formatar_moeda(disp['reserva'])}`\n"
-                                                   f"> Fila total: `{formatar_moeda(disp['fila'])}`", inline=False)
     de_trabalho = (saque["tipo"] or "jogador") == "trabalho"
-    atual = (await saldo_trabalho(saque["user_id"], saque["guild_id"]) if de_trabalho
-             else await saldo_carteira(saque["user_id"], saque["guild_id"]))
-    detalhe = ("> Fonte: **carteira de trabalho** (Suporte)\n" if de_trabalho
-               else "> Fonte: carteira do jogador\n")
-    if saque["saldo_antes"] is not None:
-        detalhe += (f"> ⏮️ Antes do saque: `{formatar_moeda(saque['saldo_antes'])}`\n"
-                    f"> 📉 Descontado: `{formatar_moeda(saque['valor'])}`\n")
-    detalhe += f"> ✅ **Total atualizado: `{formatar_moeda(atual)}`**"
-    embed.add_field(name="💼 Carteira depois deste saque", value=detalhe, inline=False)
+    atual = (
+        await saldo_trabalho(saque["user_id"], saque["guild_id"])
+        if de_trabalho
+        else await saldo_carteira(saque["user_id"], saque["guild_id"])
+    )
+    fonte_txt = "Carteira de Trabalho (Suporte)" if de_trabalho else "Carteira Pessoal"
+    embed = criar_embed(
+        f"💸 Saque Solicitado • Protocolo #{saque['id']}",
+        f"• **Solicitante:** {mencao(saque['user_id'])}\n"
+        f"• **Valor:** **`{formatar_moeda(saque['valor'])}`**\n"
+        f"• **Chave PIX:** `{saque['chave_pix']}`\n"
+        f"• **Titular:** `{saque['titular'] or 'não informado'}`\n"
+        f"• **Origem:** {fonte_txt} *(saldo atual: `{formatar_moeda(atual)}`)*\n"
+        f"• **Caixa Interno:** `{formatar_moeda(disp['saldo'])}` *(reserva: `{formatar_moeda(disp['reserva'])}` • fila: `{formatar_moeda(disp['fila'])}`)*\n"
+        f"-# Envie o PIX manualmente e registre no seletor abaixo",
+        "Cinza Escuro",
+    )
     canal, motivo_privacidade = await canal_financeiro_privado(guild)
     if canal:
         try:
@@ -7799,7 +8085,8 @@ async def cmd_carteira(interaction: discord.Interaction, usuario: Optional[disco
 
 
 class ConfirmarAjusteSaldoView(discord.ui.View):
-    """Confirmação ligada a quem iniciou o ajuste e à carteira escolhida."""
+    """Confirmação minimalista ligada a quem iniciou o ajuste e à carteira escolhida."""
+
     def __init__(self, autor_id: int, alvo_id: int, guild_id: int,
                  valor: float, motivo: str, tipo_carteira: str = "pessoal"):
         super().__init__(timeout=90)
@@ -7809,44 +8096,76 @@ class ConfirmarAjusteSaldoView(discord.ui.View):
         self.valor = float(valor)
         self.motivo = str(motivo)[:300]
         self.tipo_carteira = "trabalho" if tipo_carteira == "trabalho" else "pessoal"
+        sel = discord.ui.Select(
+            placeholder="🛠️ Confirme ou cancele este ajuste...",
+            options=[
+                discord.SelectOption(
+                    label="Confirmar Ajuste de Saldo",
+                    value="confirmar",
+                    emoji="✅",
+                    description="Aplica o ajuste imediatamente e registra em auditoria",
+                ),
+                discord.SelectOption(
+                    label="Cancelar Ajuste",
+                    value="cancelar",
+                    emoji="↩️",
+                    description="Descarta a operação sem alterar nenhum saldo",
+                ),
+            ],
+        )
+        sel.callback = self._decidir
+        self.add_item(sel)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.autor_id:
             await interaction.response.send_message(
                 embed=criar_embed("🔒 Confirmação privada", "Só quem preparou este ajuste pode confirmar.", "Vermelho"),
-                ephemeral=True)
+                ephemeral=True,
+            )
             return False
         return True
 
-    @discord.ui.button(label="Confirmar ajuste", style=discord.ButtonStyle.danger, emoji="✅")
-    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _decidir(self, interaction: discord.Interaction):
+        if interaction.data["values"][0] == "cancelar":
+            return await interaction.response.edit_message(
+                embed=criar_embed("↩️ Ajuste Cancelado", "Nenhum saldo foi alterado.", "Cinza Escuro"), view=None
+            )
+
         if (not interaction.guild or interaction.guild.id != self.guild_id
                 or not await e_dono_ou_gerente(interaction.user)):
             return await interaction.response.send_message(
                 embed=criar_embed("🔒 Ação não autorizada", "Apenas Dono ou Gerente podem confirmar ajustes de carteira.", "Vermelho"),
-                ephemeral=True)
+                ephemeral=True,
+            )
         if self.alvo_id == interaction.user.id and not await tem_cargo_dono_ou_gerente_configurado(interaction.user):
             return await interaction.response.send_message(
-                embed=criar_embed("🔒 Autoajuste bloqueado",
-                                  "Mediadores e administradores sem cargo configurado não podem ajustar a própria carteira. Só os cargos configurados de Dono/Gerente podem fazer autoajuste.",
-                                  "Vermelho"), ephemeral=True)
+                embed=criar_embed(
+                    "🔒 Autoajuste bloqueado",
+                    "Apenas os cargos configurados de Dono/Gerente podem fazer autoajuste.",
+                    "Vermelho",
+                ),
+                ephemeral=True,
+            )
 
         await interaction.response.defer()
         alvo = await membro_do_guild(interaction.guild, self.alvo_id)
         if not alvo or getattr(alvo, "bot", False):
             return await interaction.edit_original_response(
                 embed=criar_embed("❌ Ajuste cancelado", "O jogador não está mais no servidor ou é um bot.", "Vermelho"),
-                view=None)
+                view=None,
+            )
         if self.tipo_carteira == "trabalho" and not await tem_carteira_trabalho(alvo):
             return await interaction.edit_original_response(
-                embed=criar_embed("❌ Ajuste cancelado", "A carteira de trabalho é exclusiva do cargo Suporte (ADM não possui carteira de trabalho).", "Vermelho"),
-                view=None)
+                embed=criar_embed("❌ Ajuste cancelado", "A carteira de trabalho é exclusiva do cargo Suporte.", "Vermelho"),
+                view=None,
+            )
 
         descricao_auditoria = f"{self.motivo} — por {interaction.user.display_name}"
         if self.tipo_carteira == "trabalho":
             novo = await movimentar_trabalho(
                 self.alvo_id, self.guild_id, self.valor, "ajuste", descricao_auditoria,
-                ref=f"ajuste:trabalho:{interaction.id}")
+                ref=f"ajuste:trabalho:{interaction.id}",
+            )
             saldo_atual = await saldo_trabalho(self.alvo_id, self.guild_id)
             nome_carteira = "carteira de trabalho"
             tipo_log = "💼 AJUSTE DE TRABALHO"
@@ -7854,36 +8173,40 @@ class ConfirmarAjusteSaldoView(discord.ui.View):
         else:
             novo = await movimentar_saldo(
                 self.alvo_id, self.guild_id, self.valor, "ajuste", descricao_auditoria,
-                ref=f"ajuste:pessoal:{interaction.id}")
+                ref=f"ajuste:pessoal:{interaction.id}",
+            )
             saldo_atual = await saldo_carteira(self.alvo_id, self.guild_id)
             nome_carteira = "carteira pessoal"
             tipo_log = "💰 AJUSTE"
             titulo_log = "💰 Ajuste da carteira pessoal"
         if novo is None:
             return await interaction.edit_original_response(
-                embed=criar_embed("❌ Saldo insuficiente",
-                                  f"O saldo mudou durante a confirmação. Atual: `{formatar_moeda(saldo_atual)}`.",
-                                  "Vermelho"), view=None)
+                embed=criar_embed(
+                    "❌ Saldo insuficiente",
+                    f"O saldo mudou durante a confirmação. Atual: `{formatar_moeda(saldo_atual)}`.",
+                    "Vermelho",
+                ),
+                view=None,
+            )
 
         await registrar_log(
             interaction.guild, tipo_log, titulo_log,
             f"{interaction.user.mention} {'adicionou' if self.valor > 0 else 'removeu'} "
             f"**{formatar_moeda(abs(self.valor))}** {'para' if self.valor > 0 else 'de'} {alvo.mention}.\n"
-            f"> 💳 Carteira: **{nome_carteira}**\n> 📝 Motivo: {self.motivo}\n"
-            f"> 💼 Novo saldo: `{formatar_moeda(novo)}`",
-            "Verde" if self.valor > 0 else "Amarelo")
+            f"• Carteira: **{nome_carteira}**\n• Motivo: {self.motivo}\n"
+            f"• Novo saldo: `{formatar_moeda(novo)}`",
+            "Verde" if self.valor > 0 else "Amarelo",
+        )
         await interaction.edit_original_response(
             embed=criar_embed(
-                "✅ Ajuste confirmado",
-                f"{alvo.mention}: `{'+' if self.valor > 0 else '−'}{formatar_moeda(abs(self.valor))}`\n"
-                f"> 💳 {nome_carteira}: `{formatar_moeda(novo)}`\n> 📝 Motivo: {self.motivo}",
-                "Esmeralda"),
-            view=None)
-
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, emoji="↩️")
-    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=criar_embed("↩️ Ajuste cancelado", "Nenhum saldo foi alterado.", "Cinza"), view=None)
+                "✅ Ajuste Confirmado",
+                f"• **Membro:** {alvo.mention} (`{'+' if self.valor > 0 else '−'}{formatar_moeda(abs(self.valor))}`)\n"
+                f"• **Carteira:** {nome_carteira} → **`{formatar_moeda(novo)}`**\n"
+                f"• **Motivo:** {self.motivo}",
+                "Esmeralda",
+            ),
+            view=None,
+        )
 
 
 @bot.tree.command(name="addsaldo", description="🛠️ Ajustar carteira pessoal ou de trabalho (Dono e Gerente)")
@@ -9003,25 +9326,58 @@ async def guilds_para_sync() -> list:
     return lista
 
 
+COLUNAS_FF_CONFIG_INT = {
+    "cargo_dono", "cargo_gerente", "cargo_mediador", "cargo_suporte",
+    "cat_premium", "cat_basico", "cat_pagamentos", "cat_tickets",
+    "canal_logs", "canal_logs_suporte", "canal_cupons", "canal_eventos", "canal_rankings",
+    "canal_log_deposito", "canal_log_saque", "canal_log_pagamento",
+    "canal_log_vaga", "canal_log_pag_suporte", "canal_log_pag_adm",
+    "janela_min", "dia_fechamento",
+}
+COLUNAS_FF_CONFIG_FLOAT = {"reserva", "comissao_pct", "saque_min", "deposito_min"}
+
+
 async def linhas_config(guild) -> list:
-    """Linha de configuração do servidor no formato da tabela ff_config."""
+    """Linha de configuração do servidor no formato estrito da tabela ff_config (PostgreSQL)."""
     cfg = await obter_config(guild.id)
-    linha = {"guild_id": int(guild.id),
-             "guild_nome": str(getattr(guild, "name", "") or "")[:120],
-             "atualizado_em": agora_brt().isoformat()}
+    linha = {
+        "guild_id": int(guild.id),
+        "guild_nome": str(getattr(guild, "name", "") or "")[:120],
+        "atualizado_em": agora_brt().isoformat(),
+    }
     for coluna in COLUNAS_FF_CONFIG:
         if coluna in ("guild_id", "guild_nome"):
             continue
         valor = cfg.get(coluna)
         if coluna == "nota_valores":
-            valor = str(valor or "")
+            linha[coluna] = str(valor or "")
         elif coluna == "cor":
-            valor = str(valor or "Fire Force")
-        elif isinstance(valor, (int, float)):
-            valor = float(valor)
-        elif valor is not None:
-            valor = int(valor) if str(valor).isdigit() else str(valor)
-        linha[coluna] = valor
+            linha[coluna] = str(valor or "Cinza Escuro")
+        elif coluna == "livepix_link":
+            linha[coluna] = str(valor or "")
+        elif coluna in COLUNAS_FF_CONFIG_INT:
+            if valor is None or str(valor).strip() == "":
+                linha[coluna] = None
+            else:
+                try:
+                    # Nunca converter IDs de 64 bits (Snowflake) usando float(), pois perde precisão e gera 22P02
+                    texto_int = str(valor).strip()
+                    if texto_int.endswith(".0"):
+                        texto_int = texto_int[:-2]
+                    ival = int(texto_int)
+                    linha[coluna] = ival if (ival != 0 or coluna in ("dia_fechamento", "janela_min")) else None
+                except Exception:
+                    linha[coluna] = None
+        elif coluna in COLUNAS_FF_CONFIG_FLOAT:
+            if valor is None or str(valor).strip() == "":
+                linha[coluna] = None
+            else:
+                try:
+                    linha[coluna] = float(valor)
+                except Exception:
+                    linha[coluna] = None
+        else:
+            linha[coluna] = str(valor) if valor is not None else None
     return [linha]
 
 
@@ -9211,11 +9567,10 @@ async def ping_supabase_keepalive(forcar: bool = False) -> tuple[bool, str]:
     await _meta_gravar("ultimo_ping_supabase", agora_iso)
     await _meta_gravar("ultimo_pulso", agora_iso)
 
-    sessao = await _ff_sessao()
-    status_get, _ = await _supabase_req(
-        sessao,
+    ok_get, _ = await _sb_req(
         "GET",
-        f"/rest/v1/{SUPABASE_TABELA}?id=eq.{SUPABASE_ID}&select=id,atualizado_em",
+        f"/rest/v1/{SUPABASE_TABELA}",
+        params={"id": f"eq.{SUPABASE_ID}", "select": "id,atualizado_em"},
     )
     resultado_salvar = await salvar_estado()
     await sincronizar_estruturado(silencioso=True)
@@ -9230,8 +9585,8 @@ async def ping_supabase_keepalive(forcar: bool = False) -> tuple[bool, str]:
     except Exception:
         pass
 
-    ok = (200 <= int(status_get or 0) < 300) and not str(resultado_salvar).startswith("❌")
-    detalhe = f"HTTP {status_get} • {resultado_salvar}"
+    ok = bool(ok_get) and not str(resultado_salvar).startswith("❌")
+    detalhe = f"{'PING OK' if ok_get else 'PING FALHOU'} • {resultado_salvar}"
     _log_arquivo(f"[SUPABASE KEEP-ALIVE] {'OK' if ok else 'AVISO'} — {detalhe}")
     return ok, detalhe
 
@@ -9779,14 +10134,30 @@ async def pagar_fila_trabalho(guild) -> int:
 # ---------- VAGAS DA EQUIPE (anúncio + candidatura) ----------
 
 class VagaCandidaturaView(discord.ui.View):
-    """Botão do anúncio de vaga: abre um atendimento com o suporte."""
+    """Seletor minimalista do anúncio de vaga: abre atendimento de candidatura."""
 
     def __init__(self):
         super().__init__(timeout=None)
+        sel = discord.ui.Select(
+            custom_id="ff_vaga_sel_v12",
+            placeholder="📝 Candidatar-se a esta vaga...",
+            options=[
+                discord.SelectOption(
+                    label="Quero me Candidatar",
+                    value="candidatar",
+                    emoji="📝",
+                    description="Abre um canal privado para entrevista com a equipe",
+                )
+            ],
+        )
+        sel.callback = self._candidatar
+        self.add_item(sel)
 
-    @discord.ui.button(label="Quero me candidatar", style=discord.ButtonStyle.green, emoji="📝",
-                       custom_id="ff_vaga_cand")
-    async def candidatar(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def _candidatar(self, interaction: discord.Interaction):
+        try:
+            await interaction.message.edit(view=VagaCandidaturaView())
+        except Exception:
+            pass
         await abrir_ticket(interaction, "suporte", assunto="Candidatura a uma vaga da equipe")
 
 
@@ -9811,7 +10182,7 @@ class VagaCandidaturaView(discord.ui.View):
 async def cmd_vaga(interaction: discord.Interaction, cargo: app_commands.Choice[str],
                    tipo: app_commands.Choice[str], descricao: str,
                    requisitos: Optional[str] = None, canal: Optional[discord.TextChannel] = None):
-    """Dono e Gerente anunciam vaga — o anúncio sai com o botão de candidatura."""
+    """Dono e Gerente anunciam vaga com seletor minimalista de candidatura."""
     if not await e_dono_ou_gerente(interaction.user):
         return await interaction.response.send_message(
             embed=criar_embed("❌ Sem Permissão", "Apenas **Dono** ou **Gerente** anunciam vaga na equipe.",
@@ -9827,22 +10198,20 @@ async def cmd_vaga(interaction: discord.Interaction, cargo: app_commands.Choice[
         return await interaction.response.send_message(
             embed=criar_embed(
                 "⚙️ Falta o canal de vagas",
-                "Configure com:\n"
-                "> `/logs acao:Canal de VAGAS da equipe (público) canal:#vagas`\n"
-                "> ou passe o canal direto: `/vaga ... canal:#vagas`", "Amarelo"), ephemeral=True)
+                "Configure com `/logs` ou passe o canal direto em `/vaga`.", "Amarelo"), ephemeral=True)
 
     embed = criar_embed(
-        f"📢 VAGA ABERTA — {cargo.value}",
-        f"> 🏷️ **Vaga:** {cargo.value}\n"
-        f"> 💼 **Tipo:** {tipo.value}\n\n"
-        f"**O que é:**\n> {descricao}\n"
-        + (f"\n**Requisitos:**\n> {requisitos}\n" if requisitos else "")
-        + f"\n> 📝 **Candidatou?** Clique no botão abaixo — o **suporte** te atende.\n"
-          f"> 🛡️ Anúncio feito por {mencao(interaction.user.id)}.",
-        "Fire Force", footer="Fire Force • Vagas da equipe")
+        f"💼 Vaga na Equipe • {cargo.value}",
+        f"• **Cargo:** `{cargo.value}`\n"
+        f"• **Modalidade:** `{tipo.value}`\n\n"
+        f"**Sobre a vaga**\n{descricao}\n"
+        + (f"\n**Requisitos**\n{requisitos}\n" if requisitos else "")
+        + f"\n-# Publicado por {interaction.user.display_name} • Selecione abaixo para se candidatar",
+        "Cinza Escuro",
+    )
     await destino.send(embed=embed, view=VagaCandidaturaView())
     await interaction.response.send_message(
-        embed=criar_embed("✅ Vaga publicada", f"Anúncio no ar em {destino.mention}.", "Esmeralda"), ephemeral=True)
+        embed=criar_embed("✅ Vaga Publicada", f"Anúncio enviado em {destino.mention}.", "Esmeralda"), ephemeral=True)
     await registrar_log(
         interaction.guild, "📢 VAGA", "📢 Vaga anunciada",
         f"**{cargo.value}** ({tipo.value}) por {mencao(interaction.user.id)} → {destino.mention}.", "Azul")
@@ -10134,17 +10503,49 @@ async def abrir_ticket(interaction: discord.Interaction, tipo: str = "suporte", 
 
 
 class TicketView(discord.ui.View):
-    """Botões do atendimento (persistentes: funcionam após restart)."""
+    """Painel minimalista de atendimento (Select único moderno, persistente após restart)."""
 
     def __init__(self, ticket_id: int = 0):
         super().__init__(timeout=None)
-        self.ticket_id = ticket_id
-        if ticket_id:
-            self.assumir.custom_id = f"ff_tk_assumir:{ticket_id}"
-            self.add.custom_id = f"ff_tk_add:{ticket_id}"
-            self.rem.custom_id = f"ff_tk_rem:{ticket_id}"
-            self.renomear.custom_id = f"ff_tk_ren:{ticket_id}"
-            self.fechar.custom_id = f"ff_tk_fechar:{ticket_id}"
+        self.ticket_id = int(ticket_id or 0)
+        sel = discord.ui.Select(
+            custom_id=f"ff_tk_sel:{self.ticket_id}",
+            placeholder="⚙️ Gerenciar este atendimento...",
+            options=[
+                discord.SelectOption(
+                    label="Assumir Atendimento",
+                    value="assumir",
+                    emoji="🙋",
+                    description="Atendente da fila assume este canal",
+                ),
+                discord.SelectOption(
+                    label="Adicionar Pessoa",
+                    value="add",
+                    emoji="➕",
+                    description="Adiciona outro membro a este canal",
+                ),
+                discord.SelectOption(
+                    label="Remover Pessoa",
+                    value="rem",
+                    emoji="➖",
+                    description="Remove um membro adicionado ao canal",
+                ),
+                discord.SelectOption(
+                    label="Renomear Canal",
+                    value="ren",
+                    emoji="✏️",
+                    description="Altera o nome deste canal privado",
+                ),
+                discord.SelectOption(
+                    label="Fechar Atendimento",
+                    value="fechar",
+                    emoji="🔒",
+                    description="Encerra o atendimento e avalia de 0 a 5 estrelas",
+                ),
+            ],
+        )
+        sel.callback = self._rotear
+        self.add_item(sel)
 
     async def _ticket(self, channel_id: int):
         async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -10153,94 +10554,129 @@ class TicketView(discord.ui.View):
                 "SELECT * FROM tickets WHERE channel_id = ? ORDER BY id DESC LIMIT 1", (channel_id,)
             )).fetchone()
 
-    @discord.ui.button(label="Assumir", style=discord.ButtonStyle.green, emoji="🙋")
-    async def assumir(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ticket = await self._ticket(interaction.channel.id)
-        if not ticket:
+    async def _rotear(self, interaction: discord.Interaction):
+        acao = interaction.data["values"][0]
+        try:
+            await interaction.message.edit(view=TicketView(self.ticket_id))
+        except Exception:
+            pass
+
+        if acao == "assumir":
+            ticket = await self._ticket(interaction.channel.id)
+            if not ticket:
+                return await interaction.response.send_message(
+                    embed=criar_embed("❌ Atendimento não encontrado", "Abra um novo pelo painel.", "Vermelho"), ephemeral=True
+                )
+            if not await atendente_autorizado(fila_normalizada(ticket["tipo"]), interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Sem Permissão", "Apenas a equipe desta fila (ou gerência) pode assumir.", "Vermelho"),
+                    ephemeral=True,
+                )
+            if not await aviso_fora_de_servico(interaction):
+                return
+            if ticket["assumido_por"] and ticket["assumido_por"] != interaction.user.id:
+                return await interaction.response.send_message(
+                    embed=criar_embed("🙋 Já assumido", f"Este atendimento já está com {mencao(ticket['assumido_por'])}.", "Amarelo"),
+                    ephemeral=True,
+                )
+
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                await db.execute(
+                    "UPDATE tickets SET assumido_por = ?, assumido_em = ? WHERE id = ?",
+                    (interaction.user.id, agora_brt().isoformat(), ticket["id"]),
+                )
+                await db.commit()
+            marcar_sujo()
+
+            cfg = await obter_config(interaction.guild.id)
+            for chave in cargos_da_fila(fila_normalizada(ticket["tipo"])):
+                if chave in ("cargo_dono", "cargo_gerente"):
+                    continue
+                cargo = interaction.guild.get_role(cfg.get(chave)) if cfg.get(chave) else None
+                if cargo:
+                    try:
+                        await interaction.channel.set_permissions(cargo, overwrite=None)
+                    except Exception:
+                        pass
+
+            embed = criar_embed(
+                "🙋 Atendimento Assumido",
+                f"{interaction.user.mention} assumiu este atendimento.\n"
+                f"• Ao concluir, {mencao(ticket['user_id'])} encerra no seletor acima e avalia o atendimento.",
+                "Esmeralda",
+            )
+            await interaction.response.send_message(content=mencao(ticket["user_id"]), embed=embed)
+            return await registrar_log_suporte(
+                interaction.guild, "🎫 TICKET", "🙋 Atendimento assumido",
+                f"{mencao(interaction.user.id)} assumiu o protocolo `#{ticket['id']}` "
+                f"(fila `{ticket['tipo']}`) de {mencao(ticket['user_id'])}.", "Verde",
+            )
+
+        if acao == "add":
+            if not await self._pode_gerenciar(interaction):
+                return
             return await interaction.response.send_message(
-                embed=criar_embed("❌ Atendimento não encontrado", "Use o painel de novo.", "Vermelho"), ephemeral=True)
-        if not await atendente_autorizado(fila_normalizada(ticket["tipo"]), interaction.user):
+                embed=criar_embed("➕ Adicionar Pessoa", "Selecione abaixo quem deve entrar no canal:", "Cinza Escuro"),
+                view=TicketAddView(),
+                ephemeral=True,
+            )
+
+        if acao == "rem":
+            if not await self._pode_gerenciar(interaction):
+                return
             return await interaction.response.send_message(
-                embed=criar_embed("❌ Sem Permissão",
-                                  "Esse atendimento é de outra fila. Só quem é da fila (ou gerência) assume.", "Vermelho"),
-                ephemeral=True)
-        if not await aviso_fora_de_servico(interaction):
-            return
-        if ticket["assumido_por"] and ticket["assumido_por"] != interaction.user.id:
+                embed=criar_embed("➖ Remover Pessoa", "Selecione abaixo quem deve sair do canal:", "Cinza Escuro"),
+                view=TicketRemView(),
+                ephemeral=True,
+            )
+
+        if acao == "ren":
+            if not await self._pode_gerenciar(interaction):
+                return
+            return await interaction.response.send_modal(TicketRenomearModal())
+
+        if acao == "fechar":
+            ticket = await self._ticket(interaction.channel.id)
+            eh_vip = await e_gerencia(interaction.user)
+            if not ticket:
+                if eh_vip:
+                    await interaction.response.send_message("🔒 Encerrando canal...", ephemeral=True)
+                    await _apagar_canal_seguro(interaction.channel, "Canal órfão encerrado")
+                    return
+                return await interaction.response.send_message(
+                    embed=criar_embed("❌ Atendimento não encontrado", "", "Vermelho"), ephemeral=True
+                )
+            eh_cliente = interaction.user.id == ticket["user_id"]
+            if not eh_cliente and not eh_vip:
+                return await interaction.response.send_message(
+                    embed=criar_embed(
+                        "🔒 Encerramento pelo Cliente",
+                        f"Quem fecha o atendimento é {mencao(ticket['user_id'])} (ou Dono/Gerente) para registrar a avaliação.",
+                        "Amarelo",
+                    ),
+                    ephemeral=True,
+                )
+            if not ticket["assumido_por"] or (eh_vip and not eh_cliente):
+                await interaction.response.defer(ephemeral=True)
+                motivo_fecho = "encerrado antes de assumir" if not ticket["assumido_por"] else f"encerrado pela gerência ({interaction.user.display_name})"
+                fechou = await _fechar_ticket_sem_nota(interaction.guild, ticket, interaction.user.id, motivo_fecho)
+                return await interaction.followup.send(
+                    embed=criar_embed(
+                        "🔒 Atendimento Encerrado" if fechou else "ℹ️ Já finalizado",
+                        "Canal encerrado com sucesso." if fechou else "Este atendimento já havia sido encerrado.",
+                        "Cinza Escuro",
+                    ),
+                    ephemeral=True,
+                )
             return await interaction.response.send_message(
-                embed=criar_embed("🙋 Já foi assumido",
-                                  f"Este atendimento já é de {mencao(ticket['assumido_por'])}.", "Amarelo"), ephemeral=True)
-
-        async with aiosqlite.connect(DATABASE_FILE) as db:
-            await db.execute("UPDATE tickets SET assumido_por = ?, assumido_em = ? WHERE id = ?",
-                             (interaction.user.id, agora_brt().isoformat(), ticket["id"]))
-            await db.commit()
-        marcar_sujo()
-
-        # a partir daqui só o atendente + gerência enxergam o canal
-        cfg = await obter_config(interaction.guild.id)
-        for chave in cargos_da_fila(fila_normalizada(ticket["tipo"])):
-            if chave in ("cargo_dono", "cargo_gerente"):
-                continue
-            cargo = interaction.guild.get_role(cfg.get(chave)) if cfg.get(chave) else None
-            if cargo:
-                try:
-                    await interaction.channel.set_permissions(cargo, overwrite=None)
-                except Exception:
-                    pass
-
-        embed = criar_embed(
-            "🙋 Atendimento assumido",
-            f"{interaction.user.mention} assumiu este atendimento.\n"
-            f"> A partir de agora só ele (e a gerência) acompanha aqui.\n"
-            f"> 🔒 Quem fecha é **{mencao(ticket['user_id'])}** — e ele dá a nota no final.",
-            "Esmeralda")
-        await interaction.response.send_message(content=mencao(ticket["user_id"]), embed=embed)
-        await registrar_log_suporte(
-            interaction.guild, "🎫 TICKET", "🙋 Atendimento assumido",
-            f"{mencao(interaction.user.id)} assumiu o protocolo `#{ticket['id']}` "
-            f"(fila `{ticket['tipo']}`) de {mencao(ticket['user_id'])}.", "Verde")
-
-    @discord.ui.button(label="Adicionar", style=discord.ButtonStyle.blurple, emoji="➕")
-    async def add(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._pode_gerenciar(interaction):
-            return
-        await interaction.response.send_message("Selecione quem adicionar:", view=TicketAddView(), ephemeral=True)
-
-    @discord.ui.button(label="Remover", style=discord.ButtonStyle.gray, emoji="➖")
-    async def rem(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._pode_gerenciar(interaction):
-            return
-        await interaction.response.send_message("Selecione quem remover:", view=TicketRemView(), ephemeral=True)
-
-    @discord.ui.button(label="Renomear", style=discord.ButtonStyle.gray, emoji="✏️")
-    async def renomear(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self._pode_gerenciar(interaction):
-            return
-        await interaction.response.send_modal(TicketRenomearModal())
-
-    @discord.ui.button(label="Fechar atendimento", style=discord.ButtonStyle.red, emoji="🔒")
-    async def fechar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ticket = await self._ticket(interaction.channel.id)
-        if not ticket:
-            return await interaction.response.send_message(
-                embed=criar_embed("❌ Atendimento não encontrado", "", "Vermelho"), ephemeral=True)
-        if interaction.user.id != ticket["user_id"]:
-            return await interaction.response.send_message(
-                embed=criar_embed("🔒 Só o cliente fecha",
-                                  f"Quem fecha o atendimento é {mencao(ticket['user_id'])} — "
-                                  f"é ele que avalia o atendente no final.", "Amarelo"), ephemeral=True)
-        if not ticket["assumido_por"]:
-            return await interaction.response.send_message(
-                embed=criar_embed("⏳ Ninguém assumiu ainda",
-                                  "Espere um atendente assumir para poder avaliar e fechar. 💛", "Amarelo"),
-                ephemeral=True)
-        await interaction.response.send_message(
-            embed=criar_embed("⭐ Avaliação do atendimento",
-                              "Antes de fechar, dê uma **nota ao atendimento**.\n"
-                              "A descrição é **opcional** (mas ajuda muito a equipe!).",
-                              "Dourado"),
-            view=TicketNotaView(ticket["id"], ticket["assumido_por"]), ephemeral=True)
+                embed=criar_embed(
+                    "⭐ Avalie o Atendimento",
+                    f"Antes de encerrar, escolha uma nota para {mencao(ticket['assumido_por'])} *(descrição opcional)*:",
+                    "Dourado",
+                ),
+                view=TicketNotaView(ticket["id"], ticket["assumido_por"]),
+                ephemeral=True,
+            )
 
     async def _pode_gerenciar(self, interaction) -> bool:
         ticket = await self._ticket(interaction.channel.id)
@@ -10249,8 +10685,9 @@ class TicketView(discord.ui.View):
         if interaction.user.id == ticket["assumido_por"] or await e_gerencia(interaction.user):
             return True
         await interaction.response.send_message(
-            embed=criar_embed("❌ Só quem assumiu", "Assuma o atendimento (ou seja gerência) para usar isso.", "Vermelho"),
-            ephemeral=True)
+            embed=criar_embed("🔒 Só quem assumiu", "Assuma o atendimento (ou seja gerência) para usar esta opção.", "Vermelho"),
+            ephemeral=True,
+        )
         return False
 
 
@@ -10416,32 +10853,81 @@ async def _fechar_ticket_sem_nota(guild, ticket, actor_id: int, motivo: str) -> 
     return True
 
 
-@bot.tree.command(name="meu_ticket_fechar", description="🔒 Fechar seu atendimento regular neste canal")
+@bot.tree.command(name="meu_ticket_fechar", description="🔒 Fechar seu atendimento aberto neste canal")
 @app_commands.guild_only()
 async def cmd_meu_ticket_fechar(interaction: discord.Interaction):
-    """Atalho de texto para o cliente fechar seu próprio ticket de suporte."""
+    """Atalho para o solicitante (ou Dono/Gerente) encerrar o canal de atendimento atual."""
     if not interaction.guild or not interaction.channel:
         return await _responder_erro_interacao(
             interaction, criar_embed("⚠️ Use dentro do servidor", "Este comando funciona no canal do atendimento.", "Amarelo"))
+    eh_vip = await e_dono_ou_gerente(interaction.user)
     async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
         db.row_factory = aiosqlite.Row
         ticket = await (await db.execute(
             "SELECT * FROM tickets WHERE guild_id=? AND channel_id=? AND status='aberto' ORDER BY id DESC LIMIT 1",
             (interaction.guild.id, interaction.channel.id))).fetchone()
+        parceria = None
+        divulgacao = None
+        if not ticket:
+            parceria = await (await db.execute(
+                "SELECT * FROM parceiros WHERE guild_id=? AND canal_ticket_id=? ORDER BY id DESC LIMIT 1",
+                (interaction.guild.id, interaction.channel.id))).fetchone()
+        if not ticket and not parceria:
+            divulgacao = await (await db.execute(
+                "SELECT * FROM divulgacoes WHERE guild_id=? AND canal_ticket_id=? ORDER BY id DESC LIMIT 1",
+                (interaction.guild.id, interaction.channel.id))).fetchone()
+
+    if parceria:
+        if not eh_vip and int(parceria["solicitante_id"] or 0) != int(interaction.user.id):
+            return await interaction.response.send_message(
+                embed=criar_embed("🔒 Sem Permissão", "Apenas o solicitante, Dono ou Gerente podem encerrar este canal.", "Vermelho"),
+                ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True)
+        if parceria["status"] == "pendente":
+            async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                await db.execute("UPDATE parceiros SET status='cancelada' WHERE id=?", (parceria["id"],))
+                await db.commit()
+            marcar_sujo()
+        await interaction.followup.send(
+            embed=criar_embed("🔒 Encerrando Canal", "Canal de parceria encerrado.", "Cinza Escuro"), ephemeral=True
+        )
+        await asyncio.sleep(1)
+        await _apagar_canal_seguro(interaction.channel, "Canal de parceria encerrado via comando")
+        return
+
+    if divulgacao:
+        if not eh_vip and int(divulgacao["solicitante_id"] or 0) != int(interaction.user.id):
+            return await interaction.response.send_message(
+                embed=criar_embed("🔒 Sem Permissão", "Apenas o contratante, Dono ou Gerente podem encerrar este canal.", "Vermelho"),
+                ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True)
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            await db.execute("UPDATE divulgacoes SET status='fechada', fechado_em=? WHERE id=?", (agora_brt().isoformat(), divulgacao["id"]))
+            await db.commit()
+        marcar_sujo()
+        await interaction.followup.send(
+            embed=criar_embed("🔒 Encerrando Canal", "Canal de divulgação encerrado.", "Cinza Escuro"), ephemeral=True
+        )
+        await asyncio.sleep(1)
+        await _apagar_canal_seguro(interaction.channel, "Canal de divulgação encerrado via comando")
+        return
+
     if not ticket:
         return await interaction.response.send_message(
-            embed=criar_embed("ℹ️ Atendimento não encontrado", "Este canal não tem um ticket de suporte aberto.", "Amarelo"),
+            embed=criar_embed("ℹ️ Atendimento não encontrado", "Este canal não possui atendimento aberto.", "Cinza Escuro"),
             ephemeral=True)
-    if int(ticket["user_id"] or 0) != int(interaction.user.id):
+    if int(ticket["user_id"] or 0) != int(interaction.user.id) and not eh_vip:
         return await interaction.response.send_message(
             embed=criar_embed("🔒 Só o solicitante fecha", "Você só pode fechar o atendimento que abriu.", "Vermelho"),
             ephemeral=True)
-    if ticket["assumido_por"]:
+    if ticket["assumido_por"] and int(ticket["user_id"] or 0) == int(interaction.user.id):
         return await interaction.response.send_message(
-            embed=criar_embed("⭐ Avalie o atendimento", "Escolha a nota para finalizar. O botão de avaliação continua funcionando.", "Dourado"),
+            embed=criar_embed("⭐ Avalie o Atendimento", "Escolha a nota para finalizar este atendimento.", "Dourado"),
             view=TicketNotaView(ticket["id"], ticket["assumido_por"]), ephemeral=True)
     fechou = await _fechar_ticket_sem_nota(interaction.guild, ticket, interaction.user.id,
-                                           "solicitante fechou pelo comando")
+                                           "fechado pelo comando /meu_ticket_fechar")
     await interaction.response.send_message(
         embed=criar_embed("✅ Atendimento fechado" if fechou else "ℹ️ Já finalizado",
                           "Seu canal foi encerrado; o histórico financeiro e demais tickets não foram alterados." if fechou
@@ -10701,12 +11187,14 @@ async def abrir_atendimento_deposito(interaction: discord.Interaction):
     marcar_sujo()
 
     embed = criar_embed(
-        "💰 Depósito na Carteira",
-        f"Olá {interaction.user.mention}! Este é o seu atendimento privado de **depósito**.\n\n"
-        f"• **1.** Clique em **Abrir depósito** e informe o valor desejado\n"
-        f"• **2.** Assim que um **Dono** ou **Gerente** clicar em **Assumir**, o QR Code e a chave PIX dele são enviados automaticamente aqui\n"
-        f"• **3.** Envie o comprovante neste canal para o crédito das suas moedas",
-        "Esmeralda", footer=f"Fire Force • Depósito #{deposito_id}")
+        f"💰 Depósito na Carteira #{deposito_id}",
+        f"Olá {interaction.user.mention}, este é o seu canal privado de depósito.\n\n"
+        f"• **1.** Escolha **Abrir Depósito** no seletor abaixo e informe o valor.\n"
+        f"• **2.** Assim que o **Dono** ou **Gerente** assumir, o QR Code e a chave PIX dele serão enviados automaticamente aqui.\n"
+        f"• **3.** Envie o comprovante neste canal para o crédito das suas moedas.\n"
+        f"-# Canal privado entre solicitante e gestão financeira",
+        "Cinza Escuro",
+    )
     try:
         await canal.send(content=mencao(interaction.user.id), embed=embed, view=DepositoCanalView(deposito_id))
     except Exception as erro:
@@ -10724,7 +11212,7 @@ async def abrir_atendimento_deposito(interaction: discord.Interaction):
                                      "Não consegui publicar o painel. Nenhum atendimento de depósito ficou aberto; tente novamente.", "Vermelho"))
     await responder_ephemeral(
         interaction,
-        embed=criar_embed("✅ Atendimento criado", f"Continue em {canal.mention} 💰", "Esmeralda")
+        embed=criar_embed("✅ Atendimento Criado", f"Continue em {canal.mention}", "Cinza Escuro")
     )
 
     await registrar_log_suporte(
@@ -10734,58 +11222,149 @@ async def abrir_atendimento_deposito(interaction: discord.Interaction):
 
 
 class DepositoComprovanteView(discord.ui.View):
-    """Ações no comprovante do depósito: confirmação/reprovação persistentes."""
-    def __init__(self, deposito_id: int=0):
-        super().__init__(timeout=None)
-        self.deposito_id=int(deposito_id) if isinstance(deposito_id,int) else 0
-        did=self.deposito_id
-        ok=discord.ui.Button(label="Confirmar comprovante",style=discord.ButtonStyle.green,emoji="✅",custom_id=f"ff_dep_comp_ok:{did}")
-        no=discord.ui.Button(label="Reprovar comprovante",style=discord.ButtonStyle.red,emoji="❌",custom_id=f"ff_dep_comp_no:{did}")
-        ok.callback=self.confirmar
-        no.callback=self.reprovar
-        self.add_item(ok);self.add_item(no)
+    """Seletor minimalista no comprovante do depósito (persistente após restart)."""
 
-    async def _autorizar(self,interaction):
-        if not await atendente_autorizado("suporte",interaction.user):
-            await interaction.response.send_message(embed=criar_embed("❌ Sem Permissão","Só suporte, dono ou gerente pode decidir comprovante de depósito.","Vermelho"),ephemeral=True);return None
-        if not await aviso_fora_de_servico(interaction):return None
-        deposito=await DepositoCanalView()._deposito(interaction.channel.id)
-        if (not deposito or int(deposito["id"])!=self.deposito_id
+    def __init__(self, deposito_id: int = 0):
+        super().__init__(timeout=None)
+        self.deposito_id = int(deposito_id) if isinstance(deposito_id, int) else 0
+        sel = discord.ui.Select(
+            custom_id=f"ff_dep_comp_sel:{self.deposito_id}",
+            placeholder="📄 Analisar comprovante de depósito...",
+            options=[
+                discord.SelectOption(
+                    label="Confirmar Comprovante e Creditar",
+                    value="ok",
+                    emoji="✅",
+                    description="Valida o PIX recebido e credita as moedas na carteira",
+                ),
+                discord.SelectOption(
+                    label="Reprovar Comprovante",
+                    value="no",
+                    emoji="❌",
+                    description="Mantém sem crédito e solicita novo comprovante",
+                ),
+            ],
+        )
+        sel.callback = self._decidir
+        self.add_item(sel)
+
+    async def _autorizar(self, interaction):
+        if not await atendente_autorizado("suporte", interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Sem Permissão", "Apenas a equipe autorizada pode decidir comprovantes de depósito.", "Vermelho"),
+                ephemeral=True,
+            )
+            return None
+        if not await aviso_fora_de_servico(interaction):
+            return None
+        deposito = await DepositoCanalView()._deposito(interaction.channel.id)
+        if (not deposito or int(deposito["id"]) != self.deposito_id
                 or deposito["status"] not in ("aguardando", "na_janela")):
-            await interaction.response.send_message(embed=criar_embed("ℹ️ Depósito resolvido","Este depósito não está mais pendente ou foi cancelado.","Amarelo"),ephemeral=True);return None
-        if (not deposito["assumido_por"] or deposito["assumido_por"]!=interaction.user.id) and not await e_gerencia(interaction.user):
-            await interaction.response.send_message(embed=criar_embed("🔒 Só quem assumiu ou gerência","Só quem assumiu este depósito ou dono/gerente pode decidir.","Vermelho"),ephemeral=True);return None
+            await interaction.response.send_message(
+                embed=criar_embed("ℹ️ Depósito resolvido", "Este depósito não está mais pendente ou foi cancelado.", "Cinza Escuro"),
+                ephemeral=True,
+            )
+            return None
+        if (not deposito["assumido_por"] or deposito["assumido_por"] != interaction.user.id) and not await e_gerencia(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Só quem assumiu ou gerência", "Apenas quem assumiu este depósito ou Dono/Gerente pode decidir.", "Vermelho"),
+                ephemeral=True,
+            )
+            return None
         return deposito
 
-    async def confirmar(self,interaction):
-        deposito=await self._autorizar(interaction)
-        if not deposito:return
-        await interaction.response.defer(ephemeral=True,thinking=True)
-        saldo=await creditar_deposito(interaction.guild,dict(deposito),"comprovante validado manualmente pela equipe")
-        try:await interaction.message.edit(view=None)
-        except Exception:pass
-        await interaction.followup.send(embed=criar_embed("✅ Comprovante aceito",f"Depósito de `{formatar_moeda(deposito['valor'])}` creditado. Saldo atualizado: `{formatar_moeda(saldo)}`.","Esmeralda"),ephemeral=True)
+    async def _decidir(self, interaction: discord.Interaction):
+        acao = interaction.data["values"][0]
+        try:
+            await interaction.message.edit(view=DepositoComprovanteView(self.deposito_id))
+        except Exception:
+            pass
+        deposito = await self._autorizar(interaction)
+        if not deposito:
+            return
+        if acao == "ok":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            saldo = await creditar_deposito(interaction.guild, dict(deposito), "comprovante validado manualmente pela equipe")
+            try:
+                await interaction.message.edit(view=None)
+            except Exception:
+                pass
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "✅ Comprovante Aceito",
+                    f"Depósito de `{formatar_moeda(deposito['valor'])}` creditado.\n• **Saldo atualizado:** `{formatar_moeda(saldo)}`",
+                    "Esmeralda",
+                ),
+                ephemeral=True,
+            )
 
-    async def reprovar(self,interaction):
-        deposito=await self._autorizar(interaction)
-        if not deposito:return
-        try:await interaction.message.edit(view=None)
-        except Exception:pass
-        await interaction.response.send_message(embed=criar_embed("❌ Comprovante reprovado","O saldo não foi creditado. O jogador será avisado para enviar um comprovante correto.","Vermelho"),ephemeral=True)
-        await interaction.channel.send(content=mencao(deposito["user_id"]),embed=criar_embed("❌ Comprovante não aprovado","Não conseguimos validar este comprovante. Envie um novo print legível, com valor e data, ou fale com o suporte. Seu saldo ainda não foi creditado.","Amarelo"))
-        await registrar_log_suporte(interaction.guild,"💰 DEPÓSITO","❌ Comprovante reprovado",
-            f"{mencao(interaction.user.id)} reprovou o comprovante enviado por {mencao(deposito['user_id'])}. Nenhum saldo foi creditado.","Vermelho")
+        try:
+            await interaction.message.edit(view=None)
+        except Exception:
+            pass
+        await interaction.response.send_message(
+            embed=criar_embed("❌ Comprovante Reprovado", "O saldo não foi creditado e o jogador foi notificado no canal.", "Vermelho"),
+            ephemeral=True,
+        )
+        await interaction.channel.send(
+            content=mencao(deposito["user_id"]),
+            embed=criar_embed(
+                "❌ Comprovante Não Validado",
+                "Não conseguimos validar este comprovante. Envie um novo print legível contendo valor, data e destinatário.",
+                "Amarelo",
+            ),
+        )
+        await registrar_log_suporte(
+            interaction.guild, "💰 DEPÓSITO", "❌ Comprovante reprovado",
+            f"{mencao(interaction.user.id)} reprovou o comprovante enviado por {mencao(deposito['user_id'])}. Nenhum saldo foi creditado.",
+            "Vermelho",
+        )
 
 
 class DepositoCanalView(discord.ui.View):
+    """Painel minimalista dentro do canal privado de depósito (Select único moderno)."""
+
     def __init__(self, deposito_id: int = 0):
         super().__init__(timeout=None)
-        if deposito_id:
-            self.abrir.custom_id = f"ff_dep_abrir:{deposito_id}"
-            self.assumir.custom_id = f"ff_dep_assumir:{deposito_id}"
-            self.manual.custom_id = f"ff_dep_manual:{deposito_id}"
-            self.comprovante.custom_id = f"ff_dep_comprovante:{deposito_id}"
-            self.fechar.custom_id = f"ff_dep_fechar:{deposito_id}"
+        self.deposito_id = int(deposito_id or 0)
+        sel = discord.ui.Select(
+            custom_id=f"ff_dep_sel:{self.deposito_id}",
+            placeholder="💰 Selecione uma opção para este depósito...",
+            options=[
+                discord.SelectOption(
+                    label="Abrir Depósito (Informar Valor)",
+                    value="abrir",
+                    emoji="💳",
+                    description="Jogador informa o valor em R$ que deseja depositar",
+                ),
+                discord.SelectOption(
+                    label="Assumir e Enviar Meu PIX",
+                    value="assumir",
+                    emoji="🙋",
+                    description="Dono/Gerente assume e envia automaticamente seu QR Code PIX",
+                ),
+                discord.SelectOption(
+                    label="Confirmar e Creditar Moedas",
+                    value="manual",
+                    emoji="✅",
+                    description="Confirma o pagamento recebido e credita na carteira",
+                ),
+                discord.SelectOption(
+                    label="Pedir Comprovante",
+                    value="comprovante",
+                    emoji="📄",
+                    description="Solicita ao jogador a imagem do comprovante PIX",
+                ),
+                discord.SelectOption(
+                    label="Encerrar Atendimento",
+                    value="fechar",
+                    emoji="🔒",
+                    description="Fecha e apaga este canal de depósito",
+                ),
+            ],
+        )
+        sel.callback = self._rotear
+        self.add_item(sel)
 
     async def _deposito(self, channel_id: int):
         async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -10794,126 +11373,179 @@ class DepositoCanalView(discord.ui.View):
                 "SELECT * FROM depositos WHERE canal_id = ? ORDER BY id DESC LIMIT 1", (channel_id,)
             )).fetchone()
 
-    @discord.ui.button(label="Abrir depósito", style=discord.ButtonStyle.green, emoji="💳")
-    async def abrir(self, interaction: discord.Interaction, button: discord.ui.Button):
-        deposito = await self._deposito(interaction.channel.id)
-        if not deposito:
-            return await interaction.response.send_message(
-                embed=criar_embed("❌ Não encontrado", "Abra um novo pelo painel **Carteira → Depositar PIX**.", "Vermelho"), ephemeral=True)
-        if deposito["status"] not in ("aguardando", "na_janela"):
-            return await interaction.response.send_message(
-                embed=criar_embed("ℹ️ Atendimento encerrado", "Este pedido foi resolvido/cancelado. Abra um novo pelo painel da carteira.", "Amarelo"), ephemeral=True)
-        if interaction.user.id != deposito["user_id"]:
-            return await interaction.response.send_message(
-                embed=criar_embed("🙋 É o atendimento de outra pessoa",
-                                  f"Quem abre o depósito é {mencao(deposito['user_id'])}.", "Amarelo"), ephemeral=True)
-        await interaction.response.send_modal(DepositoModal(deposito["id"], interaction.channel.id))
+    async def _rotear(self, interaction: discord.Interaction):
+        acao = interaction.data["values"][0]
+        try:
+            await interaction.message.edit(view=DepositoCanalView(self.deposito_id))
+        except Exception:
+            pass
 
-    @discord.ui.button(label="Assumir", style=discord.ButtonStyle.blurple, emoji="🙋")
-    async def assumir(self, interaction: discord.Interaction, button: discord.ui.Button):
-        deposito = await self._deposito(interaction.channel.id)
-        if not deposito or not await e_dono_ou_gerente(interaction.user):
-            return await interaction.response.send_message(
-                embed=criar_embed("❌ Exclusivo Dono/Gerente", "Apenas **Dono** ou **Gerente** assume depósitos (o PIX enviado será o de quem assumir).", "Vermelho"),
-                ephemeral=True)
-        if deposito["status"] not in ("aguardando", "na_janela"):
-            return await interaction.response.send_message(
-                embed=criar_embed("ℹ️ Depósito encerrado", "Este atendimento já foi resolvido/cancelado.", "Amarelo"),
-                ephemeral=True)
-        if deposito["assumido_por"] and deposito["assumido_por"] != interaction.user.id:
-            return await interaction.response.send_message(
-                embed=criar_embed("🙋 Já assumido", f"Já foi assumido por {mencao(deposito['assumido_por'])}.", "Amarelo"),
-                ephemeral=True)
+        if acao == "abrir":
+            deposito = await self._deposito(interaction.channel.id)
+            if not deposito:
+                return await interaction.response.send_message(
+                    embed=criar_embed("❌ Não encontrado", "Abra um novo pelo painel **Carteira → Depositar PIX**.", "Vermelho"),
+                    ephemeral=True,
+                )
+            if deposito["status"] not in ("aguardando", "na_janela"):
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Atendimento encerrado", "Este pedido já foi resolvido ou cancelado.", "Cinza Escuro"),
+                    ephemeral=True,
+                )
+            if interaction.user.id != deposito["user_id"]:
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Apenas o titular", f"Quem preenche o valor do depósito é {mencao(deposito['user_id'])}.", "Amarelo"),
+                    ephemeral=True,
+                )
+            return await interaction.response.send_modal(DepositoModal(deposito["id"], interaction.channel.id))
 
-        pix_meu = await obter_pix_adm(interaction.user.id, interaction.guild.id)
-        if not pix_meu:
-            return await interaction.response.send_message(
-                embed=criar_embed(
-                    "⚠️ Cadastre sua chave PIX primeiro",
-                    "Use `/pix` para cadastrar sua chave PIX antes de assumir — no depósito, sua chave PIX e o QR Code são enviados **automaticamente** assim que você assume.",
-                    "Amarelo",
-                ),
+        if acao == "assumir":
+            deposito = await self._deposito(interaction.channel.id)
+            if not deposito or not await e_dono_ou_gerente(interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Exclusivo Dono/Gerente", "Apenas **Dono** ou **Gerente** assume depósitos (o PIX enviado é o de quem assumir).", "Vermelho"),
+                    ephemeral=True,
+                )
+            if deposito["status"] not in ("aguardando", "na_janela"):
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Depósito encerrado", "Este atendimento já foi resolvido ou cancelado.", "Cinza Escuro"),
+                    ephemeral=True,
+                )
+            if deposito["assumido_por"] and deposito["assumido_por"] != interaction.user.id:
+                return await interaction.response.send_message(
+                    embed=criar_embed("🙋 Já assumido", f"Já foi assumido por {mencao(deposito['assumido_por'])}.", "Amarelo"),
+                    ephemeral=True,
+                )
+
+            pix_meu = await obter_pix_adm(interaction.user.id, interaction.guild.id)
+            if not pix_meu:
+                return await interaction.response.send_message(
+                    embed=criar_embed(
+                        "⚠️ Cadastre sua chave PIX primeiro",
+                        "Use `/pix` para cadastrar sua chave PIX antes de assumir — no depósito, sua chave PIX e QR Code são enviados **automaticamente** ao assumir.",
+                        "Amarelo",
+                    ),
+                    ephemeral=True,
+                )
+
+            await interaction.response.defer()
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                await db.execute("UPDATE depositos SET assumido_por = ? WHERE id = ?", (interaction.user.id, deposito["id"]))
+                await db.commit()
+            marcar_sujo()
+
+            valor_dep = float(deposito["valor"] or 0)
+            embed_pix, arquivo_pix, view_pix = await montar_cobranca_pix_responsavel(
+                interaction.guild.id,
+                interaction.user.id,
+                valor=valor_dep,
+                titulo=f"💰 Depósito Assumido — PIX de {interaction.user.display_name}",
+                mencao_destino=mencao(deposito["user_id"]),
+                rodape=f"Fire Force • Depósito #{deposito['id']}",
+                nome_arquivo="deposito_pix.png",
+            )
+            kwargs_envio = {"content": mencao(deposito["user_id"]), "embed": embed_pix}
+            if arquivo_pix:
+                kwargs_envio["file"] = arquivo_pix
+            if view_pix:
+                kwargs_envio["view"] = view_pix
+            await interaction.followup.send(**kwargs_envio)
+            return await registrar_log_suporte(
+                interaction.guild, "💰 DEPÓSITO", "🙋 Depósito assumido (PIX enviado)",
+                f"{mencao(interaction.user.id)} assumiu o depósito `#{deposito['id']}` e enviou seu PIX automaticamente.",
+                "Verde",
+            )
+
+        if acao == "manual":
+            deposito = await self._deposito(interaction.channel.id)
+            if not deposito or not await atendente_autorizado("suporte", interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Sem Permissão", "Apenas equipe autorizada pode confirmar depósitos.", "Vermelho"),
+                    ephemeral=True,
+                )
+            if not await aviso_fora_de_servico(interaction):
+                return
+            if deposito["status"] not in ("aguardando", "na_janela"):
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Depósito encerrado", "Este depósito já foi resolvido ou cancelado.", "Cinza Escuro"),
+                    ephemeral=True,
+                )
+            if float(deposito["valor"] or 0) <= 0:
+                return await interaction.response.send_message(
+                    embed=criar_embed("⚠️ Valor não informado", "O jogador precisa escolher **Abrir Depósito** e informar o valor primeiro.", "Amarelo"),
+                    ephemeral=True,
+                )
+            if (not deposito["assumido_por"] or deposito["assumido_por"] != interaction.user.id) and not await e_gerencia(interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Só quem assumiu ou gerência", "Assuma este depósito ou peça ao Dono/Gerente.", "Vermelho"),
+                    ephemeral=True,
+                )
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            saldo = await creditar_deposito(interaction.guild, dict(deposito), "confirmação manual pela equipe")
+            return await interaction.followup.send(
+                embed=criar_embed("✅ Depósito Confirmado", f"Crédito registrado.\n• **Saldo atualizado:** `{formatar_moeda(saldo)}`", "Esmeralda"),
                 ephemeral=True,
             )
 
-        await interaction.response.defer()
-        async with aiosqlite.connect(DATABASE_FILE) as db:
-            await db.execute("UPDATE depositos SET assumido_por = ? WHERE id = ?",
-                             (interaction.user.id, deposito["id"]))
-            await db.commit()
-        marcar_sujo()
+        if acao == "comprovante":
+            deposito = await self._deposito(interaction.channel.id)
+            if not deposito or not await atendente_autorizado("suporte", interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Sem Permissão", "Apenas equipe autorizada pode solicitar comprovante.", "Vermelho"),
+                    ephemeral=True,
+                )
+            if not await aviso_fora_de_servico(interaction):
+                return
+            if deposito["status"] == "creditado":
+                return await interaction.response.send_message(
+                    embed=criar_embed("ℹ️ Já creditado", "Este depósito já foi confirmado.", "Cinza Escuro"),
+                    ephemeral=True,
+                )
+            if float(deposito["valor"] or 0) <= 0:
+                return await interaction.response.send_message(
+                    embed=criar_embed("⚠️ Valor não informado", "Peça ao jogador para preencher o valor em **Abrir Depósito** primeiro.", "Amarelo"),
+                    ephemeral=True,
+                )
+            if (not deposito["assumido_por"] or deposito["assumido_por"] != interaction.user.id) and not await e_gerencia(interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Só quem assumiu ou gerência", "Assuma este depósito ou peça ao Dono/Gerente.", "Vermelho"),
+                    ephemeral=True,
+                )
+            embed = criar_embed(
+                "📄 Comprovante de Depósito Solicitado",
+                f"{mencao(deposito['user_id'])}, envie **neste canal** a imagem do comprovante PIX.\n\n"
+                f"• **Valor esperado:** `{formatar_moeda(deposito['valor'])}`\n"
+                f"-# Após conferir na conta PIX, valide no seletor abaixo",
+                "Cinza Escuro",
+            )
+            await interaction.response.send_message(
+                content=mencao(deposito["user_id"]), embed=embed, view=DepositoComprovanteView(deposito["id"])
+            )
+            return await registrar_log_suporte(
+                interaction.guild, "💰 DEPÓSITO", "📄 Comprovante solicitado",
+                f"{mencao(interaction.user.id)} pediu comprovante de depósito a {mencao(deposito['user_id'])} — `{formatar_moeda(deposito['valor'])}`.",
+                "Azul",
+            )
 
-        valor_dep = float(deposito["valor"] or 0)
-        embed_pix, arquivo_pix, view_pix = await montar_cobranca_pix_responsavel(
-            interaction.guild.id,
-            interaction.user.id,
-            valor=valor_dep,
-            titulo=f"💰 Depósito Assumido — PIX de {interaction.user.display_name}",
-            mencao_destino=mencao(deposito["user_id"]),
-            rodape=f"Fire Force • Depósito #{deposito['id']}",
-            nome_arquivo="deposito_pix.png",
-        )
-        kwargs_envio = {"content": mencao(deposito["user_id"]), "embed": embed_pix}
-        if arquivo_pix:
-            kwargs_envio["file"] = arquivo_pix
-        if view_pix:
-            kwargs_envio["view"] = view_pix
-        await interaction.followup.send(**kwargs_envio)
-        await registrar_log_suporte(interaction.guild, "💰 DEPÓSITO", "🙋 Depósito assumido (PIX enviado)",
-                                    f"{mencao(interaction.user.id)} assumiu o depósito `#{deposito['id']}` e enviou seu PIX automaticamente.", "Verde")
-
-    @discord.ui.button(label="Confirmar pelo financeiro", style=discord.ButtonStyle.green, emoji="✅")
-    async def manual(self, interaction: discord.Interaction, button: discord.ui.Button):
-        deposito=await self._deposito(interaction.channel.id)
-        if not deposito or not await atendente_autorizado("suporte",interaction.user):
-            return await interaction.response.send_message(embed=criar_embed("❌ Sem Permissão","Só suporte, dono ou gerente pode confirmar depósito.","Vermelho"),ephemeral=True)
-        if not await aviso_fora_de_servico(interaction): return
-        if deposito["status"] not in ("aguardando", "na_janela"):
-            return await interaction.response.send_message(embed=criar_embed("ℹ️ Depósito encerrado","Este depósito foi resolvido/cancelado e não pode ser confirmado.","Amarelo"),ephemeral=True)
-        if float(deposito["valor"] or 0)<=0:
-            return await interaction.response.send_message(embed=criar_embed("⚠️ Falta o valor","O jogador precisa abrir/preencher o depósito primeiro.","Amarelo"),ephemeral=True)
-        if (not deposito["assumido_por"] or deposito["assumido_por"]!=interaction.user.id) and not await e_gerencia(interaction.user):
-            return await interaction.response.send_message(embed=criar_embed("🔒 Só quem assumiu ou gerência","Assuma este depósito ou peça ao dono/gerente.","Vermelho"),ephemeral=True)
-        await interaction.response.defer(ephemeral=True,thinking=True)
-        saldo=await creditar_deposito(interaction.guild,dict(deposito),"confirmação manual pela equipe")
-        await interaction.followup.send(embed=criar_embed("✅ Depósito confirmado",f"Crédito manual registrado. Saldo atualizado: `{formatar_moeda(saldo)}`.","Esmeralda"),ephemeral=True)
-
-    @discord.ui.button(label="Pedir comprovante", style=discord.ButtonStyle.blurple, emoji="📄")
-    async def comprovante(self, interaction: discord.Interaction, button: discord.ui.Button):
-        deposito=await self._deposito(interaction.channel.id)
-        if not deposito or not await atendente_autorizado("suporte",interaction.user):
-            return await interaction.response.send_message(embed=criar_embed("❌ Sem Permissão","Só suporte, dono ou gerente pode solicitar comprovante de depósito.","Vermelho"),ephemeral=True)
-        if not await aviso_fora_de_servico(interaction): return
-        if deposito["status"]=="creditado":
-            return await interaction.response.send_message(embed=criar_embed("ℹ️ Já creditado","Este depósito já foi confirmado.","Amarelo"),ephemeral=True)
-        if float(deposito["valor"] or 0)<=0:
-            return await interaction.response.send_message(embed=criar_embed("⚠️ Falta o valor","Peça ao jogador para abrir/preencher o depósito primeiro.","Amarelo"),ephemeral=True)
-        if (not deposito["assumido_por"] or deposito["assumido_por"]!=interaction.user.id) and not await e_gerencia(interaction.user):
-            return await interaction.response.send_message(embed=criar_embed("🔒 Só quem assumiu ou gerência","Assuma este depósito ou peça ao dono/gerente.","Vermelho"),ephemeral=True)
-        embed=criar_embed("📄 COMPROVANTE DO DEPÓSITO",
-            f"{mencao(deposito['user_id'])}, envie **neste canal** a imagem do comprovante PIX.\n\n"
-            f"> 💰 Valor esperado: `{formatar_moeda(deposito['valor'])}`\n"
-            f"> Confira valor, data e pagador antes de decidir.\n"
-            f"> Só quem assumiu ou dono/gerente confirma ou reprova o print.","Azul")
-        await interaction.response.send_message(content=mencao(deposito["user_id"]),embed=embed,
-                                                view=DepositoComprovanteView(deposito["id"]))
-        await registrar_log_suporte(interaction.guild,"💰 DEPÓSITO","📄 Comprovante solicitado",
-            f"{mencao(interaction.user.id)} pediu comprovante de depósito a {mencao(deposito['user_id'])} — `{formatar_moeda(deposito['valor'])}`.","Azul")
-
-    @discord.ui.button(label="Fechar atendimento", style=discord.ButtonStyle.red, emoji="🔒")
-    async def fechar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await atendente_autorizado("suporte", interaction.user):
-            return await interaction.response.send_message(
-                embed=criar_embed("❌ Sem Permissão", "Só a equipe fecha o atendimento de depósito.", "Vermelho"),
-                ephemeral=True)
-        deposito = await self._deposito(interaction.channel.id)
-        if deposito and deposito["status"] != "creditado":
-            async with aiosqlite.connect(DATABASE_FILE) as db:
-                await db.execute("UPDATE depositos SET status = 'cancelado' WHERE id = ?", (deposito["id"],))
-                await db.commit()
-        await interaction.response.send_message(
-            embed=criar_embed("🔒 Atendimento encerrado", "Este canal será fechado em 10 segundos.", "Cinza Escuro"))
-        await asyncio.sleep(10)
+        if acao == "fechar":
+            deposito = await self._deposito(interaction.channel.id)
+            eh_equipe = await atendente_autorizado("suporte", interaction.user)
+            eh_dono_dep = bool(deposito and interaction.user.id == deposito["user_id"] and deposito["status"] != "creditado")
+            if not eh_equipe and not eh_dono_dep:
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Sem Permissão", "Apenas a equipe (ou o solicitante antes da conclusão) pode encerrar este canal.", "Vermelho"),
+                    ephemeral=True,
+                )
+            if deposito and deposito["status"] != "creditado":
+                async with aiosqlite.connect(DATABASE_FILE) as db:
+                    await db.execute("UPDATE depositos SET status = 'cancelado' WHERE id = ?", (deposito["id"],))
+                    await db.commit()
+                marcar_sujo()
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Atendimento Encerrado", "Este canal será fechado em 3 segundos...", "Cinza Escuro")
+            )
+            await asyncio.sleep(3)
+            await _apagar_canal_seguro(interaction.channel, "Canal de depósito encerrado")
         try:
             await interaction.channel.delete()
         except Exception:
@@ -11251,70 +11883,88 @@ class RankingView(discord.ui.View):
 
 
 class RankingResultadoView(discord.ui.View):
-    """Private per-user Top 100 with its own category selector and refresh button."""
-    def __init__(self,categoria:str="saldo"):
+    """Top 100 individual com seletor minimalista único (incluindo atualização)."""
+
+    def __init__(self, categoria: str = "saldo"):
         super().__init__(timeout=600)
-        self.categoria=categoria
+        self.categoria = categoria
 
-    @discord.ui.select(placeholder="Trocar de ranking (só você vê)...",options=[
-        discord.SelectOption(label="Mais saldo",value="saldo",emoji="💰"),
-        discord.SelectOption(label="Mais transferências enviadas",value="transferencias",emoji="📤"),
-        discord.SelectOption(label="Mais depósitos",value="depositos",emoji="⬆️"),
-        discord.SelectOption(label="Mais ganhos (saldo dado)",value="ganhos",emoji="🎁"),
-        discord.SelectOption(label="Mais vitórias (top 1)",value="vitórias",emoji="🏆"),
-        discord.SelectOption(label="Ganhos dos ADMs (PIX)",value="comissoes",emoji="🛡️"),
-        discord.SelectOption(label="Carteira de trabalho (Suporte)",value="trabalho",emoji="💼"),
-    ])
-    async def selecionar(self,interaction:discord.Interaction,select:discord.ui.Select):
-        self.categoria=select.values[0]
-        await interaction.response.edit_message(embed=await montar_embed_ranking(interaction.guild,self.categoria,100),
-                                                view=RankingResultadoView(self.categoria))
-
-    @discord.ui.button(label="Atualizar ranking",style=discord.ButtonStyle.gray,emoji="🔄",row=1)
-    async def atualizar(self,interaction:discord.Interaction,button:discord.ui.Button):
-        await interaction.response.edit_message(embed=await montar_embed_ranking(interaction.guild,self.categoria,100),
-                                                view=RankingResultadoView(self.categoria))
+    @discord.ui.select(
+        placeholder="🏆 Trocar ou atualizar ranking (só você vê)...",
+        options=[
+            discord.SelectOption(label="Atualizar Ranking Atual", value="_refresh", emoji="🔄"),
+            discord.SelectOption(label="Mais Saldo", value="saldo", emoji="💰"),
+            discord.SelectOption(label="Mais Transferências Enviadas", value="transferencias", emoji="📤"),
+            discord.SelectOption(label="Mais Depósitos", value="depositos", emoji="⬆️"),
+            discord.SelectOption(label="Mais Ganhos (Saldo Dado)", value="ganhos", emoji="🎁"),
+            discord.SelectOption(label="Mais Vitórias (Top 1)", value="vitórias", emoji="🏆"),
+            discord.SelectOption(label="Ganhos dos ADMs (PIX)", value="comissoes", emoji="🛡️"),
+            discord.SelectOption(label="Carteira de Trabalho (Suporte)", value="trabalho", emoji="💼"),
+        ],
+    )
+    async def selecionar(self, interaction: discord.Interaction, select: discord.ui.Select):
+        escolha = select.values[0]
+        if escolha != "_refresh":
+            self.categoria = escolha
+        await interaction.response.edit_message(
+            embed=await montar_embed_ranking(interaction.guild, self.categoria, 100),
+            view=RankingResultadoView(self.categoria),
+        )
 
 
 # ---------- SAQUE v2 (tipo de chave + nome) ----------
 
 class SaqueTipoView(discord.ui.View):
+    """Seletor minimalista único para escolher ou reutilizar chave PIX no saque."""
+
     def __init__(self, saldo: float, tipo_carteira: str):
         super().__init__(timeout=180)
         self.saldo = saldo
         self.tipo_carteira = tipo_carteira
 
-    @discord.ui.select(placeholder="Escolha o tipo da sua chave PIX...", options=[
-        discord.SelectOption(label="CPF/CNPJ", value="cpf", emoji="🪪"),
-        discord.SelectOption(label="Celular", value="telefone", emoji="📱"),
-        discord.SelectOption(label="E-mail", value="email", emoji="✉️"),
-        discord.SelectOption(label="Chave aleatória", value="aleatoria", emoji="🔑"),
-    ])
+    @discord.ui.select(
+        placeholder="💸 Escolha como receber seu saque PIX...",
+        options=[
+            discord.SelectOption(
+                label="Usar Minha Chave PIX Salva",
+                value="salva",
+                emoji="⭐",
+                description="Preenche automaticamente com a última chave cadastrada",
+            ),
+            discord.SelectOption(label="CPF / CNPJ", value="cpf", emoji="🪪"),
+            discord.SelectOption(label="Celular", value="telefone", emoji="📱"),
+            discord.SelectOption(label="E-mail", value="email", emoji="✉️"),
+            discord.SelectOption(label="Chave Aleatória", value="aleatoria", emoji="🔑"),
+        ],
+    )
     async def tipo(self, interaction: discord.Interaction, select: discord.ui.Select):
+        escolha = select.values[0]
         async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory = aiosqlite.Row
             salva = await (await db.execute(
                 "SELECT * FROM chaves_salvas WHERE user_id = ? AND guild_id = ?",
-                (interaction.user.id, interaction.guild.id))).fetchone()
-        await interaction.response.send_modal(SaqueModal(
-            tipo_chave=select.values[0], tipo_carteira=self.tipo_carteira,
-            chave_salva=(salva["chave"] if salva and salva["tipo"] == select.values[0] else ""),
-            titular_salvo=(salva["titular"] if salva else "")))
+                (interaction.user.id, interaction.guild.id),
+            )).fetchone()
 
-    @discord.ui.button(label="Usar minha chave salva", style=discord.ButtonStyle.green, emoji="⭐", row=1)
-    async def usar_salva(self, interaction: discord.Interaction, button: discord.ui.Button):
-        async with aiosqlite.connect(DATABASE_FILE) as db:
-            db.row_factory = aiosqlite.Row
-            salva = await (await db.execute(
-                "SELECT * FROM chaves_salvas WHERE user_id = ? AND guild_id = ?",
-                (interaction.user.id, interaction.guild.id))).fetchone()
-        if not salva:
-            return await interaction.response.send_message(
-                embed=criar_embed("⭐ Sem chave salva", "Escolha o tipo e cadastre a sua chave uma vez.", "Amarelo"),
-                ephemeral=True)
+        if escolha == "salva":
+            if not salva:
+                return await interaction.response.send_message(
+                    embed=criar_embed("⭐ Nenhuma chave salva ainda", "Selecione o tipo da sua chave (CPF, Celular, E-mail ou Aleatória) para salvá-la na primeira vez.", "Amarelo"),
+                    ephemeral=True,
+                )
+            return await interaction.response.send_modal(SaqueModal(
+                tipo_chave=salva["tipo"],
+                tipo_carteira=self.tipo_carteira,
+                chave_salva=salva["chave"],
+                titular_salvo=salva["titular"] or "",
+            ))
+
         await interaction.response.send_modal(SaqueModal(
-            tipo_chave=salva["tipo"], tipo_carteira=self.tipo_carteira,
-            chave_salva=salva["chave"], titular_salvo=salva["titular"] or ""))
+            tipo_chave=escolha,
+            tipo_carteira=self.tipo_carteira,
+            chave_salva=(salva["chave"] if salva and salva["tipo"] == escolha else ""),
+            titular_salvo=(salva["titular"] if salva else ""),
+        ))
 
 
 async def _resolver_nome_pix(user_id: int, guild_id: int) -> str:
@@ -11771,6 +12421,34 @@ async def cmd_trabalho(interaction: discord.Interaction, usuario: Optional[disco
 
 
 # ==================== PARCERIAS (🤝) & DIVULGAÇÃO PAGA (📣) — v12.0 ====================
+
+async def avisar_jogador(guild: Optional[discord.Guild], user_id: int, embed: discord.Embed) -> bool:
+    """Envia aviso por DM ao usuário de forma segura (nunca interrompe o fluxo caso DM esteja fechada)."""
+    if not user_id:
+        return False
+    try:
+        alvo = (await membro_do_guild(guild, int(user_id))) if guild else None
+        if not alvo:
+            alvo = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
+        if alvo:
+            await alvo.send(embed=embed)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _apagar_canal_seguro(canal, motivo: str = "Atendimento encerrado") -> bool:
+    """Remove um canal privado com tratamento seguro de erros e log diagnóstico."""
+    if not canal or not hasattr(canal, "delete"):
+        return False
+    try:
+        await canal.delete(reason=motivo[:250])
+        return True
+    except Exception as erro:
+        _log_arquivo(f"[CANAL] falha ao apagar canal={getattr(canal, 'id', 0)}: {type(erro).__name__}: {erro}")
+        return False
+
 
 def _normalizar_convite_url(link: str) -> str:
     """Normaliza links discord.gg/... para https://discord.gg/... para botões Link."""
@@ -12350,7 +13028,7 @@ class EscolherValorPixLiberadoView(discord.ui.View):
 
 
 class ParceriaTicketView(discord.ui.View):
-    """Controles exclusivos de Dono/Gerente dentro do ticket de parceria.
+    """Controles minimalistas dentro do ticket de parceria.
     Após clicar em Assumir, libera a nova função 'Liberar Chave PIX' no painel."""
 
     def __init__(self, parceria_id: int, assumido: bool = False):
@@ -12362,7 +13040,7 @@ class ParceriaTicketView(discord.ui.View):
                 label="Assumir Atendimento",
                 value="assumir",
                 emoji="🙋",
-                description="Assumir esta parceria (habilita Liberar Chave PIX no painel)",
+                description="Dono/Gerente assume (habilita Liberar Chave PIX)",
             ),
         ]
         if self.assumido:
@@ -12371,7 +13049,7 @@ class ParceriaTicketView(discord.ui.View):
                     label="Liberar Chave PIX",
                     value="liberar_pix",
                     emoji="🔓",
-                    description="Envia sua chave /pix (pergunta se tem valor específico ou não)",
+                    description="Envia sua chave /pix (pergunta se tem valor específico)",
                 )
             )
         opcoes.extend([
@@ -12379,7 +13057,7 @@ class ParceriaTicketView(discord.ui.View):
                 label="Aprovar e Publicar na Vitrine",
                 value="aprovar",
                 emoji="✅",
-                description="Aprova a parceria e adiciona automaticamente na Vitrine",
+                description="Aprova a parceria, publica na Vitrine e fecha o canal",
             ),
             discord.SelectOption(
                 label="Editar Ficha Antes de Aprovar",
@@ -12393,29 +13071,72 @@ class ParceriaTicketView(discord.ui.View):
                 emoji="❌",
                 description="Recusa a solicitação e encerra este canal",
             ),
+            discord.SelectOption(
+                label="Encerrar Canal",
+                value="fechar",
+                emoji="🔒",
+                description="Fecha e apaga este canal de parceria agora",
+            ),
         ])
         sel = discord.ui.Select(
             custom_id=f"ff_parc_tk_{self.parceria_id}",
-            placeholder="⚙️ Gerenciar Parceria (Dono / Gerente)...",
+            placeholder="⚙️ Gerenciar Parceria...",
             options=opcoes,
         )
         sel.callback = self._decidir
         self.add_item(sel)
 
     async def _decidir(self, interaction: discord.Interaction):
-        if not await e_dono_ou_gerente(interaction.user):
-            return await interaction.response.send_message(
-                embed=criar_embed("🔒 Exclusivo Dono/Gerente", "Apenas **Dono** ou **Gerente** gerenciam parcerias.", "Vermelho"),
-                ephemeral=True,
-            )
         acao = interaction.data["values"][0]
         async with aiosqlite.connect(DATABASE_FILE) as db:
             db.row_factory = aiosqlite.Row
             parceria = await (await db.execute("SELECT * FROM parceiros WHERE id = ?", (self.parceria_id,))).fetchone()
         if not parceria:
+            # Mesmo se o registro não existir mais, permite que Dono/Gerente limpe o canal órfão
+            if acao == "fechar" and await e_dono_ou_gerente(interaction.user):
+                await interaction.response.send_message("🔒 Encerrando canal...", ephemeral=True)
+                await _apagar_canal_seguro(interaction.channel, "Canal de parceria órfão encerrado")
+                return
             return await interaction.response.send_message("❌ Registro não encontrado.", ephemeral=True)
+
         p = dict(parceria)
+        eh_vip = await e_dono_ou_gerente(interaction.user)
         ja_assumido = int(p.get("assumido_por") or 0)
+
+        if acao == "fechar":
+            if not eh_vip and interaction.user.id != int(p.get("solicitante_id") or 0):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Sem Permissão", "Apenas o solicitante, Dono ou Gerente podem encerrar este canal.", "Vermelho"),
+                    ephemeral=True,
+                )
+            await interaction.response.defer(ephemeral=True)
+            if p.get("status") == "pendente":
+                async with aiosqlite.connect(DATABASE_FILE) as db:
+                    await db.execute("UPDATE parceiros SET status = 'cancelada' WHERE id = ?", (self.parceria_id,))
+                    await db.commit()
+                marcar_sujo()
+            await interaction.followup.send(
+                embed=criar_embed("🔒 Encerrando Canal", "Este canal será apagado em 2 segundos...", "Cinza Escuro"),
+                ephemeral=True,
+            )
+            await asyncio.sleep(2)
+            apagou = await _apagar_canal_seguro(interaction.channel, "Canal de parceria encerrado")
+            if not apagou:
+                await interaction.followup.send(
+                    embed=criar_embed("⚠️ Permissão necessária", "Verifique se o cargo do bot possui a permissão **Gerenciar Canais** nesta categoria.", "Amarelo"),
+                    ephemeral=True,
+                )
+            return
+
+        if not eh_vip:
+            try:
+                await interaction.message.edit(view=ParceriaTicketView(self.parceria_id, assumido=bool(ja_assumido)))
+            except Exception:
+                pass
+            return await interaction.response.send_message(
+                embed=criar_embed("🔒 Exclusivo Dono/Gerente", "Apenas **Dono** ou **Gerente** gerenciam esta opção.", "Vermelho"),
+                ephemeral=True,
+            )
 
         if acao == "assumir":
             if ja_assumido and ja_assumido != interaction.user.id:
@@ -12436,7 +13157,7 @@ class ParceriaTicketView(discord.ui.View):
                 embed=criar_embed(
                     "🙋 Parceria Assumida",
                     f"{interaction.user.mention} assumiu este atendimento.\n"
-                    f"-# 🔓 A função **Liberar Chave PIX** já está disponível no painel acima caso precise enviar seu PIX.",
+                    f"-# 🔓 A função **Liberar Chave PIX** já está disponível no painel acima.",
                     "Esmeralda",
                 )
             )
@@ -12509,7 +13230,7 @@ class ParceriaTicketView(discord.ui.View):
                     except Exception:
                         pass
 
-            ok_vit, msg_vit = await atualizar_vitrine_parceiros(interaction.guild)
+            _, msg_vit = await atualizar_vitrine_parceiros(interaction.guild)
             if p.get("solicitante_id"):
                 await avisar_jogador(
                     interaction.guild,
@@ -12526,15 +13247,11 @@ class ParceriaTicketView(discord.ui.View):
                 "Esmeralda",
             )
             await interaction.followup.send(
-                embed=criar_embed("✅ Parceria Aprovada", f"{msg_vit}\nFechando o ticket em 4 segundos...", "Esmeralda"),
+                embed=criar_embed("✅ Parceria Aprovada", f"{msg_vit}\nEncerrando o canal em 3 segundos...", "Esmeralda"),
                 ephemeral=True,
             )
-            await asyncio.sleep(4)
-            if isinstance(interaction.channel, discord.TextChannel):
-                try:
-                    await interaction.channel.delete(reason="Parceria aprovada")
-                except Exception:
-                    pass
+            await asyncio.sleep(3)
+            await _apagar_canal_seguro(interaction.channel, "Parceria aprovada")
             return
 
         if acao == "recusar":
@@ -12557,15 +13274,11 @@ class ParceriaTicketView(discord.ui.View):
                     ),
                 )
             await interaction.followup.send(
-                embed=criar_embed("❌ Solicitação recusada", "Canal será encerrado em 3 segundos.", "Amarelo"),
+                embed=criar_embed("❌ Solicitação Recusada", "Canal será encerrado em 2 segundos...", "Cinza Escuro"),
                 ephemeral=True,
             )
-            await asyncio.sleep(3)
-            if isinstance(interaction.channel, discord.TextChannel):
-                try:
-                    await interaction.channel.delete(reason="Parceria recusada")
-                except Exception:
-                    pass
+            await asyncio.sleep(2)
+            await _apagar_canal_seguro(interaction.channel, "Parceria recusada")
 
 
 class ConfigurarNossaOrgModal(discord.ui.Modal, title="📝 Ficha da Nossa Organização"):
@@ -13160,7 +13873,10 @@ class DivulgacaoTicketView(discord.ui.View):
 
         if acao == "fechar":
             if not eh_vip and interaction.user.id != int(d["solicitante_id"]):
-                return await interaction.response.send_message("❌ Sem permissão para fechar este canal.", ephemeral=True)
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Sem Permissão", "Apenas o contratante, Dono ou Gerente podem encerrar este canal.", "Vermelho"),
+                    ephemeral=True,
+                )
             await interaction.response.defer(ephemeral=True)
             async with aiosqlite.connect(DATABASE_FILE) as db:
                 await db.execute(
@@ -13169,13 +13885,12 @@ class DivulgacaoTicketView(discord.ui.View):
                 )
                 await db.commit()
             marcar_sujo()
-            await interaction.followup.send("🔒 Encerrando canal em 3 segundos...", ephemeral=True)
-            await asyncio.sleep(3)
-            if isinstance(interaction.channel, discord.TextChannel):
-                try:
-                    await interaction.channel.delete(reason="Divulgação encerrada")
-                except Exception:
-                    pass
+            await interaction.followup.send(
+                embed=criar_embed("🔒 Encerrando Canal", "Este canal será apagado em 2 segundos...", "Cinza Escuro"),
+                ephemeral=True,
+            )
+            await asyncio.sleep(2)
+            await _apagar_canal_seguro(interaction.channel, "Divulgação encerrada")
 
 
 @bot.tree.command(name="divulgacao", description="📣 Publicar painel minimalista para contratação de divulgação paga (Dono e Gerente)")
@@ -13273,9 +13988,20 @@ async def _inicializar_bot():
                     pass
 
         slots_pendentes = await (await db.execute("SELECT * FROM slots WHERE confirmado = 0")).fetchall()
+        bot.add_view(PagamentoAcaoView())
         for s in slots_pendentes:
-            bot.add_view(PagamentoAcaoView())
             bot.add_view(ComprovanteAcaoView(s["id"]))
+            for guild in bot.guilds:
+                canal_slot = guild.get_channel(s["canal_pag"]) if s["canal_pag"] else None
+                if not canal_slot:
+                    continue
+                try:
+                    async for msg_s in canal_slot.history(limit=15, oldest_first=True):
+                        if msg_s.author == guild.me and msg_s.embeds and msg_s.components:
+                            await msg_s.edit(view=PagamentoAcaoView())
+                            break
+                except Exception:
+                    pass
         bot.add_view(VagaCandidaturaView())
 
         saques_abertos = await (await db.execute(
@@ -13283,30 +14009,48 @@ async def _inicializar_bot():
         for linha_saque in saques_abertos:
             bot.add_view(SaqueAcaoView(linha_saque["id"]))
         tickets_saque = await (await db.execute(
-            "SELECT id FROM saques WHERE canal_ticket_id IS NOT NULL")).fetchall()
+            "SELECT id, canal_ticket_id, msg_ticket_id FROM saques WHERE canal_ticket_id IS NOT NULL")).fetchall()
         for linha_saque in tickets_saque:
             bot.add_view(SaqueTicketView(linha_saque["id"]))
+            for guild in bot.guilds:
+                canal_sq = guild.get_channel(linha_saque["canal_ticket_id"]) if linha_saque["canal_ticket_id"] else None
+                if not canal_sq or not linha_saque["msg_ticket_id"]:
+                    continue
+                try:
+                    msg_sq = await canal_sq.fetch_message(int(linha_saque["msg_ticket_id"]))
+                    await msg_sq.edit(view=SaqueTicketView(linha_saque["id"]))
+                except Exception:
+                    pass
 
-        # 🎧 atendimentos abertos voltam funcionando depois de qualquer restart
+        # 🎧 atendimentos abertos voltam funcionando e atualizados com o seletor minimalista
         tickets_abertos = await (await db.execute(
-            "SELECT id FROM tickets WHERE status = 'aberto'")).fetchall()
+            "SELECT id, channel_id FROM tickets WHERE status = 'aberto'")).fetchall()
         for linha_ticket in tickets_abertos:
             bot.add_view(TicketView(linha_ticket["id"]))
+            for guild in bot.guilds:
+                canal_tk = guild.get_channel(linha_ticket["channel_id"]) if linha_ticket["channel_id"] else None
+                if not canal_tk:
+                    continue
+                try:
+                    async for msg_tk in canal_tk.history(limit=15, oldest_first=True):
+                        if msg_tk.author == guild.me and msg_tk.embeds and msg_tk.components:
+                            await msg_tk.edit(view=TicketView(linha_ticket["id"]))
+                            break
+                except Exception:
+                    pass
 
         depositos_abertos = await (await db.execute(
             "SELECT id, canal_id FROM depositos WHERE status IN ('aguardando', 'na_janela')")).fetchall()
         for linha_deposito in depositos_abertos:
             bot.add_view(DepositoCanalView(linha_deposito["id"]))
             bot.add_view(DepositoComprovanteView(linha_deposito["id"]))
-            # Atualiza também o painel já publicado nos depósitos abertos, para que apareça
-            # o novo botão de solicitar comprovante sem o usuário precisar abrir outro depósito.
             for guild in bot.guilds:
-                canal_dep=guild.get_channel(linha_deposito["canal_id"]) if linha_deposito["canal_id"] else None
-                if not canal_dep: continue
+                canal_dep = guild.get_channel(linha_deposito["canal_id"]) if linha_deposito["canal_id"] else None
+                if not canal_dep:
+                    continue
                 try:
-                    async for msg_dep in canal_dep.history(limit=30,oldest_first=True):
-                        if (msg_dep.author==guild.me and msg_dep.embeds
-                                and (msg_dep.embeds[0].title or "").startswith("💰 Depósito na carteira")):
+                    async for msg_dep in canal_dep.history(limit=20, oldest_first=True):
+                        if msg_dep.author == guild.me and msg_dep.embeds and msg_dep.components:
                             await msg_dep.edit(view=DepositoCanalView(linha_deposito["id"]))
                             break
                 except Exception:
@@ -13315,14 +14059,38 @@ async def _inicializar_bot():
         bot.add_view(RankingView("saldo"))
 
         parcerias_abertas = await (await db.execute(
-            "SELECT id, assumido_por FROM parceiros WHERE status = 'pendente'")).fetchall()
+            "SELECT id, assumido_por, canal_ticket_id FROM parceiros WHERE status = 'pendente'")).fetchall()
         for lp in parcerias_abertas:
-            bot.add_view(ParceriaTicketView(lp["id"], assumido=bool(lp["assumido_por"])))
+            view_lp = ParceriaTicketView(lp["id"], assumido=bool(lp["assumido_por"]))
+            bot.add_view(view_lp)
+            for guild in bot.guilds:
+                canal_lp = guild.get_channel(lp["canal_ticket_id"]) if lp["canal_ticket_id"] else None
+                if not canal_lp:
+                    continue
+                try:
+                    async for msg_lp in canal_lp.history(limit=15, oldest_first=True):
+                        if msg_lp.author == guild.me and msg_lp.embeds and msg_lp.components:
+                            await msg_lp.edit(view=ParceriaTicketView(lp["id"], assumido=bool(lp["assumido_por"])))
+                            break
+                except Exception:
+                    pass
 
         divulgacoes_abertas = await (await db.execute(
-            "SELECT id, assumido_por FROM divulgacoes WHERE status IN ('aberto', 'publicada')")).fetchall()
+            "SELECT id, assumido_por, canal_ticket_id FROM divulgacoes WHERE status IN ('aberto', 'publicada')")).fetchall()
         for ld in divulgacoes_abertas:
-            bot.add_view(DivulgacaoTicketView(ld["id"], assumido=bool(ld["assumido_por"])))
+            view_ld = DivulgacaoTicketView(ld["id"], assumido=bool(ld["assumido_por"]))
+            bot.add_view(view_ld)
+            for guild in bot.guilds:
+                canal_ld = guild.get_channel(ld["canal_ticket_id"]) if ld["canal_ticket_id"] else None
+                if not canal_ld:
+                    continue
+                try:
+                    async for msg_ld in canal_ld.history(limit=15, oldest_first=True):
+                        if msg_ld.author == guild.me and msg_ld.embeds and msg_ld.components:
+                            await msg_ld.edit(view=DivulgacaoTicketView(ld["id"], assumido=bool(ld["assumido_por"])))
+                            break
+                except Exception:
+                    pass
 
     for guild in bot.guilds:
         try:
