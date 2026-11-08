@@ -92,7 +92,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.2"
+VERSAO_BOT = "13.3"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -114,6 +114,7 @@ ARQUIVO_LOG = "fireforce.log"
 LOG_TAMANHO_MAX = 2 * 1024 * 1024
 TICKET_FECHAR_SEGUNDOS = 15      # espera antes de apagar o canal do atendimento
 DEPOSITO_FECHAR_SEGUNDOS = 20    # espera antes de apagar o canal do depósito
+PAGAMENTO_APROVADO_FECHAR_SEGUNDOS = 15  # espera antes de apagar o canal de pagamento aprovado
 
 _CACHE_LOGS = {}                # guild_id -> (canal_id, timestamp)
 _ULTIMO_AVISO_RESERVA = {}      # guild_id -> timestamp do aviso de caixa baixo
@@ -5807,6 +5808,152 @@ async def estornar_moedas_reserva_se_necessario(guild, slot_dict: dict, motivo: 
     return True
 
 
+_CANAIS_PAG_FECHANDO: set = set()
+
+
+async def _tarefa_apagar_canal_pag_aprovado(
+    guild: discord.Guild,
+    slot_id: int,
+    canal_pag_id: int,
+    canal_tabela_id: Optional[int],
+    rotulo: str,
+    numero_final: int,
+    horario_txt: str,
+    espera_seg: float = PAGAMENTO_APROVADO_FECHAR_SEGUNDOS,
+):
+    """Aguarda a contagem regressiva, arquiva a transcrição nos logs privados, apaga o canal de pagamento e limpa canal_pag."""
+    chave = int(canal_pag_id or 0)
+    if chave <= 0 or chave in _CANAIS_PAG_FECHANDO:
+        return
+    if canal_tabela_id and int(canal_tabela_id) == chave:
+        return
+    _CANAIS_PAG_FECHANDO.add(chave)
+    try:
+        if espera_seg > 0:
+            await asyncio.sleep(espera_seg)
+        canal_alvo = guild.get_channel(chave) if guild else None
+        if canal_alvo:
+            await _apagar_canal_seguro(
+                canal_alvo,
+                f"Pagamento aprovado ({rotulo} #{numero_final} • {horario_txt}) — atendimento migrado para o canal do diário",
+            )
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute("UPDATE slots SET canal_pag = NULL WHERE id = ?", (int(slot_id),))
+            await db.commit()
+        marcar_sujo()
+    except Exception as erro:
+        _log_arquivo(f"[PAGAMENTO] falha ao encerrar canal aprovado slot={slot_id} canal={chave}: {erro}")
+    finally:
+        _CANAIS_PAG_FECHANDO.discard(chave)
+
+
+async def _notificar_dm_e_agendar_fechamento_pag(
+    guild: discord.Guild,
+    slot_dict: dict,
+    horario_dict: dict,
+    numero_final: int,
+    canal_pag,
+    canal_tabela_id: Optional[int],
+    nicks_txt: str = "",
+    detalhe_pag: str = "",
+):
+    """Remove seletores ativos, envia comprovante oficial na DM do comprador e agenda exclusão do canal de pagamento."""
+    tipo = str(horario_dict.get("tipo") or "solo").lower()
+    categoria = str(horario_dict.get("categoria") or "premium")
+    hora_str = str(horario_dict.get("horario") or "--:--")
+    rotulo = texto_slot(tipo)
+    canal_tabela = guild.get_channel(int(canal_tabela_id)) if (guild and canal_tabela_id) else None
+    ref_sala = canal_tabela.mention if canal_tabela else "`canal oficial do diário`"
+
+    # 1. Remove componentes interativos antigos do canal de pagamento durante a contagem
+    if canal_pag and hasattr(canal_pag, "history"):
+        try:
+            me = getattr(guild, "me", None)
+            async for msg in canal_pag.history(limit=10):
+                if (not me or msg.author == me) and getattr(msg, "components", None):
+                    await msg.edit(view=None)
+        except Exception:
+            pass
+
+    # 2. Envia recibo completo na DM do comprador (sem bloquear caso DM esteja fechada)
+    dica_equipe = ""
+    if JOGADORES_POR_LOTE.get(tipo, 1) > 1:
+        dica_equipe = (
+            f"\n👥 **Jogando em equipe?** Dentro de {ref_sala}, abra o menu da sala e selecione "
+            f"**\"Liberar Visão p/ Membro da Minha Line\"** para seus amigos verem a tabela e o ID/Senha!"
+        )
+    jog_linha = f"• **Jogador(es):** {nicks_txt}\n" if nicks_txt else ""
+    embed_dm = criar_embed(
+        f"✅ {rotulo} #{numero_final} Confirmada! • Comprovante Oficial",
+        f"Sua inscrição no diário foi aprovada e sua posição já está na Tabela Oficial!\n\n"
+        f"• **Diário:** {formatar_rotulo_diario(tipo, categoria)} — `{hora_str}`\n"
+        f"• **{rotulo}:** `#{numero_final}`\n"
+        f"{jog_linha}"
+        f"{detalhe_pag}"
+        f"• **Canal Oficial da Sala:** {ref_sala}\n"
+        f"{dica_equipe}\n\n"
+        f"📩 O **ID e a Senha** da sala também serão enviados aqui na sua DM **5 minutos antes** do início.",
+        "Vermelho Escuro",
+        footer=f"Fire Force • {rotulo} #{numero_final} confirmada",
+    )
+    try:
+        await avisar_jogador(guild, int(slot_dict["comprador_id"]), embed_dm)
+    except Exception:
+        pass
+
+    # 3. Agenda arquivamento nos logs + exclusão automática do canal de pagamento em 15s
+    cid_pag = int(getattr(canal_pag, "id", 0) or slot_dict.get("canal_pag") or 0)
+    if cid_pag > 0:
+        asyncio.create_task(
+            _tarefa_apagar_canal_pag_aprovado(
+                guild=guild,
+                slot_id=int(slot_dict["id"]),
+                canal_pag_id=cid_pag,
+                canal_tabela_id=canal_tabela_id,
+                rotulo=rotulo,
+                numero_final=int(numero_final),
+                horario_txt=hora_str,
+                espera_seg=PAGAMENTO_APROVADO_FECHAR_SEGUNDOS,
+            )
+        )
+
+
+async def _limpar_canais_pag_ja_confirmados(guild: discord.Guild) -> int:
+    """Faxina automática: arquiva e apaga eventuais canais de pagamento cujas vagas já foram aprovadas."""
+    if not guild:
+        return 0
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT s.id, s.numero, s.canal_pag, h.tipo, h.horario, h.canal_tabela "
+            "FROM slots s LEFT JOIN horarios h ON h.id = s.horario_id "
+            "WHERE s.guild_id = ? AND s.confirmado = 1 AND s.canal_pag IS NOT NULL AND s.canal_pag > 0",
+            (int(guild.id),),
+        )).fetchall()
+
+    removidos = 0
+    for r in rows:
+        cid = int(r["canal_pag"] or 0)
+        ctab = int(r["canal_tabela"] or 0) if r["canal_tabela"] else 0
+        if cid > 0 and cid in _CANAIS_PAG_FECHANDO:
+            continue
+        canal_ch = guild.get_channel(cid) if (cid > 0 and cid != ctab) else None
+        if canal_ch:
+            rot = texto_slot(str(r["tipo"] or "solo"))
+            ok = await _apagar_canal_seguro(
+                canal_ch,
+                f"Limpeza automática de canal de pagamento já aprovado ({rot} #{r['numero'] or '?'} • {r['horario'] or '--:--'})",
+            )
+            if ok:
+                removidos += 1
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            await db.execute("UPDATE slots SET canal_pag = NULL WHERE id = ?", (int(r["id"]),))
+            await db.commit()
+    if rows:
+        marcar_sujo()
+    return removidos
+
+
 class PagamentoAcaoView(discord.ui.View):
     """Seletor minimalista de reserva/pagamento de vaga. A vaga só é liberada quando o ADM confirma."""
 
@@ -5952,6 +6099,11 @@ class PagamentoAcaoView(discord.ui.View):
                 await db.commit()
             slot_dict["assumido_por"] = interaction.user.id
 
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+
         origem_aprovacao = "moedas_adm" if int(slot_dict.get("pago_moedas") or 0) == 1 else "staff"
         try:
             await pos_aprovacao(interaction.guild, slot_dict, dict(horario),
@@ -5977,13 +6129,13 @@ class PagamentoAcaoView(discord.ui.View):
             print("Erro ao atualizar tabela:", erro)
         await rebuild_painel(interaction.guild, horario["painel_id"])
 
-        try:
-            await interaction.channel.edit(name=f"✅│{rotulo.lower()}-{numero_final}")
-        except Exception:
-            pass
-
         canal_tabela = interaction.guild.get_channel(canal_tabela_id) if canal_tabela_id else None
-        acesso_txt = f"\n> 📊 Acompanhe no canal {canal_tabela.mention} — seu acesso já foi liberado!" if canal_tabela else ""
+        acesso_txt = f"\n> 📊 **Acompanhe tudo no canal oficial:** {canal_tabela.mention} *(acesso já liberado!)*" if canal_tabela else ""
+        dica_line = (
+            f"\n> 👥 **Jogando em equipe?** Em {canal_tabela.mention} você pode liberar a visão da sala para seus amigos!"
+            if (canal_tabela and JOGADORES_POR_LOTE.get(horario["tipo"], 1) > 1)
+            else ""
+        )
 
         jogadores_do_slot = await _jogadores_do_slot(slot_dict["id"])
         partes_jog = []
@@ -6018,22 +6170,31 @@ class PagamentoAcaoView(discord.ui.View):
                       f"{detalhe_pag}"
                       f"**{rotulo}:** `#{numero_final}`\n"
                       f"**Jogador(es):** {nicks_txt}\n\n"
-                      f"🔓 Vaga liberada e acesso concedido."
-                      f"{acesso_txt}\n\n"
-                      f"📩 **ID e senha da sala** são enviados automaticamente **5 minutos antes** do início.",
+                      f"🔓 Vaga confirmada e comprovante enviado na sua **DM**!"
+                      f"{acesso_txt}{dica_line}\n\n"
+                      f"📩 **ID e senha da sala** são enviados automaticamente **5 minutos antes** do início.\n"
+                      f"⏳ *Este canal de pagamento será salvo nos logs e apagado automaticamente em **{PAGAMENTO_APROVADO_FECHAR_SEGUNDOS}s**.*",
             cor_nome="Esmeralda",
-            footer=f"Fire Force • {rotulo} #{numero_final}"
+            footer=f"Fire Force • {rotulo} #{numero_final} • Encerrando canal em {PAGAMENTO_APROVADO_FECHAR_SEGUNDOS}s",
         )
-        await interaction.response.send_message(
-            content=mencao(slot_dict["comprador_id"]), embed=embed_sucesso
-        )
-
         try:
-            async for msg in interaction.channel.history(limit=10):
-                if msg.author == interaction.guild.me and msg.components:
-                    await msg.edit(view=None)
+            if interaction.response.is_done():
+                await interaction.followup.send(content=mencao(slot_dict["comprador_id"]), embed=embed_sucesso)
+            else:
+                await interaction.response.send_message(content=mencao(slot_dict["comprador_id"]), embed=embed_sucesso)
         except Exception:
             pass
+
+        await _notificar_dm_e_agendar_fechamento_pag(
+            guild=interaction.guild,
+            slot_dict=slot_dict,
+            horario_dict=dict(horario),
+            numero_final=numero_final,
+            canal_pag=interaction.channel,
+            canal_tabela_id=canal_tabela_id,
+            nicks_txt=nicks_txt,
+            detalhe_pag=f"• {detalhe_pag}",
+        )
 
     async def assumir_pagamento(self, interaction: discord.Interaction, button=None, forcar_reassumir: bool = False):
         """ADM assume (ou reassume) o pagamento e exibe sua chave PIX + QR Code direto para o jogador."""
@@ -7006,7 +7167,10 @@ class AlterarValorModal(discord.ui.Modal, title="💰 Alterar Valor do Horário"
                 await db.execute("UPDATE horarios SET valor = ? WHERE id = ?", (val, hid))
                 await db.commit()
 
-                await rebuild_painel(interaction.guild, horario["painel_id"])
+            marcar_sujo()
+            await rebuild_painel(interaction.guild, horario["painel_id"])
+            if horario["canal_tabela"]:
+                await atualizar_tabela(interaction.guild, hid)
 
             await interaction.response.send_message(
                 embed=criar_embed("✅ Atualizado", f"Novo valor do horário #{hid}: `{formatar_moeda(val)}`", "Esmeralda"),
@@ -7038,7 +7202,10 @@ class AlterarPremiacaoModal(discord.ui.Modal, title="🏆 Alterar Premiação"):
                 await db.execute("UPDATE horarios SET premiacao = ? WHERE id = ?", (self.premiacao.value.strip(), hid))
                 await db.commit()
 
-                await rebuild_painel(interaction.guild, horario["painel_id"])
+            marcar_sujo()
+            await rebuild_painel(interaction.guild, horario["painel_id"])
+            if horario["canal_tabela"]:
+                await atualizar_tabela(interaction.guild, hid)
 
             await interaction.response.send_message(
                 embed=criar_embed("✅ Atualizado", f"Premiação do horário #{hid} atualizada!", "Esmeralda"),
@@ -11501,28 +11668,33 @@ async def aprovar_pagamento(guild, slot_id: int, staff_id: Optional[int] = None,
 
     await pos_aprovacao(guild, slot, horario, staff_id=staff_id, origem=origem)
 
-    # avisa o comprador no canal de pagamento (menção por ID: zero intent)
+    # avisa o comprador no canal de pagamento + envia recibo na DM + apaga canal em 15s
+    canal_pag = guild.get_channel(slot["canal_pag"]) if slot.get("canal_pag") else None
+    canal_tab_obj = guild.get_channel(canal_tabela_id) if canal_tabela_id else None
+    ref_tab = canal_tab_obj.mention if canal_tab_obj else "o canal oficial do diário"
     try:
-        canal_pag = guild.get_channel(slot["canal_pag"]) if slot.get("canal_pag") else None
         if canal_pag:
             embed = criar_embed(
                 "✅ Pagamento Aprovado!",
-                f"{mencao(slot['comprador_id'])} — **vaga #{numero_final}** liberada!\n"
-                f"> 🎮 `{texto_slot(horario['tipo'])}` • `{horario['horario']}`\n"
-                f"> 📊 Acompanhe a tabela no canal do diário.\n"
-                f"> 📩 ID e senha chegam **5 minutos antes** do início.",
-                "Esmeralda"
+                f"{mencao(slot['comprador_id'])} — **{texto_slot(horario['tipo']).lower()} #{numero_final}** liberada!\n"
+                f"> 🎮 `{formatar_rotulo_diario(horario['tipo'], horario['categoria'])}` • `{horario['horario']}`\n"
+                f"> 📊 **Acompanhe tudo em:** {ref_tab}\n"
+                f"> 📩 Comprovante enviado na sua **DM** (ID e senha chegam **5 min antes**).\n\n"
+                f"⏳ *Este canal de pagamento será salvo nos logs e apagado em **{PAGAMENTO_APROVADO_FECHAR_SEGUNDOS}s**.*",
+                "Esmeralda",
             )
             await canal_pag.send(content=mencao(slot["comprador_id"]), embed=embed)
-            try:
-                async for msg in canal_pag.history(limit=8):
-                    if msg.author == guild.me and msg.components:
-                        await msg.edit(view=None)
-                        break
-            except Exception:
-                pass
     except Exception:
         pass
+
+    await _notificar_dm_e_agendar_fechamento_pag(
+        guild=guild,
+        slot_dict=slot,
+        horario_dict=horario,
+        numero_final=numero_final,
+        canal_pag=canal_pag,
+        canal_tabela_id=canal_tabela_id,
+    )
 
     return numero_final, horario
 
@@ -16053,6 +16225,7 @@ async def cmd_reparar_pendencias(
     await interaction.response.defer(ephemeral=True, thinking=True)
     tickets = await _reconciliar_ticket_estado(interaction.guild, limpar_fechados=True)
     depositos_orfaos = await _reconciliar_depositos_orfaos(interaction.guild)
+    canais_vagas_aprovadas = await _limpar_canais_pag_ja_confirmados(interaction.guild)
     cancelado = False
     detalhe = ""
     if deposito_id is not None:
@@ -16090,6 +16263,7 @@ async def cmd_reparar_pendencias(
             (interaction.guild.id,))).fetchall()
     resumo = (f"Tickets órfãos fechados: **{tickets['tickets_orfaos']}**. "
               f"Canais de tickets já fechados removidos: **{tickets['canais_fechados_removidos']}**. "
+              f"Canais de vagas já aprovadas limpos: **{canais_vagas_aprovadas}**. "
               f"Atendimentos vazios de depósito sem canal cancelados: **{depositos_orfaos}**.")
     if ativos:
         resumo += "\n\nPendências de depósito preservadas (não cancelei automaticamente):\n" + "\n".join(
@@ -19134,6 +19308,7 @@ async def _inicializar_bot():
         try:
             await _reconciliar_ticket_estado(guild, limpar_fechados=True)
             await _reconciliar_depositos_orfaos(guild)
+            await _limpar_canais_pag_ja_confirmados(guild)
         except Exception as erro:
             _log_arquivo(f"[RECONCILIAÇÃO] guild={guild.id}: {type(erro).__name__}: {erro}")
 
