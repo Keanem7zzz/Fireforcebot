@@ -31,11 +31,18 @@ import os
 import random
 import re
 import time
+import unicodedata
 import qrcode
 import io
 import asyncio
 import datetime
 from typing import Optional, List, Dict
+
+try:
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+    _PIL_DISPONIVEL = True
+except Exception:
+    _PIL_DISPONIVEL = False
 
 # ==================== .env DA PASTA DO BOT ====================
 def _carregar_env_do_arquivo() -> int:
@@ -85,7 +92,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.0"
+VERSAO_BOT = "13.1"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -8969,15 +8976,1051 @@ async def cmd_info(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="perfil", description="🎖️ Ficha competitiva completa: patente, vitórias, winrate, sequência e lines")
+
+# ==================== v13.1: CARD VISUAL HD (/perfil • VERMELHO ESCURO & PRETO) ====================
+
+_CARD_FONT_DIRS = (
+    r"C:\Windows\Fonts",
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/liberation",
+)
+_CARD_FONT_CANDIDATES = {
+    "black": ("seguibl.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"),
+    "bold": ("segoeuib.ttf", "bahnschrift.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"),
+    "regular": ("seguisb.ttf", "segoeui.ttf", "arial.ttf", "DejaVuSans.ttf", "LiberationSans-Regular.ttf"),
+    "mono": ("consolab.ttf", "DejaVuSansMono-Bold.ttf", "DejaVuSans-Bold.ttf"),
+}
+_CARD_FONT_CACHE: dict = {}
+_CARD_NOTDEF_CACHE: dict = {}
+
+
+def _card_carregar_fonte(estilo: str, tamanho: int):
+    chave = (estilo, int(tamanho))
+    if chave in _CARD_FONT_CACHE:
+        return _CARD_FONT_CACHE[chave]
+    for pasta in _CARD_FONT_DIRS:
+        for arq in _CARD_FONT_CANDIDATES.get(estilo, _CARD_FONT_CANDIDATES["bold"]):
+            caminho = os.path.join(pasta, arq)
+            if os.path.exists(caminho):
+                try:
+                    fonte = ImageFont.truetype(caminho, int(tamanho))
+                    _CARD_FONT_CACHE[chave] = fonte
+                    return fonte
+                except Exception:
+                    continue
+    fonte = ImageFont.load_default(size=int(tamanho))
+    _CARD_FONT_CACHE[chave] = fonte
+    return fonte
+
+
+def _card_limpar_texto(texto: str, fonte, fallback: str = "", remover_simbolos: bool = False) -> str:
+    txt = unicodedata.normalize("NFKC", str(texto or ""))
+    fid = id(fonte)
+    if fid not in _CARD_NOTDEF_CACHE:
+        try:
+            _CARD_NOTDEF_CACHE[fid] = bytes(fonte.getmask("\uffff"))
+        except Exception:
+            _CARD_NOTDEF_CACHE[fid] = b""
+    notdef = _CARD_NOTDEF_CACHE[fid]
+    saida = []
+    for ch in txt:
+        if ch in (" ", "\t"):
+            saida.append(" ")
+            continue
+        codigo = ord(ch)
+        if codigo < 32 or (0xFE00 <= codigo <= 0xFE0F) or (0x1F000 <= codigo <= 0x1FAFF):
+            continue
+        if remover_simbolos and ((0x2600 <= codigo <= 0x27BF) or (0x2300 <= codigo <= 0x23FF)):
+            continue
+        if notdef:
+            try:
+                if bytes(fonte.getmask(ch)) == notdef:
+                    continue
+            except Exception:
+                continue
+        saida.append(ch)
+    limpo = " ".join("".join(saida).split())
+    return limpo if limpo else fallback
+
+
+def _card_truncar_px(draw, texto: str, fonte, larg_max: int, remover_simbolos: bool = False) -> str:
+    texto = _card_limpar_texto(texto, fonte, "—", remover_simbolos=remover_simbolos)
+    if draw.textlength(texto, font=fonte) <= larg_max:
+        return texto
+    elipse = "..."
+    for tam in range(len(texto), 0, -1):
+        cand = texto[:tam].rstrip() + elipse
+        if draw.textlength(cand, font=fonte) <= larg_max:
+            return cand
+    return elipse
+
+
+def _card_ajustar_titulo(draw, texto: str, estilo: str, tam_max: int, tam_min: int, larg_max: int, remover_simbolos: bool = False):
+    for tam in range(tam_max, tam_min - 1, -2):
+        f = _card_carregar_fonte(estilo, tam)
+        limpo = _card_limpar_texto(texto, f, "", remover_simbolos=remover_simbolos)
+        if not limpo:
+            continue
+        if draw.textlength(limpo, font=f) <= larg_max:
+            return f, limpo
+    f = _card_carregar_fonte(estilo, tam_min)
+    return f, _card_truncar_px(draw, texto, f, larg_max, remover_simbolos=remover_simbolos)
+
+
+def _card_pts_chanfro(x1: float, y1: float, x2: float, y2: float,
+                      c_tl: float = 18, c_tr: float = 0, c_br: float = 18, c_bl: float = 0):
+    pts = []
+    if c_tl > 0:
+        pts.extend([(x1, y1 + c_tl), (x1 + c_tl, y1)])
+    else:
+        pts.append((x1, y1))
+    if c_tr > 0:
+        pts.extend([(x2 - c_tr, y1), (x2, y1 + c_tr)])
+    else:
+        pts.append((x2, y1))
+    if c_br > 0:
+        pts.extend([(x2, y2 - c_br), (x2 - c_br, y2)])
+    else:
+        pts.append((x2, y2))
+    if c_bl > 0:
+        pts.extend([(x1 + c_bl, y2), (x1, y2 - c_bl)])
+    else:
+        pts.append((x1, y2))
+    return pts
+
+
+def _card_gradiente_vertical(w: int, h: int, cor_topo: tuple, cor_base: tuple):
+    col = Image.new("RGBA", (1, 64))
+    px = col.load()
+    for y in range(64):
+        t = y / 63.0
+        px[0, y] = tuple(int(cor_topo[i] + (cor_base[i] - cor_topo[i]) * t) for i in range(4))
+    return col.resize((w, h), Image.Resampling.BILINEAR)
+
+
+def _card_glow_radial_local(canvas, cx: int, cy: int, rx: int, ry: int, cor_rgb: tuple, alpha_max: int):
+    pad_x, pad_y = int(rx * 1.35), int(ry * 1.35)
+    x1, y1 = max(0, cx - pad_x), max(0, cy - pad_y)
+    x2, y2 = min(canvas.width, cx + pad_x), min(canvas.height, cy + pad_y)
+    bw, bh = x2 - x1, y2 - y1
+    if bw <= 8 or bh <= 8:
+        return
+    gw, gh = max(32, bw // 4), max(32, bh // 4)
+    sx, sy = gw / bw, gh / bh
+    sub = Image.new("RGBA", (gw, gh), (0, 0, 0, 0))
+    d = ImageDraw.Draw(sub)
+    lcx, lcy = (cx - x1) * sx, (cy - y1) * sy
+    for passo in range(10, 0, -1):
+        frac = passo / 10.0
+        a = min(255, int(alpha_max * (1.0 - (passo - 1) / 10.0) ** 1.85))
+        prx, pry = rx * sx * frac, ry * sy * frac
+        d.ellipse((lcx - prx, lcy - pry, lcx + prx, lcy + pry), fill=(*cor_rgb, a))
+    sub = sub.filter(ImageFilter.GaussianBlur(radius=max(8, int(min(gw, gh) * 0.14))))
+    sub = sub.resize((bw, bh), Image.Resampling.BILINEAR)
+    canvas.alpha_composite(sub, dest=(x1, y1))
+
+
+def _card_painel_tatico(
+    canvas,
+    box: tuple,
+    c_tl: int = 28,
+    c_tr: int = 8,
+    c_br: int = 28,
+    c_bl: int = 8,
+    topo_rgba=(18, 6, 8, 248),
+    base_rgba=(6, 5, 7, 252),
+    borda_rgba=(118, 12, 24, 235),
+    borda_interna_rgba=(44, 10, 16, 195),
+    acento_topo: bool = True,
+    acento_esq: bool = False,
+):
+    x1, y1, x2, y2 = box
+    pad = 18
+    bx1, by1 = max(0, x1 - pad), max(0, y1 - pad)
+    bx2, by2 = min(canvas.width, x2 + pad), min(canvas.height, y2 + pad)
+    bw, bh = bx2 - bx1, by2 - by1
+    lx1, ly1, lx2, ly2 = x1 - bx1, y1 - by1, x2 - bx1, y2 - by1
+    pw, ph = lx2 - lx1, ly2 - ly1
+
+    sub = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+    ds = ImageDraw.Draw(sub)
+    sombra_pts = _card_pts_chanfro(lx1 + 6, ly1 + 10, lx2 + 6, ly2 + 10, c_tl, c_tr, c_br, c_bl)
+    ds.polygon(sombra_pts, fill=(0, 0, 0, 175))
+    sub = sub.filter(ImageFilter.GaussianBlur(radius=6))
+
+    grad = _card_gradiente_vertical(pw, ph, topo_rgba, base_rgba)
+    tex = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+    dt = ImageDraw.Draw(tex)
+    for k in range(int(pw * 0.45), pw + ph, 32):
+        dt.line([(k, 0), (k - int(ph * 0.55), int(ph * 0.55))], fill=(155, 14, 24, 14), width=6)
+    grad = Image.alpha_composite(grad, tex)
+    _card_glow_radial_local(grad, int(pw * 0.12), int(ph * 0.08), int(pw * 0.48), int(ph * 0.48), (128, 6, 12), 34)
+
+    masc = Image.new("L", (pw, ph), 0)
+    ImageDraw.Draw(masc).polygon(_card_pts_chanfro(0, 0, pw, ph, c_tl, c_tr, c_br, c_bl), fill=255)
+    painel_img = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+    painel_img.paste(grad, (lx1, ly1), masc)
+    sub = Image.alpha_composite(sub, painel_img)
+
+    d = ImageDraw.Draw(sub)
+    pts = _card_pts_chanfro(lx1, ly1, lx2, ly2, c_tl, c_tr, c_br, c_bl)
+    pts_in = _card_pts_chanfro(
+        lx1 + 6, ly1 + 6, lx2 - 6, ly2 - 6,
+        max(0, c_tl - 5), max(0, c_tr - 4), max(0, c_br - 5), max(0, c_bl - 4),
+    )
+    d.line(pts_in + [pts_in[0]], fill=borda_interna_rgba, width=2)
+    d.line(pts + [pts[0]], fill=borda_rgba, width=3)
+
+    if acento_topo:
+        ax1 = lx1 + c_tl + 8
+        ax2 = min(lx2 - c_tr - 8, lx1 + int(pw * 0.44))
+        d.line([(ax1, ly1 + 1), (ax2, ly1 + 1)], fill=(192, 14, 24, 255), width=6)
+        d.line([(ax1, ly1 + 6), (ax2 - 22, ly1 + 6)], fill=(255, 90, 98, 95), width=2)
+    if acento_esq:
+        ay1 = ly1 + c_tl + 10
+        ay2 = ly2 - c_bl - 10
+        d.line([(lx1 + 2, ay1), (lx1 + 2, ay2)], fill=(184, 12, 22, 255), width=7)
+        d.line([(lx1 + 8, ay1 + 10), (lx1 + 8, ay2 - 10)], fill=(255, 80, 90, 80), width=2)
+
+    d.line([(lx2 - c_br - 36, ly2 - 1), (lx2 - c_br - 4, ly2 - 1)], fill=(192, 14, 24, 210), width=4)
+    canvas.alpha_composite(sub, dest=(bx1, by1))
+
+
+def _card_chama_ff(
+    d,
+    cx: float,
+    cy: float,
+    r: float,
+    cor_sombra=(118, 6, 14, 255),
+    cor_principal=(192, 14, 24, 255),
+    cor_nucleo=(248, 218, 218, 255),
+):
+    ext = [
+        (cx, cy - r * 1.14),
+        (cx + r * 0.46, cy - r * 0.48),
+        (cx + r * 0.34, cy - r * 0.78),
+        (cx + r * 0.84, cy - r * 0.08),
+        (cx + r * 0.72, cy + r * 0.54),
+        (cx + r * 0.28, cy + r * 0.98),
+        (cx, cy + r * 1.06),
+        (cx - r * 0.38, cy + r * 0.94),
+        (cx - r * 0.78, cy + r * 0.44),
+        (cx - r * 0.72, cy - r * 0.16),
+        (cx - r * 0.34, cy - r * 0.56),
+        (cx - r * 0.24, cy - r * 0.22),
+    ]
+    d.polygon([(px + 2, py + 4) for px, py in ext], fill=(0, 0, 0, 140))
+    d.polygon(ext, fill=cor_sombra, outline=cor_principal, width=3)
+    med = [
+        (cx + r * 0.02, cy - r * 0.80),
+        (cx + r * 0.54, cy + r * 0.02),
+        (cx + r * 0.44, cy + r * 0.58),
+        (cx, cy + r * 0.96),
+        (cx - r * 0.46, cy + r * 0.54),
+        (cx - r * 0.48, cy - r * 0.04),
+    ]
+    d.polygon(med, fill=cor_principal)
+    nuc = [
+        (cx + r * 0.03, cy - r * 0.30),
+        (cx + r * 0.28, cy + r * 0.18),
+        (cx + r * 0.18, cy + r * 0.66),
+        (cx, cy + r * 0.82),
+        (cx - r * 0.20, cy + r * 0.62),
+        (cx - r * 0.24, cy + r * 0.16),
+    ]
+    d.polygon(nuc, fill=cor_nucleo)
+
+
+def _card_icone_modulo(d, tipo: str, cx: float, cy: float, r: float):
+    cor = (196, 14, 24, 255)
+    cor_escura = (112, 6, 14, 240)
+    cor_clara = (248, 214, 218, 245)
+    if tipo == "partidas":
+        d.ellipse((cx - r * 0.80, cy - r * 0.80, cx + r * 0.80, cy + r * 0.80), fill=(24, 5, 9, 210), outline=cor, width=5)
+        d.ellipse((cx - r * 0.36, cy - r * 0.36, cx + r * 0.36, cy + r * 0.36), outline=cor_clara, width=3)
+        d.ellipse((cx - 5, cy - 5, cx + 5, cy + 5), fill=cor_clara)
+        for dx1, dy1, dx2, dy2 in (
+            (0, -r * 1.08, 0, -r * 0.54),
+            (0, r * 0.54, 0, r * 1.08),
+            (-r * 1.08, 0, -r * 0.54, 0),
+            (r * 0.54, 0, r * 1.08, 0),
+        ):
+            d.line([(cx + dx1, cy + dy1), (cx + dx2, cy + dy2)], fill=cor, width=5)
+    elif tipo == "vitorias":
+        d.polygon([
+            (cx - r * 0.62, cy - r * 0.78),
+            (cx + r * 0.62, cy - r * 0.78),
+            (cx + r * 0.44, cy + r * 0.04),
+            (cx + r * 0.16, cy + r * 0.28),
+            (cx - r * 0.16, cy + r * 0.28),
+            (cx - r * 0.44, cy + r * 0.04),
+        ], fill=cor, outline=cor_clara, width=2)
+        d.arc((cx - r * 0.96, cy - r * 0.68, cx - r * 0.34, cy - r * 0.04), start=95, end=275, fill=cor_clara, width=5)
+        d.arc((cx + r * 0.34, cy - r * 0.68, cx + r * 0.96, cy - r * 0.04), start=265, end=85, fill=cor_clara, width=5)
+        d.rectangle((cx - r * 0.11, cy + r * 0.26, cx + r * 0.11, cy + r * 0.62), fill=cor_clara)
+        d.rounded_rectangle((cx - r * 0.52, cy + r * 0.60, cx + r * 0.52, cy + r * 0.82), radius=5, fill=cor_escura, outline=cor, width=3)
+        pts_s = []
+        for i in range(10):
+            ang = -math.pi / 2 + i * math.pi / 5
+            rr = r * (0.24 if i % 2 == 0 else 0.10)
+            pts_s.append((cx + math.cos(ang) * rr, cy - r * 0.34 + math.sin(ang) * rr))
+        d.polygon(pts_s, fill=(16, 5, 8, 250))
+    elif tipo == "streak":
+        _card_chama_ff(d, cx, cy, r * 0.86, cor_sombra=cor_escura, cor_principal=cor, cor_nucleo=cor_clara)
+    elif tipo == "squad":
+        esc = [
+            (cx, cy - r * 0.90),
+            (cx + r * 0.76, cy - r * 0.56),
+            (cx + r * 0.64, cy + r * 0.24),
+            (cx, cy + r * 0.90),
+            (cx - r * 0.64, cy + r * 0.24),
+            (cx - r * 0.76, cy - r * 0.56),
+        ]
+        d.polygon(esc, outline=cor, fill=(36, 5, 10, 240), width=5)
+        d.line([(cx - r * 0.34, cy - r * 0.04), (cx, cy - r * 0.34), (cx + r * 0.34, cy - r * 0.04)], fill=cor_clara, width=5)
+        d.line([(cx - r * 0.34, cy + r * 0.26), (cx, cy - r * 0.02), (cx + r * 0.34, cy + r * 0.26)], fill=cor, width=5)
+    elif tipo == "relogio":
+        d.ellipse((cx - r * 0.82, cy - r * 0.82, cx + r * 0.82, cy + r * 0.82), fill=(30, 5, 10, 235), outline=cor, width=5)
+        d.line([(cx, cy - r * 0.46), (cx, cy), (cx + r * 0.36, cy + r * 0.22)], fill=cor_clara, width=5)
+        d.ellipse((cx - 5, cy - 5, cx + 5, cy + 5), fill=cor)
+
+
+def _card_insignia_patente(canvas, cx: int, cy: int, raio: int, indice: int):
+    idx = max(0, min(11, int(indice)))
+    metais = (
+        (146, 78, 66),    # 0 Bronze Escuro
+        (176, 174, 178),  # 1 Aço Prateado
+        (196, 128, 112),  # 2 Cobre Rubro
+        (204, 196, 198),  # 3 Platina Fumê
+        (196, 26, 36),    # 4 Diamante Sangue
+        (184, 20, 30),    # 5 Mestre Carmesim
+        (222, 188, 188),  # 6 Mestre de Honra
+        (204, 20, 30),    # 7 Elite Rubro
+        (234, 202, 202),  # 8 Elite de Honra
+        (216, 22, 32),    # 9 Desafiante
+        (242, 214, 214),  # 10 Desafiante de Honra
+        (228, 24, 34),    # 11 Hacker
+    )
+    metal = metais[idx]
+    rubi_vivo = (192, 14, 24)
+    sangue_med = (122, 7, 14)
+    sangue_esc = (64, 4, 9)
+    preto_armadura = (8, 6, 8)
+
+    intensidade = 65 + int((idx / 11.0) * 105)
+    _card_glow_radial_local(
+        canvas, cx, cy,
+        int(raio * (1.35 + idx * 0.05)),
+        int(raio * (1.15 + idx * 0.04)),
+        (156, 8, 14), intensidade,
+    )
+
+    box_r = int(raio * 2.25)
+    bx1, by1 = max(0, cx - box_r), max(0, cy - int(raio * 1.45))
+    bx2, by2 = min(canvas.width, cx + box_r), min(canvas.height, cy + int(raio * 1.45))
+    sub = Image.new("RGBA", (bx2 - bx1, by2 - by1), (0, 0, 0, 0))
+    d = ImageDraw.Draw(sub)
+    lcx, lcy = cx - bx1, cy - by1
+
+    if idx >= 7:
+        d.ellipse((lcx - raio * 1.08, lcy - raio * 1.08, lcx + raio * 1.08, lcy + raio * 1.08), outline=(168, 12, 22, 125), width=3)
+    if idx >= 9:
+        for a0 in (-25, 155):
+            d.arc((lcx - raio * 1.16, lcy - raio * 1.16, lcx + raio * 1.16, lcy + raio * 1.16), start=a0, end=a0 + 50, fill=(208, 18, 30, 215), width=5)
+
+    qtd_asas = 1 if idx <= 2 else (2 if idx <= 5 else (3 if idx <= 8 else 4))
+    tons_asa = (rubi_vivo, sangue_med, sangue_esc, (40, 4, 8))
+    for i in range(qtd_asas - 1, -1, -1):
+        off_y = (i - (qtd_asas - 1) / 2.0) * (raio * 0.27)
+        envergadura = raio * (1.36 + (qtd_asas - 1 - i) * 0.17 + (0.12 if idx >= 9 else 0.0))
+        inclina = raio * (0.25 - i * 0.08)
+        cor_a = tons_asa[min(i, len(tons_asa) - 1)]
+        for sinal in (-1, 1):
+            asa_sombra = [
+                (lcx + sinal * raio * 0.54, lcy + off_y - raio * 0.10 + 6),
+                (lcx + sinal * envergadura, lcy + off_y - inclina - raio * 0.16 + 6),
+                (lcx + sinal * (envergadura * 0.83), lcy + off_y + raio * 0.12 + 6),
+                (lcx + sinal * raio * 0.48, lcy + off_y + raio * 0.18 + 6),
+            ]
+            d.polygon(asa_sombra, fill=(0, 0, 0, 145))
+            asa = [
+                (lcx + sinal * raio * 0.54, lcy + off_y - raio * 0.12),
+                (lcx + sinal * envergadura, lcy + off_y - inclina - raio * 0.18),
+                (lcx + sinal * (envergadura * 0.83), lcy + off_y + raio * 0.10),
+                (lcx + sinal * raio * 0.48, lcy + off_y + raio * 0.16),
+            ]
+            d.polygon(asa, fill=(*cor_a, 248), outline=(*metal, 195 if i == 0 else 120), width=3)
+            d.line([asa[0], asa[1]], fill=(255, 118, 124, 120 if i == 0 else 55), width=2)
+
+    if idx >= 6:
+        coroa = [
+            (lcx - raio * 0.46, lcy - raio * 0.72),
+            (lcx - raio * 0.56, lcy - raio * 1.05),
+            (lcx - raio * 0.22, lcy - raio * 0.86),
+            (lcx, lcy - raio * 1.20),
+            (lcx + raio * 0.22, lcy - raio * 0.86),
+            (lcx + raio * 0.56, lcy - raio * 1.05),
+            (lcx + raio * 0.46, lcy - raio * 0.72),
+        ]
+        d.polygon(coroa, fill=(*sangue_med, 255), outline=(*metal, 240), width=3)
+        d.ellipse((lcx - 6, lcy - raio * 1.20 - 6, lcx + 6, lcy - raio * 1.20 + 6), fill=(*metal, 255))
+
+    def _escudo_pts(escala: float):
+        r = raio * escala
+        return [
+            (lcx, lcy - r * 0.96),
+            (lcx + r * 0.78, lcy - r * 0.56),
+            (lcx + r * 0.68, lcy + r * 0.34),
+            (lcx, lcy + r * 0.98),
+            (lcx - r * 0.68, lcy + r * 0.34),
+            (lcx - r * 0.78, lcy - r * 0.56),
+        ]
+
+    d.polygon([(px + 4, py + 9) for px, py in _escudo_pts(1.03)], fill=(0, 0, 0, 185))
+    d.polygon(_escudo_pts(1.00), fill=(*sangue_esc, 255), outline=(*metal, 240), width=5)
+    d.polygon(_escudo_pts(0.86), fill=(*preto_armadura, 255), outline=(*rubi_vivo, 235), width=4)
+    esc_in = _escudo_pts(0.70)
+    d.polygon(esc_in, fill=(28, 4, 8, 255), outline=(108, 10, 18, 185), width=2)
+    d.polygon([esc_in[0], esc_in[3], esc_in[4], esc_in[5]], fill=(48, 5, 10, 150))
+
+    if idx <= 2:
+        qtd_c = idx + 1
+        for c in range(qtd_c):
+            oy = lcy + (c - (qtd_c - 1) / 2.0) * (raio * 0.24) + raio * 0.05
+            d.line(
+                [(lcx - raio * 0.33, oy + raio * 0.13), (lcx, oy - raio * 0.14), (lcx + raio * 0.33, oy + raio * 0.13)],
+                fill=(*metal, 255), width=9,
+            )
+    elif idx <= 4:
+        gem = [
+            (lcx, lcy - raio * 0.46),
+            (lcx + raio * 0.38, lcy - raio * 0.06),
+            (lcx, lcy + raio * 0.48),
+            (lcx - raio * 0.38, lcy - raio * 0.06),
+        ]
+        d.polygon(gem, fill=(*sangue_med, 255), outline=(*metal, 255), width=4)
+        d.polygon([gem[0], gem[1], (lcx, lcy - raio * 0.06)], fill=(*rubi_vivo, 255))
+        d.polygon([gem[0], gem[3], (lcx, lcy - raio * 0.06)], fill=(245, 165, 172, 195))
+    elif idx <= 6:
+        est = []
+        for i in range(8):
+            ang = -math.pi / 2 + i * math.pi / 4
+            rr = raio * (0.48 if i % 2 == 0 else 0.17)
+            est.append((lcx + math.cos(ang) * rr, lcy + math.sin(ang) * rr))
+        d.polygon(est, fill=(*rubi_vivo, 255), outline=(*metal, 255), width=4)
+        d.ellipse((lcx - raio * 0.10, lcy - raio * 0.10, lcx + raio * 0.10, lcy + raio * 0.10), fill=(252, 232, 234, 255))
+    elif idx <= 8:
+        falcao = [
+            (lcx, lcy - raio * 0.48),
+            (lcx + raio * 0.44, lcy - raio * 0.18),
+            (lcx + raio * 0.22, lcy + raio * 0.08),
+            (lcx, lcy + raio * 0.48),
+            (lcx - raio * 0.22, lcy + raio * 0.08),
+            (lcx - raio * 0.44, lcy - raio * 0.18),
+        ]
+        d.polygon(falcao, fill=(*rubi_vivo, 255), outline=(*metal, 255), width=4)
+        d.polygon(
+            [(lcx, lcy - raio * 0.24), (lcx + raio * 0.15, lcy + raio * 0.04),
+             (lcx, lcy + raio * 0.26), (lcx - raio * 0.15, lcy + raio * 0.04)],
+            fill=(250, 224, 224, 245),
+        )
+    elif idx <= 10:
+        _card_chama_ff(d, lcx, lcy, raio * 0.46, cor_sombra=sangue_esc, cor_principal=rubi_vivo, cor_nucleo=(252, 224, 218, 255))
+    else:
+        r_sk = raio * 0.39
+        d.ellipse((lcx - r_sk, lcy - r_sk * 1.04, lcx + r_sk, lcy + r_sk * 0.56), fill=(236, 228, 230, 252), outline=(*rubi_vivo, 255), width=4)
+        d.rounded_rectangle((lcx - r_sk * 0.56, lcy + r_sk * 0.14, lcx + r_sk * 0.56, lcy + r_sk * 0.88), radius=8, fill=(236, 228, 230, 252))
+        d.polygon(
+            [(lcx - r_sk * 0.62, lcy - r_sk * 0.22), (lcx - r_sk * 0.14, lcy - r_sk * 0.05),
+             (lcx - r_sk * 0.22, lcy + r_sk * 0.22), (lcx - r_sk * 0.58, lcy + r_sk * 0.10)],
+            fill=(185, 8, 20, 255),
+        )
+        d.polygon(
+            [(lcx + r_sk * 0.62, lcy - r_sk * 0.22), (lcx + r_sk * 0.14, lcy - r_sk * 0.05),
+             (lcx + r_sk * 0.22, lcy + r_sk * 0.22), (lcx + r_sk * 0.58, lcy + r_sk * 0.10)],
+            fill=(185, 8, 20, 255),
+        )
+        d.ellipse((lcx - r_sk * 0.42, lcy - r_sk * 0.08, lcx - r_sk * 0.30, lcy + r_sk * 0.04), fill=(255, 198, 200, 255))
+        d.ellipse((lcx + r_sk * 0.30, lcy - r_sk * 0.08, lcx + r_sk * 0.42, lcy + r_sk * 0.04), fill=(255, 198, 200, 255))
+        d.polygon([(lcx, lcy + r_sk * 0.08), (lcx + r_sk * 0.13, lcy + r_sk * 0.35), (lcx - r_sk * 0.13, lcy + r_sk * 0.35)], fill=(16, 6, 8, 255))
+        for tx in (-0.30, 0.0, 0.30):
+            d.line([(lcx + r_sk * tx, lcy + r_sk * 0.52), (lcx + r_sk * tx, lcy + r_sk * 0.84)], fill=(16, 6, 8, 255), width=4)
+
+    canvas.alpha_composite(sub, dest=(bx1, by1))
+
+
+def _card_formatar_data_curta(iso_str: str) -> str:
+    bruto = str(iso_str or "").strip()
+    if not bruto:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(bruto.replace("Z", "+00:00"))
+        return dt.strftime("%d/%m/%Y às %H:%M")
+    except Exception:
+        limpo = bruto[:16].replace("T", " ")
+        if len(limpo) >= 16 and limpo[4] == "-" and limpo[7] == "-":
+            return f"{limpo[8:10]}/{limpo[5:7]}/{limpo[0:4]} às {limpo[11:16]}"
+        return limpo
+
+
+async def _obter_avatar_bytes_membro(membro) -> Optional[bytes]:
+    """Busca o avatar PNG 256px do jogador com timeout curto e fallback imediato."""
+    av = getattr(membro, "display_avatar", None)
+    if not av:
+        return None
+    try:
+        av_256 = av.replace(size=256, format="png") if hasattr(av, "replace") else av
+        if hasattr(av_256, "read"):
+            coro = av_256.read()
+            if asyncio.iscoroutine(coro):
+                bruto = await asyncio.wait_for(coro, timeout=2.5)
+                if isinstance(bruto, (bytes, bytearray)) and len(bruto) > 64:
+                    return bytes(bruto)
+    except Exception:
+        pass
+
+    url = str(getattr(av, "url", "") or "")
+    if url.startswith("http://") or url.startswith("https://"):
+        try:
+            sessao = await _ff_sessao()
+            async with sessao.get(url, timeout=aiohttp.ClientTimeout(total=2.2)) as resp:
+                if resp.status == 200:
+                    bruto = await resp.read()
+                    if isinstance(bruto, (bytes, bytearray)) and len(bruto) > 64:
+                        return bytes(bruto)
+        except Exception:
+            pass
+    return None
+
+
+def renderizar_card_perfil_png(
+    *,
+    user_id: int,
+    display_name: str,
+    username: str,
+    guild_name: str,
+    cargo_nome: str,
+    dados: dict,
+    avatar_bytes: Optional[bytes] = None,
+) -> bytes:
+    """Renderiza o Card Competitivo HD (1240x700 via 2x SSAA) em Vermelho Escuro Sangue + Preto Obsidiana."""
+    W, H = 2480, 1400
+    card = _card_gradiente_vertical(W, H, (9, 4, 6, 255), (4, 4, 6, 255))
+
+    _card_glow_radial_local(card, 450, 420, 660, 580, (116, 5, 10), 145)
+    _card_glow_radial_local(card, 2080, 220, 780, 480, (92, 4, 8), 120)
+    _card_glow_radial_local(card, 1420, 1280, 880, 380, (80, 4, 8), 105)
+
+    bg_fx = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    db = ImageDraw.Draw(bg_fx)
+
+    faixas = (
+        (-180, 320, 42, (112, 6, 14, 26)),
+        (190, 500, 72, (74, 4, 10, 30)),
+        (1500, 460, 82, (104, 6, 14, 26)),
+        (2040, 240, 55, (148, 10, 18, 30)),
+    )
+    for x_top, larg_f, alpha_lin, cor_f in faixas:
+        incl = 540
+        pol = [(x_top, 0), (x_top + larg_f, 0), (x_top + larg_f - incl, H), (x_top - incl, H)]
+        db.polygon(pol, fill=cor_f)
+        db.line([(x_top + larg_f, 0), (x_top + larg_f - incl, H)], fill=(172, 12, 22, alpha_lin), width=3)
+
+    for gx in range(1640, 2410, 38):
+        for gy in range(88, 470, 38):
+            db.rectangle((gx, gy, gx + 4, gy + 4), fill=(188, 16, 26, 28))
+    for gx in range(64, 680, 38):
+        for gy in range(1040, 1340, 38):
+            db.rectangle((gx, gy, gx + 4, gy + 4), fill=(188, 16, 26, 24))
+
+    rng = random.Random(int(user_id) ^ 0xFF13)
+    for _ in range(26):
+        ex = rng.randint(70, W - 70)
+        ey = rng.randint(90, H - 70)
+        er = rng.randint(3, 7)
+        ea = rng.randint(24, 72)
+        db.ellipse((ex - er, ey - er, ex + er, ey + er), fill=(195, 14, 24, ea))
+
+    moldura_ext = _card_pts_chanfro(24, 24, W - 24, H - 24, 34, 34, 34, 34)
+    db.line(moldura_ext + [moldura_ext[0]], fill=(92, 8, 16, 230), width=4)
+    moldura_int = _card_pts_chanfro(36, 36, W - 36, H - 36, 28, 28, 28, 28)
+    db.line(moldura_int + [moldura_int[0]], fill=(38, 7, 12, 195), width=2)
+
+    tam_c = 88
+    cor_canto = (192, 14, 24, 255)
+    db.line([(24, 24 + tam_c), (24, 58), (58, 24), (24 + tam_c, 24)], fill=cor_canto, width=7)
+    db.line([(W - 24 - tam_c, 24), (W - 58, 24), (W - 24, 58), (W - 24, 24 + tam_c)], fill=cor_canto, width=7)
+    db.line([(24, H - 24 - tam_c), (24, H - 58), (58, H - 24), (24 + tam_c, H - 24)], fill=cor_canto, width=7)
+    db.line([(W - 24 - tam_c, H - 24), (W - 58, H - 24), (W - 24, H - 58), (W - 24, H - 24 - tam_c)], fill=cor_canto, width=7)
+
+    card = Image.alpha_composite(card, bg_fx)
+    d_main = ImageDraw.Draw(card, "RGBA")
+
+    # Cabeçalho superior
+    _card_chama_ff(d_main, 98, 104, 28)
+    f_brand = _card_carregar_fonte("black", 42)
+    f_sub_hdr = _card_carregar_fonte("bold", 24)
+    f_pill = _card_carregar_fonte("bold", 24)
+
+    d_main.text((142, 80), "FIRE FORCE", font=f_brand, fill=(248, 242, 244, 255))
+    w_brand = d_main.textlength("FIRE FORCE", font=f_brand)
+    d_main.text((142 + w_brand + 24, 92), "//  FICHA COMPETITIVA OFICIAL", font=f_sub_hdr, fill=(178, 58, 66, 240))
+
+    pat = dados["patente"]
+    prox = dados["proxima_patente"]
+    idx_pat = int(pat.get("indice", 0))
+
+    srv_limpo = _card_truncar_px(d_main, (guild_name or "FIRE FORCE").upper(), f_pill, 480, remover_simbolos=True)
+    txt_hdr_dir = f"{srv_limpo}  •  TIER {idx_pat + 1:02d}/12"
+    w_pill = int(d_main.textlength(txt_hdr_dir, font=f_pill)) + 68
+    px1, py1, px2, py2 = W - 76 - w_pill, 72, W - 76, 134
+    d_main.polygon(_card_pts_chanfro(px1, py1, px2, py2, 16, 6, 16, 6), fill=(26, 4, 8, 255), outline=(148, 10, 18, 255), width=3)
+    d_main.text(((px1 + px2) / 2, (py1 + py2) / 2), txt_hdr_dir, font=f_pill, fill=(242, 222, 224, 255), anchor="mm")
+
+    d_main.line([(76, 154), (W - 76, 154)], fill=(84, 8, 16, 255), width=2)
+    d_main.line([(76, 154), (430, 154)], fill=(192, 14, 24, 255), width=5)
+
+    # Painel esquerdo: Identidade & Insígnia
+    LX1, LY1, LX2, LY2 = 76, 182, 836, 1324
+    LCX = (LX1 + LX2) // 2
+    _card_painel_tatico(
+        card, (LX1, LY1, LX2, LY2),
+        c_tl=38, c_tr=12, c_br=38, c_bl=12,
+        topo_rgba=(18, 6, 8, 248),
+        base_rgba=(5, 4, 6, 252),
+        borda_rgba=(124, 12, 22, 240),
+        acento_topo=True,
+    )
+
+    f_wm = _card_carregar_fonte("black", 240)
+    d_main = ImageDraw.Draw(card, "RGBA")
+    d_main.text((LCX, 944), f"{idx_pat + 1:02d}", font=f_wm, fill=(24, 6, 10, 255), anchor="mm")
+
+    AV_CY = 394
+    AV_R = 148
+    _card_glow_radial_local(card, LCX, AV_CY, 245, 225, (152, 8, 14), 135)
+    d_main = ImageDraw.Draw(card, "RGBA")
+
+    r_hud = AV_R + 30
+    for deg in range(0, 360, 10):
+        rad = math.radians(deg)
+        r_in_t = r_hud + 8
+        r_out_t = r_hud + (17 if deg % 30 == 0 else 13)
+        cor_t = (188, 14, 24, 255) if deg % 30 == 0 else (84, 9, 15, 255)
+        d_main.line(
+            [(LCX + math.cos(rad) * r_in_t, AV_CY + math.sin(rad) * r_in_t),
+             (LCX + math.cos(rad) * r_out_t, AV_CY + math.sin(rad) * r_out_t)],
+            fill=cor_t,
+            width=3 if deg % 30 == 0 else 2,
+        )
+    d_main.ellipse((LCX - r_hud, AV_CY - r_hud, LCX + r_hud, AV_CY + r_hud), outline=(84, 8, 14, 255), width=4)
+    for ang_ini in (-38, 52, 142, 232):
+        d_main.arc((LCX - r_hud - 2, AV_CY - r_hud - 2, LCX + r_hud + 2, AV_CY + r_hud + 2), start=ang_ini, end=ang_ini + 36, fill=(196, 14, 24, 255), width=8)
+
+    r_aro = AV_R + 12
+    d_main.ellipse((LCX - r_aro, AV_CY - r_aro, LCX + r_aro, AV_CY + r_aro), fill=(16, 5, 8, 255), outline=(164, 12, 20, 255), width=6)
+
+    av_img = None
+    if avatar_bytes:
+        try:
+            av_img = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+            av_img = av_img.resize((AV_R * 2, AV_R * 2), Image.Resampling.LANCZOS)
+        except Exception:
+            av_img = None
+
+    if av_img is None:
+        av_img = _card_gradiente_vertical(AV_R * 2, AV_R * 2, (72, 6, 12, 255), (10, 4, 7, 255))
+        dm = ImageDraw.Draw(av_img)
+        f_ini = _card_carregar_fonte("black", 108)
+        ini_limpo = _card_limpar_texto(display_name or username or "FF", f_ini, "FF", remover_simbolos=True)
+        iniciais = "".join(ch for ch in ini_limpo if ch.isalnum())[:2].upper() or "FF"
+        dm.text((AV_R + 3, AV_R + 1), iniciais, font=f_ini, fill=(0, 0, 0, 180), anchor="mm")
+        dm.text((AV_R, AV_R - 2), iniciais, font=f_ini, fill=(248, 236, 238, 255), anchor="mm")
+
+    masc_av = Image.new("L", (AV_R * 2, AV_R * 2), 0)
+    ImageDraw.Draw(masc_av).ellipse((0, 0, AV_R * 2, AV_R * 2), fill=255)
+    card.paste(av_img, (LCX - AV_R, AV_CY - AV_R), masc_av)
+    d_main = ImageDraw.Draw(card, "RGBA")
+    d_main.ellipse((LCX - AV_R, AV_CY - AV_R, LCX + AV_R, AV_CY + AV_R), outline=(212, 42, 50, 255), width=3)
+
+    f_tag_av = _card_carregar_fonte("bold", 23)
+    lbl_tier = f"RANK #{idx_pat + 1:02d}  •  {int(dados['pontos'])} PTS"
+    tw = int(d_main.textlength(lbl_tier, font=f_tag_av)) + 58
+    tx1, ty1, tx2, ty2 = LCX - tw // 2, AV_CY + AV_R - 22, LCX + tw // 2, AV_CY + AV_R + 28
+    d_main.polygon(_card_pts_chanfro(tx1, ty1, tx2, ty2, 12, 12, 12, 12), fill=(116, 6, 12, 255), outline=(214, 46, 54, 255), width=3)
+    d_main.text((LCX, (ty1 + ty2) / 2), lbl_tier, font=f_tag_av, fill=(255, 246, 247, 255), anchor="mm")
+
+    f_nick, nick_txt = _card_ajustar_titulo(d_main, display_name or username or f"Jogador {str(user_id)[-4:]}", "black", 56, 32, 660)
+    if not nick_txt:
+        f_nick, nick_txt = _card_ajustar_titulo(d_main, username or f"JOGADOR #{str(user_id)[-4:]}", "black", 50, 32, 660)
+    d_main.text((LCX + 3, 632), nick_txt, font=f_nick, fill=(0, 0, 0, 255), anchor="mm")
+    d_main.text((LCX, 628), nick_txt, font=f_nick, fill=(250, 244, 245, 255), anchor="mm")
+
+    f_handle = _card_carregar_fonte("regular", 27)
+    handle_limpo = _card_limpar_texto(username or "", f_handle, f"ID {str(user_id)[-6:]}", remover_simbolos=True)
+    if not handle_limpo.startswith("@") and not handle_limpo.startswith("ID "):
+        handle_limpo = f"@{handle_limpo}"
+    handle_limpo = _card_truncar_px(d_main, handle_limpo, f_handle, 580)
+    d_main.text((LCX, 682), handle_limpo, font=f_handle, fill=(176, 118, 124, 255), anchor="mm")
+
+    dy_div = 736
+    d_main.line([(LX1 + 68, dy_div), (LCX - 24, dy_div)], fill=(108, 10, 18, 255), width=3)
+    d_main.line([(LCX + 24, dy_div), (LX2 - 68, dy_div)], fill=(108, 10, 18, 255), width=3)
+    d_main.polygon([(LCX, dy_div - 11), (LCX + 11, dy_div), (LCX, dy_div + 11), (LCX - 11, dy_div)], fill=(192, 14, 24, 255))
+
+    _card_insignia_patente(card, LCX, 962, 128, idx_pat)
+    d_main = ImageDraw.Draw(card, "RGBA")
+
+    f_pat_lbl = _card_carregar_fonte("bold", 22)
+    d_main.text((LCX, 1142), "PATENTE COMPETITIVA", font=f_pat_lbl, fill=(192, 40, 50, 255), anchor="mm")
+
+    f_pat_nome, pat_nome_txt = _card_ajustar_titulo(d_main, pat["nome"].upper(), "black", 48, 30, 660, remover_simbolos=True)
+    d_main.text((LCX + 2, 1198), pat_nome_txt, font=f_pat_nome, fill=(0, 0, 0, 255), anchor="mm")
+    d_main.text((LCX, 1194), pat_nome_txt, font=f_pat_nome, fill=(252, 240, 242, 255), anchor="mm")
+
+    f_role = _card_carregar_fonte("bold", 22)
+    cargo_limpo = _card_limpar_texto(cargo_nome or "", f_role, "", remover_simbolos=True).strip(" -•|")
+    if cargo_limpo:
+        role_str = f"CARGO ATIVO: {_card_truncar_px(d_main, cargo_limpo.upper(), f_role, 450, remover_simbolos=True)}"
+    else:
+        role_str = f"PATAMAR DA PATENTE: {pat['min_pts']} PTS"
+    rw = int(d_main.textlength(role_str, font=f_role)) + 52
+    rx1, ry1, rx2, ry2 = LCX - rw // 2, 1240, LCX + rw // 2, 1288
+    d_main.polygon(_card_pts_chanfro(rx1, ry1, rx2, ry2, 10, 10, 10, 10), fill=(24, 5, 9, 255), outline=(122, 12, 22, 255), width=2)
+    d_main.text((LCX, (ry1 + ry2) / 2), role_str, font=f_role, fill=(224, 174, 180, 255), anchor="mm")
+
+    # Painel direito 1: Progressão de Carreira & Pontos
+    RX1, RX2 = 876, W - 76
+    PY1, PY2 = 182, 502
+    _card_painel_tatico(
+        card, (RX1, PY1, RX2, PY2),
+        c_tl=32, c_tr=12, c_br=32, c_bl=12,
+        topo_rgba=(18, 6, 8, 248),
+        base_rgba=(6, 5, 7, 252),
+        borda_rgba=(120, 12, 22, 235),
+        acento_topo=True,
+    )
+    d_main = ImageDraw.Draw(card, "RGBA")
+
+    f_sec = _card_carregar_fonte("bold", 23)
+    f_pts_num = _card_carregar_fonte("black", 76)
+    f_pts_lbl = _card_carregar_fonte("bold", 22)
+    f_meta = _card_carregar_fonte("bold", 23)
+
+    d_main.text((RX1 + 48, PY1 + 36), "PROGRESSÃO DE CARREIRA", font=f_sec, fill=(198, 28, 38, 255))
+
+    if prox:
+        faixa_total = max(1, int(prox["min_pts"]) - int(pat["min_pts"]))
+        avanco = max(0, int(dados["pontos"]) - int(pat["min_pts"]))
+        pct = min(1.0, avanco / faixa_total)
+        rota_txt = f"{pat['nome'].upper()}   ▸   {prox['nome'].upper()}"
+        rodape_esq = f"BASE DA FAIXA: {pat['min_pts']} PTS"
+        rodape_dir = f"FALTAM {dados['faltam_pts']} PTS P/ {prox['nome'].upper()}  •  {int(round(pct * 100))}%"
+    else:
+        pct = 1.0
+        rota_txt = f"{pat['nome'].upper()}   •   PATENTE MÁXIMA"
+        rodape_esq = f"TOPO DA HIERARQUIA ({pat['min_pts']}+ PTS)"
+        rodape_dir = "100% CONCLUÍDO  •  DOMÍNIO ABSOLUTO"
+
+    f_rota, rota_fit = _card_ajustar_titulo(d_main, rota_txt, "black", 38, 26, 940, remover_simbolos=True)
+    d_main.text((RX1 + 48, PY1 + 80), rota_fit, font=f_rota, fill=(248, 242, 244, 255))
+
+    pts_str = f"{int(dados['pontos'])}"
+    d_main.text((RX2 - 122, PY1 + 32), pts_str, font=f_pts_num, fill=(252, 244, 245, 255), anchor="ra")
+    d_main.text((RX2 - 48, PY1 + 58), "PTS", font=f_sec, fill=(196, 14, 24, 255), anchor="ra")
+    d_main.text((RX2 - 48, PY1 + 114), "PONTUAÇÃO VITALÍCIA", font=f_pts_lbl, fill=(172, 114, 120, 255), anchor="ra")
+
+    BX1, BY1, BX2, BY2 = RX1 + 48, PY1 + 172, RX2 - 48, PY1 + 228
+    d_main.polygon(_card_pts_chanfro(BX1 - 10, BY1 - 10, BX2 + 10, BY2 + 10, 12, 12, 12, 12), fill=(5, 4, 6, 255), outline=(74, 10, 18, 255), width=3)
+
+    n_segs = 22
+    incl_seg = 14
+    gap_seg = 8
+    larg_util = (BX2 - BX1) - incl_seg
+    seg_w = (larg_util - gap_seg * (n_segs - 1)) / n_segs
+    segs_ativos = int(round(pct * n_segs))
+    if pct > 0 and segs_ativos == 0:
+        segs_ativos = 1
+
+    if segs_ativos > 0:
+        bar_pad = 24
+        gb_w, gb_h = (BX2 - BX1) + bar_pad * 2, (BY2 - BY1) + bar_pad * 2
+        glow_bar = Image.new("RGBA", (gb_w, gb_h), (0, 0, 0, 0))
+        dgb = ImageDraw.Draw(glow_bar)
+        for s in range(segs_ativos):
+            sx1 = bar_pad + s * (seg_w + gap_seg)
+            sx2 = sx1 + seg_w
+            pol_g = [(sx1 + incl_seg, bar_pad), (sx2 + incl_seg, bar_pad), (sx2, bar_pad + (BY2 - BY1)), (sx1, bar_pad + (BY2 - BY1))]
+            dgb.polygon(pol_g, fill=(185, 10, 18, 95))
+        glow_bar = glow_bar.filter(ImageFilter.GaussianBlur(radius=12))
+        card.alpha_composite(glow_bar, dest=(BX1 - bar_pad, BY1 - bar_pad))
+        d_main = ImageDraw.Draw(card, "RGBA")
+
+    for s in range(n_segs):
+        sx1 = BX1 + s * (seg_w + gap_seg)
+        sx2 = sx1 + seg_w
+        pol_s = [(sx1 + incl_seg, BY1), (sx2 + incl_seg, BY1), (sx2, BY2), (sx1, BY2)]
+        if s < segs_ativos:
+            t = s / max(1, n_segs - 1)
+            r_c = int(92 + t * 112)
+            g_c = int(4 + t * 12)
+            b_c = int(8 + t * 14)
+            r_hi = min(255, r_c + 34)
+            g_hi = min(255, g_c + 18)
+            b_hi = min(255, b_c + 20)
+            d_main.polygon(pol_s, fill=(r_c, g_c, b_c, 255), outline=(min(255, r_c + 42), 26, 32, 255), width=2)
+            pol_top = [
+                (sx1 + incl_seg + 2, BY1 + 2),
+                (sx2 + incl_seg - 2, BY1 + 2),
+                (sx2 + incl_seg * 0.64 - 2, BY1 + (BY2 - BY1) * 0.35),
+                (sx1 + incl_seg * 0.64 + 2, BY1 + (BY2 - BY1) * 0.35),
+            ]
+            d_main.polygon(pol_top, fill=(r_hi, g_hi, b_hi, 255))
+        else:
+            d_main.polygon(pol_s, fill=(18, 10, 13, 255), outline=(46, 14, 20, 255), width=2)
+
+    d_main.text((BX1, PY2 - 54), rodape_esq, font=f_meta, fill=(172, 118, 124, 255))
+    d_main.text((BX2, PY2 - 54), rodape_dir, font=f_meta, fill=(244, 204, 208, 255), anchor="ra")
+
+    # Grid 2x2 de Estatísticas
+    GAP = 28
+    CW = (RX2 - RX1 - GAP) // 2
+    CH = 258
+    GY1 = 532
+    GY2 = GY1 + CH + GAP
+
+    f_card_lbl = _card_carregar_fonte("bold", 22)
+    f_card_sub = _card_carregar_fonte("regular", 23)
+
+    winrate = float(dados.get("winrate") or 0.0)
+    if dados["partidas"] <= 0 and dados["vitorias"] <= 0:
+        tag_wr = "SEM REGISTROS"
+    elif winrate >= 45.0:
+        tag_wr = "TAXA DOMINANTE"
+    elif winrate >= 25.0:
+        tag_wr = "ALTO DESEMPENHO"
+    elif winrate >= 12.0:
+        tag_wr = "RITMO COMPETITIVO"
+    else:
+        tag_wr = "EM EVOLUÇÃO"
+
+    streak_atual = int(dados.get("streak_atual") or 0)
+    maior_streak = int(dados.get("maior_streak") or 0)
+    streak_val_txt = f"{streak_atual}x" if streak_atual > 0 else "0"
+    streak_sub_txt = f"Recorde: {maior_streak} vitória(s)  •  Lines: {dados['qtd_lines']}"
+
+    cards_cfg = (
+        (RX1, GY1, "DIÁRIOS JOGADOS", f"{dados['partidas']}", "Salas confirmadas (+1 pt cada)", "partidas"),
+        (RX1 + CW + GAP, GY1, "VITÓRIAS (TOP 1)", f"{dados['vitorias']}", "Booyahs oficiais (+3 pts cada)", "vitorias"),
+        (RX1, GY2, "APROVEITAMENTO", f"{winrate:.1f}%", f"Status: {tag_wr}", "winrate"),
+        (RX1 + CW + GAP, GY2, "SEQUÊNCIA ATUAL", streak_val_txt, streak_sub_txt, "streak"),
+    )
+
+    for cx1, cy1, titulo_m, valor_m, sub_m, icone_m in cards_cfg:
+        cx2, cy2 = cx1 + CW, cy1 + CH
+        _card_painel_tatico(
+            card, (cx1, cy1, cx2, cy2),
+            c_tl=22, c_tr=10, c_br=22, c_bl=10,
+            topo_rgba=(16, 5, 7, 247),
+            base_rgba=(6, 5, 7, 252),
+            borda_rgba=(106, 10, 20, 230),
+            acento_topo=False,
+            acento_esq=True,
+        )
+        d_main = ImageDraw.Draw(card, "RGBA")
+        d_main.text((cx1 + 42, cy1 + 32), titulo_m, font=f_card_lbl, fill=(196, 38, 48, 255))
+        f_val_fit, val_fit = _card_ajustar_titulo(d_main, valor_m, "black", 68, 44, CW - 230)
+        d_main.text((cx1 + 44, cy1 + 85), val_fit, font=f_val_fit, fill=(0, 0, 0, 255))
+        d_main.text((cx1 + 42, cy1 + 82), val_fit, font=f_val_fit, fill=(252, 245, 246, 255))
+        d_main.text((cx1 + 42, cy2 - 58), _card_truncar_px(d_main, sub_m, f_card_sub, CW - 80), font=f_card_sub, fill=(176, 128, 134, 255))
+
+        if icone_m == "winrate":
+            gx, gy, gr = cx2 - 96, cy1 + 114, 58
+            if winrate > 0:
+                _card_glow_radial_local(card, gx, gy, 76, 76, (168, 10, 18), 85)
+                d_main = ImageDraw.Draw(card, "RGBA")
+            d_main.ellipse((gx - gr, gy - gr, gx + gr, gy + gr), outline=(40, 10, 15, 255), width=14)
+            ang_fim = -90 + int(round(min(100.0, max(0.0, winrate)) * 3.6))
+            if ang_fim > -90:
+                d_main.arc((gx - gr, gy - gr, gx + gr, gy + gr), start=-90, end=ang_fim, fill=(196, 14, 24, 255), width=14)
+            d_main.ellipse((gx - gr + 22, gy - gr + 22, gx + gr - 22, gy + gr - 22), fill=(20, 5, 8, 255), outline=(118, 12, 22, 255), width=3)
+            f_wr_mini = _card_carregar_fonte("bold", 21)
+            d_main.text((gx, gy), f"{int(round(winrate))}%", font=f_wr_mini, fill=(246, 214, 218, 255), anchor="mm")
+        else:
+            ix1, iy1, ix2, iy2 = cx2 - 146, cy1 + 44, cx2 - 40, cy1 + 150
+            d_main.polygon(_card_pts_chanfro(ix1, iy1, ix2, iy2, 18, 6, 18, 6), fill=(24, 4, 8, 255), outline=(136, 12, 22, 255), width=3)
+            _card_icone_modulo(d_main, icone_m, (ix1 + ix2) / 2, (iy1 + iy2) / 2, 34)
+
+    # Faixa tática inferior (Squad & Última Participação)
+    FY1, FY2 = GY2 + CH + GAP, 1324
+    _card_painel_tatico(
+        card, (RX1, FY1, RX2, FY2),
+        c_tl=22, c_tr=10, c_br=26, c_bl=10,
+        topo_rgba=(16, 5, 7, 248),
+        base_rgba=(6, 5, 7, 252),
+        borda_rgba=(112, 12, 22, 230),
+        acento_topo=False,
+        acento_esq=True,
+    )
+    d_main = ImageDraw.Draw(card, "RGBA")
+    mid_fx = (RX1 + RX2) // 2
+    d_main.line([(mid_fx, FY1 + 28), (mid_fx, FY2 - 28)], fill=(92, 10, 18, 255), width=3)
+
+    f_ft_lbl = _card_carregar_fonte("bold", 21)
+    f_ft_val = _card_carregar_fonte("bold", 30)
+    f_ft_sub = _card_carregar_fonte("regular", 22)
+
+    _card_icone_modulo(d_main, "squad", RX1 + 66, (FY1 + FY2) / 2, 30)
+    d_main.text((RX1 + 118, FY1 + 30), "LINE FAVORITA & SQUADS", font=f_ft_lbl, fill=(196, 38, 48, 255))
+    line_fav = dados.get("line_favorita") or "Nenhuma line salva (/lines)"
+    d_main.text((RX1 + 118, FY1 + 68), _card_truncar_px(d_main, line_fav, f_ft_val, mid_fx - RX1 - 148), font=f_ft_val, fill=(248, 240, 242, 255))
+    d_main.text((RX1 + 118, FY1 + 114), f"{dados.get('qtd_lines', 0)} line(s) registrada(s) no servidor", font=f_ft_sub, fill=(172, 124, 130, 255))
+
+    _card_icone_modulo(d_main, "relogio", mid_fx + 62, (FY1 + FY2) / 2, 30)
+    d_main.text((mid_fx + 114, FY1 + 30), "ÚLTIMA SALA CONFIRMADA", font=f_ft_lbl, fill=(196, 38, 48, 255))
+    ult = dados.get("ultima")
+    if ult:
+        tipo_u = str(ult.get("tipo") or "4x4").upper()
+        cat_u = str(ult.get("categoria") or "Mobile").title()
+        hor_u = str(ult.get("horario") or "—")
+        dt_fmt = _card_formatar_data_curta(ult.get("criado_em"))
+        ult_principal = f"{tipo_u} {cat_u}  •  {hor_u}"
+        ult_sec = f"Confirmado em {dt_fmt}" if dt_fmt else "Inscrição confirmada recentemente"
+    else:
+        ult_principal = "Sem diário recente"
+        ult_sec = "Participe de uma sala para pontuar (+1 pt)"
+    d_main.text((mid_fx + 114, FY1 + 68), _card_truncar_px(d_main, ult_principal, f_ft_val, RX2 - mid_fx - 144), font=f_ft_val, fill=(248, 240, 242, 255))
+    d_main.text((mid_fx + 114, FY1 + 114), _card_truncar_px(d_main, ult_sec, f_ft_sub, RX2 - mid_fx - 144), font=f_ft_sub, fill=(172, 124, 130, 255))
+
+    f_micro = _card_carregar_fonte("bold", 19)
+    d_main.text((W // 2, H - 50), "FIRE FORCE COMPETITIVE SYSTEM   •   DIÁRIO +1 PT   •   VITÓRIA +3 PTS", font=f_micro, fill=(142, 72, 80, 255), anchor="mm")
+
+    final_rgb = card.convert("RGB").resize((W // 2, H // 2), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    final_rgb.save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+class PerfilCardPublicarView(discord.ui.View):
+    """Menu discreto para publicar o Card Competitivo no chat (sem dados privados da carteira)."""
+
+    def __init__(
+        self,
+        autor_id: int,
+        alvo_nome: str,
+        pat_emoji: str,
+        pat_nome: str,
+        cargo_txt: str,
+        pontos: int,
+        png_bytes: bytes,
+    ):
+        super().__init__(timeout=180)
+        self.autor_id = int(autor_id)
+        self.alvo_nome = alvo_nome
+        self.pat_emoji = pat_emoji
+        self.pat_nome = pat_nome
+        self.cargo_txt = cargo_txt
+        self.pontos = int(pontos)
+        self.png_bytes = png_bytes
+        self.publicado = False
+
+        sel = discord.ui.Select(
+            placeholder="🩸 Opções do Card Competitivo...",
+            options=[
+                discord.SelectOption(
+                    label="Exibir Card no Chat",
+                    value="publicar_chat",
+                    emoji="📤",
+                    description="Publica o card neste canal (sem saldo privado da carteira)",
+                ),
+            ],
+        )
+        sel.callback = self._acao
+        self.add_item(sel)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.autor_id:
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Painel privado", "Use `/perfil` para gerar o seu próprio card.", "Vermelho Escuro"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _acao(self, interaction: discord.Interaction):
+        if self.publicado:
+            return await interaction.response.send_message(
+                embed=criar_embed("✅ Já publicado", "Este card já foi exibido neste canal.", "Vermelho Escuro"),
+                ephemeral=True,
+            )
+        canal = interaction.channel
+        if not interaction.guild or not canal or not hasattr(canal, "send"):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Canal inválido", "Não foi possível publicar o card neste canal.", "Vermelho"),
+                ephemeral=True,
+            )
+        me = interaction.guild.me
+        perms = canal.permissions_for(me) if (me and hasattr(canal, "permissions_for")) else None
+        if perms and not (perms.send_messages and perms.attach_files and perms.embed_links):
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "🛠️ Permissão ausente",
+                    "O bot precisa de **Enviar mensagens**, **Inserir links** e **Anexar arquivos** neste canal.",
+                    "Vermelho",
+                ),
+                ephemeral=True,
+            )
+
+        self.publicado = True
+        await interaction.response.defer(ephemeral=True)
+        nome_arq = "perfil_fireforce.png"
+        arq_pub = discord.File(io.BytesIO(self.png_bytes), filename=nome_arq)
+        emb_pub = criar_embed(
+            f"{self.pat_emoji} Ficha Competitiva • {self.alvo_nome}",
+            f"**Patente:** {self.pat_emoji} **{self.pat_nome}**{self.cargo_txt} • **`{self.pontos} pts`**",
+            "Vermelho Escuro",
+            image=f"attachment://{nome_arq}",
+            footer="Fire Force • Use /perfil para ver sua ficha competitiva",
+        )
+        try:
+            await canal.send(
+                embed=emb_pub,
+                file=arq_pub,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            self.publicado = False
+            return await interaction.followup.send(
+                embed=criar_embed("⚠️ Falha ao enviar", "Verifique as permissões de envio de imagem neste canal.", "Amarelo"),
+                ephemeral=True,
+            )
+
+        try:
+            await interaction.edit_original_response(view=None)
+        except Exception:
+            pass
+        await interaction.followup.send(
+            embed=criar_embed("📤 Card Exibido!", "O card competitivo foi publicado no canal.", "Vermelho Escuro"),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="perfil", description="🎖️ Ficha competitiva HD: card visual, patente, vitórias, winrate e sequência")
 @app_commands.guild_only()
-@app_commands.describe(usuario="Jogador (opcional; por padrão, seu próprio perfil)")
+@app_commands.describe(
+    usuario="Jogador (opcional; por padrão, seu próprio perfil)",
+    publico="Mostrar o card diretamente no chat para todos verem (padrão: privado)",
+)
 async def cmd_perfil(interaction: discord.Interaction,
-                     usuario: Optional[discord.Member] = None):
+                     usuario: Optional[discord.Member] = None,
+                     publico: Optional[bool] = False):
     if not interaction.guild:
         return await interaction.response.send_message(
             embed=criar_embed("❌ Só no servidor", "Use este comando dentro do servidor.", "Vermelho"),
             ephemeral=True)
+
+    efemero = not bool(publico)
+    await interaction.response.defer(ephemeral=efemero)
     alvo = usuario or interaction.user
 
     # Garante cargo de patente sincronizado automaticamente
@@ -8986,37 +10029,92 @@ async def cmd_perfil(interaction: discord.Interaction,
     pat = dados["patente"]
     prox = dados["proxima_patente"]
 
+    cargos_pat = await obter_cargos_patentes(interaction.guild.id)
+    rid_pat = cargos_pat.get(pat["slug"])
+    role_pat = interaction.guild.get_role(rid_pat) if rid_pat else None
+    cargo_txt = f" ({role_pat.mention})" if role_pat else ""
+    cargo_nome_card = role_pat.name if role_pat else ""
+
+    png_bytes: Optional[bytes] = None
+    if _PIL_DISPONIVEL:
+        try:
+            avatar_bytes = await _obter_avatar_bytes_membro(alvo)
+            png_bytes = await asyncio.to_thread(
+                renderizar_card_perfil_png,
+                user_id=int(alvo.id),
+                display_name=str(getattr(alvo, "display_name", "") or getattr(alvo, "name", "")),
+                username=str(getattr(alvo, "name", "") or ""),
+                guild_name=str(getattr(interaction.guild, "name", "") or "FIRE FORCE"),
+                cargo_nome=cargo_nome_card,
+                dados=dados,
+                avatar_bytes=avatar_bytes,
+            )
+        except Exception as erro_card:
+            _log_arquivo(f"[PERFIL] falha ao renderizar card PNG user={alvo.id}: {erro_card}")
+            png_bytes = None
+
+    if png_bytes:
+        nome_arq = "perfil_fireforce.png"
+        arquivo_card = discord.File(io.BytesIO(png_bytes), filename=nome_arq)
+        embed = criar_embed(
+            f"{pat['emoji']} Ficha Competitiva • {alvo.display_name}",
+            f"**Patente Atual:** {pat['emoji']} **{pat['nome']}**{cargo_txt} • **`{dados['pontos']} pts`**",
+            "Vermelho Escuro",
+            image=f"attachment://{nome_arq}",
+            footer="Fire Force • Pontuação: cada Diário = +1 pt | cada Vitória = +3 pts",
+        )
+        if efemero and alvo.id == interaction.user.id:
+            saldo = await saldo_carteira(alvo.id, interaction.guild.id)
+            vip_qtd = await obter_vagas_vip_usuario(interaction.guild.id, alvo.id)
+            vip_str = f" • 🎟️ **Vagas VIP:** {formatar_qtd_vaga_vip(vip_qtd)}" if vip_qtd != 0 else ""
+            embed.add_field(
+                name="🔒 Seus Recursos Privados (só você vê)",
+                value=f"🪙 **Carteira:** `{formatar_moeda(saldo)}`{vip_str}",
+                inline=False,
+            )
+        view_pub = (
+            PerfilCardPublicarView(
+                autor_id=interaction.user.id,
+                alvo_nome=alvo.display_name,
+                pat_emoji=pat["emoji"],
+                pat_nome=pat["nome"],
+                cargo_txt=cargo_txt,
+                pontos=dados["pontos"],
+                png_bytes=png_bytes,
+            )
+            if efemero
+            else None
+        )
+        kwargs_envio = {"embed": embed, "file": arquivo_card, "ephemeral": efemero}
+        if view_pub is not None:
+            kwargs_envio["view"] = view_pub
+        return await interaction.followup.send(**kwargs_envio)
+
+    # Fallback em texto caso Pillow não esteja instalado no ambiente
     if prox:
         faixa_total = max(1, int(prox["min_pts"]) - int(pat["min_pts"]))
         avanco = max(0, int(dados["pontos"]) - int(pat["min_pts"]))
         pct_bar = min(1.0, avanco / faixa_total)
         blocos = int(round(pct_bar * 10))
-        barra = "🟩" * blocos + "⬛" * (10 - blocos)
+        barra = "🟥" * blocos + "⬛" * (10 - blocos)
         progresso_txt = (
             f"`{barra}` **{int(pct_bar * 100)}%**\n"
             f"• Pontos: **`{dados['pontos']} pts`** • Faltam **`{dados['faltam_pts']} pts`** para {prox['emoji']} **{prox['nome']}**"
         )
     else:
         progresso_txt = (
-            f"`🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩` **100% (TOPO MÁXIMO)**\n"
+            f"`🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥` **100% (TOPO MÁXIMO)**\n"
             f"• Pontos acumulados: **`{dados['pontos']} pts`** • Patente máxima alcançada!"
         )
 
-    cargos_pat = await obter_cargos_patentes(interaction.guild.id)
-    rid_pat = cargos_pat.get(pat["slug"])
-    role_pat = interaction.guild.get_role(rid_pat) if rid_pat else None
-    cargo_txt = f" ({role_pat.mention})" if role_pat else ""
-
-    cor_perfil = "Dourado" if pat["min_pts"] >= 140 else ("Esmeralda" if pat["min_pts"] >= 35 else "Cinza Escuro")
     embed = criar_embed(
         f"{pat['emoji']} Perfil Competitivo • {alvo.display_name}",
         f"**Patente Atual:** {pat['emoji']} **{pat['nome']}**{cargo_txt}\n"
         f"{progresso_txt}",
-        cor_perfil,
+        "Vermelho Escuro",
         thumb=alvo.display_avatar.url,
         footer="Fire Force • Pontuação: cada Diário = +1 pt | cada Vitória = +3 pts",
     )
-
     streak_str = (
         f"🔥 **{dados['streak_atual']} seguida(s)** *(recorde: `{dados['maior_streak']}`)*"
         if dados["streak_atual"] > 0
@@ -9040,7 +10138,6 @@ async def cmd_perfil(interaction: discord.Interaction,
         ),
         inline=True,
     )
-
     ultima = dados.get("ultima")
     if ultima:
         data_txt = str(ultima.get("criado_em") or "")[:16].replace("T", " ") or "—"
@@ -9052,7 +10149,7 @@ async def cmd_perfil(interaction: discord.Interaction,
         ultima_txt = "Nenhum diário recente nos últimos 35 dias."
     embed.add_field(name="🕒 Última Participação", value=ultima_txt, inline=False)
 
-    if alvo.id == interaction.user.id:
+    if efemero and alvo.id == interaction.user.id:
         saldo = await saldo_carteira(alvo.id, interaction.guild.id)
         vip_qtd = await obter_vagas_vip_usuario(interaction.guild.id, alvo.id)
         vip_str = f" • 🎟️ **Vagas VIP:** {formatar_qtd_vaga_vip(vip_qtd)}" if vip_qtd != 0 else ""
@@ -9062,7 +10159,7 @@ async def cmd_perfil(interaction: discord.Interaction,
             inline=False,
         )
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=efemero)
 
 
 class ConfirmarAnuncioView(discord.ui.View):
