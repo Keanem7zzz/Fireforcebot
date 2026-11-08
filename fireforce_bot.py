@@ -5,7 +5,7 @@
 #  • Consulta de ID do Free Fire OB55 confiável (corrida multi-provedores +
 #    regiões + cache de 24h + disjuntor) — seção 'CONSULTA DE ID FREE FIRE'
 #  • Inscrição obrigatória por ID numérico do Free Fire (puxa Nick e Level na API)
-#  • Tabela do diário em TEXTO: "1. (nick)" — sem imagem, sem contador
+#  • Tabela Oficial do Diário em IMAGEM HD (Solo, Duo, Trio e Squad) — Vermelho Escuro & Preto
 #  • Vaga e acesso liberados depois do pagamento aprovado pelo ADM
 #  • CARTEIRA: painel minimalista privado, depósito/saque PIX direto aos Donos e moedas do bot
 #  • v11.6: Log completo de ganhos/recebimentos do ADM (com cupom/desconto,
@@ -92,7 +92,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.1"
+VERSAO_BOT = "13.2"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -2804,15 +2804,20 @@ async def remover_pix_adm(user_id: int, guild_id: int) -> bool:
     return False
 
 
-# ==================== TABELA EM TEXTO — "1. (NICK)" ====================
-# Nada de imagem e nada de contador de pagamento: só a lista das vagas.
-#    1. ()
-#    2. (ㅤFXㅤWINNER)
-#    3. ()
-# Fica no canal do diário e se atualiza sozinha a cada 15 segundos.
+# ==================== v13.2: TABELA OFICIAL EM IMAGEM HD (SOLO, DUO, TRIO, SQUAD) ====================
+
+_TABELA_ASSINATURA_CACHE: dict = {}
+_ROTULOS_CATEGORIA_CARD = {
+    "basico": "BÁSICO",
+    "premium": "PREMIUM",
+    "mobile": "MOBILE",
+    "misto": "MISTO",
+    "emulador": "EMULADOR",
+}
+
 
 def montar_lista_vagas(tipo: str, slots_data: list) -> str:
-    """Lista numerada dos lotes: `N. (nomes)` — vazio vira `N. ()`."""
+    """Lista numerada de fallback em texto: `N. (nomes)`."""
     total = LOTES_POR_MODO.get((tipo or "solo").lower(), len(slots_data or []))
     linhas = []
     for indice in range(total):
@@ -2830,7 +2835,7 @@ def montar_lista_vagas(tipo: str, slots_data: list) -> str:
 
 def montar_embed_tabela(horario: dict, slots_data: list, ocupadas: int = 0,
                         atualizado_em: str = "") -> discord.Embed:
-    """Embed com a lista das vagas em texto (layout simples, como era antes)."""
+    """Fallback de segurança caso Pillow não esteja disponível no ambiente."""
     tipo = (horario.get("tipo") or "solo").lower()
     categoria = horario.get("categoria") or "premium"
     total = LOTES_POR_MODO.get(tipo, 48)
@@ -2846,9 +2851,421 @@ def montar_embed_tabela(horario: dict, slots_data: list, ocupadas: int = 0,
     return criar_embed(
         titulo=f"🔥 {formatar_rotulo_diario(tipo, categoria)} — {horario.get('horario', '--:--')}",
         descricao=descricao,
-        cor_nome="Fire Force",
-        footer=("Atualização automática a cada 15s" + (f" • {atualizado_em}" if atualizado_em else ""))
+        cor_nome="Vermelho Escuro",
+        footer=("Fire Force • Tabela Oficial em Tempo Real" + (f" • {atualizado_em}" if atualizado_em else "")),
     )
+
+
+def renderizar_tabela_sala_png(
+    horario: dict,
+    slots_data: list,
+    ocupadas: int = 0,
+    atualizado_em: str = "",
+) -> bytes:
+    """Renderiza a Tabela Oficial de Posições (Solo/Duo/Trio/Squad) em PNG HD (2x SSAA) Vermelho Escuro & Preto."""
+    tipo = str(horario.get("tipo") or "solo").lower()
+    cat_raw = str(horario.get("categoria") or "premium").lower()
+    cat_up = _ROTULOS_CATEGORIA_CARD.get(cat_raw, cat_raw.upper())
+    hora_str = str(horario.get("horario") or "--:--")
+    premiacao = str(horario.get("premiacao") or "Por Kill")
+    valor_str = formatar_moeda(horario.get("valor"))
+    total = int(LOTES_POR_MODO.get(tipo, len(slots_data or []) or 12))
+    jog_por_lote = int(JOGADORES_POR_LOTE.get(tipo, 1))
+    rotulo_unidades = "VAGAS" if tipo == "solo" else "LOTES"
+    rotulo_unidade_sing = "VAGA" if tipo == "solo" else "LOTE"
+
+    if tipo == "squad" and total == 12:
+        W, H = 2640, 1960
+        cols, rows = 3, 4
+        ordem_coluna = False
+    elif tipo == "trio" and total == 16:
+        W, H = 2760, 1860
+        cols, rows = 4, 4
+        ordem_coluna = False
+    elif tipo == "duo" and total == 24:
+        W, H = 2760, 1920
+        cols, rows = 4, 6
+        ordem_coluna = True
+    elif tipo == "solo" and total == 48:
+        W, H = 2760, 1980
+        cols, rows = 4, 12
+        ordem_coluna = True
+    else:
+        cols = 2 if total <= 4 else (3 if total <= 12 else 4)
+        rows = max(1, math.ceil(total / cols))
+        W = 2640 if cols <= 3 else 2760
+        H = max(1100, min(2200, 480 + rows * (118 if jog_por_lote == 1 else (225 if jog_por_lote == 2 else 340))))
+        ordem_coluna = jog_por_lote <= 2
+
+    card = _card_gradiente_vertical(W, H, (9, 4, 6, 255), (4, 4, 6, 255))
+
+    _card_glow_radial_local(card, 480, 320, 720, 520, (116, 5, 10), 135)
+    _card_glow_radial_local(card, W - 440, 280, 760, 500, (96, 4, 9), 120)
+    _card_glow_radial_local(card, W // 2, H - 220, 980, 420, (82, 4, 8), 95)
+
+    bg_fx = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    db = ImageDraw.Draw(bg_fx)
+
+    faixas = (
+        (-160, 340, 40, (112, 6, 14, 24)),
+        (260, 520, 68, (74, 4, 10, 28)),
+        (W - 980, 460, 76, (104, 6, 14, 24)),
+        (W - 420, 250, 52, (148, 10, 18, 28)),
+    )
+    for x_top, larg_f, alpha_lin, cor_f in faixas:
+        incl = 620
+        pol = [(x_top, 0), (x_top + larg_f, 0), (x_top + larg_f - incl, H), (x_top - incl, H)]
+        db.polygon(pol, fill=cor_f)
+        db.line([(x_top + larg_f, 0), (x_top + larg_f - incl, H)], fill=(172, 12, 22, alpha_lin), width=3)
+
+    for gx in range(W - 860, W - 70, 40):
+        for gy in range(80, 420, 40):
+            db.rectangle((gx, gy, gx + 4, gy + 4), fill=(188, 16, 26, 26))
+
+    seed_h = int(horario.get("id") or 77) ^ 0xFF55
+    rng = random.Random(seed_h)
+    for _ in range(28):
+        ex = rng.randint(70, W - 70)
+        ey = rng.randint(90, H - 70)
+        er = rng.randint(3, 7)
+        ea = rng.randint(20, 64)
+        db.ellipse((ex - er, ey - er, ex + er, ey + er), fill=(195, 14, 24, ea))
+
+    moldura_ext = _card_pts_chanfro(24, 24, W - 24, H - 24, 34, 34, 34, 34)
+    db.line(moldura_ext + [moldura_ext[0]], fill=(92, 8, 16, 230), width=4)
+    moldura_int = _card_pts_chanfro(36, 36, W - 36, H - 36, 28, 28, 28, 28)
+    db.line(moldura_int + [moldura_int[0]], fill=(38, 7, 12, 195), width=2)
+
+    tam_c = 92
+    cor_canto = (192, 14, 24, 255)
+    db.line([(24, 24 + tam_c), (24, 58), (58, 24), (24 + tam_c, 24)], fill=cor_canto, width=7)
+    db.line([(W - 24 - tam_c, 24), (W - 58, 24), (W - 24, 58), (W - 24, 24 + tam_c)], fill=cor_canto, width=7)
+    db.line([(24, H - 24 - tam_c), (24, H - 58), (58, H - 24), (24 + tam_c, H - 24)], fill=cor_canto, width=7)
+    db.line([(W - 24 - tam_c, H - 24), (W - 58, H - 24), (W - 24, H - 58), (W - 24, H - 24 - tam_c)], fill=cor_canto, width=7)
+
+    card = Image.alpha_composite(card, bg_fx)
+    d_main = ImageDraw.Draw(card, "RGBA")
+
+    LX, RX = 72, W - 72
+
+    # Barra superior
+    _card_chama_ff(d_main, LX + 26, 98, 27)
+    f_brand = _card_carregar_fonte("black", 40)
+    f_sub_hdr = _card_carregar_fonte("bold", 24)
+    f_pill = _card_carregar_fonte("bold", 24)
+
+    d_main.text((LX + 68, 75), "FIRE FORCE", font=f_brand, fill=(248, 242, 244, 255))
+    w_brand = d_main.textlength("FIRE FORCE", font=f_brand)
+    d_main.text((LX + 68 + w_brand + 24, 86), f"//  TABELA OFICIAL DE POSIÇÕES  •  {tipo.upper()}", font=f_sub_hdr, fill=(182, 62, 70, 255))
+
+    txt_cat = f"MODO {tipo.upper()}  •  CATEGORIA {cat_up}"
+    w_pill = int(d_main.textlength(txt_cat, font=f_pill)) + 68
+    px1, py1, px2, py2 = RX - w_pill, 68, RX, 128
+    d_main.polygon(_card_pts_chanfro(px1, py1, px2, py2, 16, 6, 16, 6), fill=(26, 4, 8, 255), outline=(154, 12, 20, 255), width=3)
+    d_main.text(((px1 + px2) / 2, (py1 + py2) / 2), txt_cat, font=f_pill, fill=(244, 224, 226, 255), anchor="mm")
+
+    d_main.line([(LX, 146), (RX, 146)], fill=(84, 8, 16, 255), width=2)
+    d_main.line([(LX, 146), (LX + 380, 146)], fill=(192, 14, 24, 255), width=5)
+
+    # Painel Hero da Sala (Horário, Premiação, Valor e Lotação)
+    HY1, HY2 = 168, 368
+    _card_painel_tatico(
+        card, (LX, HY1, RX, HY2),
+        c_tl=30, c_tr=12, c_br=30, c_bl=12,
+        topo_rgba=(18, 6, 8, 248),
+        base_rgba=(6, 5, 7, 252),
+        borda_rgba=(126, 12, 22, 240),
+        acento_topo=True,
+    )
+    d_main = ImageDraw.Draw(card, "RGBA")
+
+    f_h_lbl = _card_carregar_fonte("bold", 22)
+    f_chip = _card_carregar_fonte("bold", 23)
+
+    d_main.text((LX + 44, HY1 + 26), "DIÁRIO OFICIAL  •  HORÁRIO DE BRASÍLIA", font=f_h_lbl, fill=(196, 36, 46, 255))
+    tit_sala = f"{tipo.upper()} {cat_up}   •   {hora_str}"
+    f_t_fit, tit_fit = _card_ajustar_titulo(d_main, tit_sala, "black", 50, 34, (RX - LX) - 1020, remover_simbolos=True)
+    d_main.text((LX + 46, HY1 + 65), tit_fit, font=f_t_fit, fill=(0, 0, 0, 255))
+    d_main.text((LX + 44, HY1 + 62), tit_fit, font=f_t_fit, fill=(252, 245, 246, 255))
+
+    prem_limpa = _card_truncar_px(d_main, premiacao.upper(), f_chip, 440, remover_simbolos=True)
+    chips_info = (
+        f"PREMIAÇÃO: {prem_limpa}",
+        f"VALOR: {valor_str.upper()}",
+    )
+    cx_chip = LX + 44
+    cy_chip1, cy_chip2 = HY2 - 64, HY2 - 20
+    for ch_txt in chips_info:
+        cw_c = int(d_main.textlength(ch_txt, font=f_chip)) + 44
+        d_main.polygon(
+            _card_pts_chanfro(cx_chip, cy_chip1, cx_chip + cw_c, cy_chip2, 10, 6, 10, 6),
+            fill=(28, 5, 9, 255), outline=(124, 12, 22, 255), width=2,
+        )
+        d_main.text((cx_chip + cw_c / 2, (cy_chip1 + cy_chip2) / 2), ch_txt, font=f_chip, fill=(238, 206, 210, 255), anchor="mm")
+        cx_chip += cw_c + 18
+
+    ocup_int = max(0, min(total, int(ocupadas or 0)))
+    pct_lot = min(1.0, ocup_int / max(1, total))
+
+    BX1, BX2 = RX - 880, RX - 44
+    BY1, BY2 = HY1 + 114, HY1 + 160
+
+    f_lot_num = _card_carregar_fonte("black", 62)
+    f_lot_tot = _card_carregar_fonte("bold", 34)
+    f_lot_lbl = _card_carregar_fonte("bold", 22)
+
+    status_lot = "SALA LOTADA  •  100%" if ocup_int >= total else f"LOTAÇÃO DA SALA  •  {int(round(pct_lot * 100))}%"
+    cor_status_lot = (232, 34, 46, 255) if ocup_int >= total else (196, 38, 48, 255)
+    d_main.text((BX1, HY1 + 32), status_lot, font=f_lot_lbl, fill=cor_status_lot)
+    restantes = max(0, total - ocup_int)
+    sub_rest = "NENHUMA VAGA RESTANTE" if restantes == 0 else f"{restantes} {rotulo_unidades if restantes > 1 else rotulo_unidade_sing} DISPONÍVEIS"
+    d_main.text((BX1, HY1 + 66), sub_rest, font=f_lot_lbl, fill=(176, 122, 128, 255))
+
+    tot_part = f"/ {total} {rotulo_unidades}"
+    w_tot_part = d_main.textlength(tot_part, font=f_lot_tot)
+    d_main.text((BX2, HY1 + 52), tot_part, font=f_lot_tot, fill=(192, 46, 56, 255), anchor="ra")
+    d_main.text((BX2 - w_tot_part - 14, HY1 + 28), f"{ocup_int:02d}", font=f_lot_num, fill=(252, 245, 246, 255), anchor="ra")
+
+    d_main.polygon(_card_pts_chanfro(BX1 - 8, BY1 - 8, BX2 + 8, BY2 + 8, 10, 10, 10, 10), fill=(5, 4, 6, 255), outline=(74, 10, 18, 255), width=3)
+    n_segs = 20
+    incl_seg = 12
+    gap_seg = 7
+    larg_util = (BX2 - BX1) - incl_seg
+    seg_w = (larg_util - gap_seg * (n_segs - 1)) / n_segs
+    segs_ativos = int(round(pct_lot * n_segs))
+    if ocup_int > 0 and segs_ativos == 0:
+        segs_ativos = 1
+
+    if segs_ativos > 0:
+        bar_pad = 20
+        gb_w, gb_h = (BX2 - BX1) + bar_pad * 2, (BY2 - BY1) + bar_pad * 2
+        glow_bar = Image.new("RGBA", (gb_w, gb_h), (0, 0, 0, 0))
+        dgb = ImageDraw.Draw(glow_bar)
+        for s in range(segs_ativos):
+            sx1 = bar_pad + s * (seg_w + gap_seg)
+            sx2 = sx1 + seg_w
+            dgb.polygon([(sx1 + incl_seg, bar_pad), (sx2 + incl_seg, bar_pad), (sx2, bar_pad + (BY2 - BY1)), (sx1, bar_pad + (BY2 - BY1))], fill=(185, 10, 18, 92))
+        glow_bar = glow_bar.filter(ImageFilter.GaussianBlur(radius=11))
+        card.alpha_composite(glow_bar, dest=(BX1 - bar_pad, BY1 - bar_pad))
+        d_main = ImageDraw.Draw(card, "RGBA")
+
+    for s in range(n_segs):
+        sx1 = BX1 + s * (seg_w + gap_seg)
+        sx2 = sx1 + seg_w
+        pol_s = [(sx1 + incl_seg, BY1), (sx2 + incl_seg, BY1), (sx2, BY2), (sx1, BY2)]
+        if s < segs_ativos:
+            t = s / max(1, n_segs - 1)
+            r_c = int(94 + t * 112)
+            g_c = int(4 + t * 12)
+            b_c = int(8 + t * 14)
+            d_main.polygon(pol_s, fill=(r_c, g_c, b_c, 255), outline=(min(255, r_c + 42), 26, 32, 255), width=2)
+            pol_top = [
+                (sx1 + incl_seg + 2, BY1 + 2),
+                (sx2 + incl_seg - 2, BY1 + 2),
+                (sx2 + incl_seg * 0.64 - 2, BY1 + (BY2 - BY1) * 0.35),
+                (sx1 + incl_seg * 0.64 + 2, BY1 + (BY2 - BY1) * 0.35),
+            ]
+            d_main.polygon(pol_top, fill=(min(255, r_c + 34), min(255, g_c + 18), min(255, b_c + 20), 255))
+        else:
+            d_main.polygon(pol_s, fill=(18, 10, 13, 255), outline=(46, 14, 20, 255), width=2)
+
+    # Grade principal de Posições / Lotes
+    GY_TOP = 396
+    GY_BOT = H - 88
+    gap_x = 24
+    gap_y = 16 if jog_por_lote == 1 else (20 if jog_por_lote == 2 else 24)
+
+    cell_w = (RX - LX - gap_x * (cols - 1)) / cols
+    cell_h = (GY_BOT - GY_TOP - gap_y * (rows - 1)) / rows
+
+    cw_i, ch_i = int(round(cell_w)), int(round(cell_h))
+    grad_ocup = _card_gradiente_vertical(cw_i, ch_i, (26, 6, 10, 255), (8, 5, 7, 255))
+    _card_glow_radial_local(grad_ocup, int(cw_i * 0.16), int(ch_i * 0.25), int(cw_i * 0.55), int(ch_i * 0.70), (138, 8, 16), 48)
+    grad_livre = _card_gradiente_vertical(cw_i, ch_i, (12, 7, 9, 255), (6, 5, 7, 255))
+
+    c_cut = 14 if jog_por_lote == 1 else 20
+    masc_cell = Image.new("L", (cw_i, ch_i), 0)
+    ImageDraw.Draw(masc_cell).polygon(_card_pts_chanfro(0, 0, cw_i, ch_i, c_cut, 6, c_cut, 6), fill=255)
+
+    f_num_solo = _card_carregar_fonte("black", 31)
+    f_nick_solo = _card_carregar_fonte("bold", 29)
+    f_livre_solo = _card_carregar_fonte("bold", 23)
+
+    f_num_duo = _card_carregar_fonte("black", 42)
+    f_sub_duo = _card_carregar_fonte("bold", 19)
+    f_nick_duo = _card_carregar_fonte("bold", 27)
+
+    f_hdr_team = _card_carregar_fonte("black", 25)
+    f_sts_team = _card_carregar_fonte("bold", 20)
+    f_idx_team = _card_carregar_fonte("bold", 22)
+    f_nick_team = _card_carregar_fonte("bold", 27)
+    f_livre_team = _card_carregar_fonte("bold", 25)
+
+    for idx in range(total):
+        if ordem_coluna:
+            col = idx // rows
+            row = idx % rows
+        else:
+            col = idx % cols
+            row = idx // cols
+
+        x1 = int(round(LX + col * (cell_w + gap_x)))
+        y1 = int(round(GY_TOP + row * (cell_h + gap_y)))
+        x2, y2 = x1 + cw_i, y1 + ch_i
+        num_pos = idx + 1
+
+        slot = slots_data[idx] if (slots_data and idx < len(slots_data)) else {}
+        confirmado = bool(slot.get("confirmado"))
+        nicks_brutos = []
+        if confirmado:
+            for jog in (slot.get("jogadores") or []):
+                nk = (jog.get("ff_nome") if isinstance(jog, dict) else jog) or ""
+                nk = str(nk).strip()
+                if nk:
+                    nicks_brutos.append(nk)
+
+        card.paste(grad_ocup if confirmado else grad_livre, (x1, y1), masc_cell)
+        d_main = ImageDraw.Draw(card, "RGBA")
+
+        pts_c = _card_pts_chanfro(x1, y1, x2, y2, c_cut, 6, c_cut, 6)
+        cor_borda = (186, 14, 24, 255) if confirmado else (52, 14, 20, 255)
+        d_main.line(pts_c + [pts_c[0]], fill=cor_borda, width=3 if confirmado else 2)
+
+        if jog_por_lote == 1:
+            tag_w = 104
+            pts_tag = _card_pts_chanfro(x1 + 3, y1 + 3, x1 + tag_w, y2 - 3, max(0, c_cut - 2), 0, 0, 4)
+            cor_tag = (146, 8, 16, 255) if confirmado else (24, 9, 13, 255)
+            d_main.polygon(pts_tag, fill=cor_tag)
+            d_main.line([(x1 + tag_w, y1 + 4), (x1 + tag_w, y2 - 4)], fill=(214, 34, 44, 255) if confirmado else (58, 16, 22, 255), width=3)
+            d_main.text((x1 + tag_w / 2 + 2, (y1 + y2) / 2), f"{num_pos:02d}", font=f_num_solo, fill=(252, 244, 245, 255) if confirmado else (136, 84, 92, 255), anchor="mm")
+
+            if confirmado:
+                nk_solo = nicks_brutos[0] if nicks_brutos else "Confirmado"
+                nk_limpo = _card_truncar_px(d_main, nk_solo, f_nick_solo, cw_i - tag_w - 52)
+                d_main.text((x1 + tag_w + 24, (y1 + y2) / 2), nk_limpo, font=f_nick_solo, fill=(250, 244, 245, 255), anchor="lm")
+                d_main.line([(x2 - 5, y1 + 18), (x2 - 5, y2 - 18)], fill=(208, 18, 30, 255), width=5)
+            else:
+                d_main.text((x1 + tag_w + 24, (y1 + y2) / 2), "DISPONÍVEL", font=f_livre_solo, fill=(84, 48, 54, 255), anchor="lm")
+
+        elif jog_por_lote == 2:
+            tag_w = 132
+            pts_tag = _card_pts_chanfro(x1 + 3, y1 + 3, x1 + tag_w, y2 - 3, max(0, c_cut - 2), 0, 0, 4)
+            cor_tag = (138, 8, 16, 255) if confirmado else (22, 9, 13, 255)
+            d_main.polygon(pts_tag, fill=cor_tag)
+            d_main.line([(x1 + tag_w, y1 + 4), (x1 + tag_w, y2 - 4)], fill=(212, 32, 42, 255) if confirmado else (58, 16, 22, 255), width=3)
+
+            cy_mid = (y1 + y2) / 2
+            d_main.text((x1 + tag_w / 2 + 2, cy_mid - 14), f"{num_pos:02d}", font=f_num_duo, fill=(252, 244, 245, 255) if confirmado else (132, 82, 90, 255), anchor="mm")
+            d_main.text((x1 + tag_w / 2 + 2, cy_mid + 30), "LOTE", font=f_sub_duo, fill=(244, 188, 194, 255) if confirmado else (98, 58, 64, 255), anchor="mm")
+
+            if confirmado:
+                d_main.line([(x1 + tag_w + 18, cy_mid), (x2 - 22, cy_mid)], fill=(72, 12, 20, 255), width=2)
+                for p_i in range(2):
+                    py_row = y1 + (ch_i * 0.27 if p_i == 0 else ch_i * 0.74)
+                    nk_p = nicks_brutos[p_i] if p_i < len(nicks_brutos) else "—"
+                    nk_limpo = _card_truncar_px(d_main, nk_p, f_nick_duo, cw_i - tag_w - 68)
+                    dx_d = x1 + tag_w + 26
+                    d_main.polygon([(dx_d, py_row - 7), (dx_d + 7, py_row), (dx_d, py_row + 7), (dx_d - 7, py_row)], fill=(204, 18, 30, 255))
+                    d_main.text((dx_d + 18, py_row), nk_limpo, font=f_nick_duo, fill=(250, 244, 245, 255), anchor="lm")
+                d_main.line([(x2 - 4, y1 + 22), (x2 - 4, y2 - 22)], fill=(208, 18, 30, 255), width=5)
+            else:
+                d_main.text(((x1 + tag_w + x2) / 2, cy_mid), "LOTE DISPONÍVEL", font=f_livre_solo, fill=(84, 48, 54, 255), anchor="mm")
+
+        else:
+            hdr_h = 62
+            pts_hdr = _card_pts_chanfro(x1 + 3, y1 + 3, x2 - 3, y1 + hdr_h, max(0, c_cut - 2), 4, 0, 0)
+            d_main.polygon(pts_hdr, fill=(46, 6, 12, 255) if confirmado else (18, 8, 11, 255))
+            d_main.line([(x1 + 4, y1 + hdr_h), (x2 - 4, y1 + hdr_h)], fill=(156, 12, 22, 255) if confirmado else (46, 14, 20, 255), width=2)
+
+            if confirmado:
+                d_main.line([(x1 + 3, y1 + c_cut + 4), (x1 + 3, y2 - 10)], fill=(204, 16, 28, 255), width=6)
+
+            lbl_lote = f"LOTE #{num_pos:02d}"
+            d_main.text((x1 + 28, y1 + hdr_h / 2 + 1), lbl_lote, font=f_hdr_team, fill=(252, 242, 244, 255) if confirmado else (138, 86, 94, 255), anchor="lm")
+
+            sts_txt = "CONFIRMADO" if confirmado else "DISPONÍVEL"
+            cor_sts = (224, 48, 60, 255) if confirmado else (92, 54, 60, 255)
+            d_main.text((x2 - 24, y1 + hdr_h / 2 + 1), sts_txt, font=f_sts_team, fill=cor_sts, anchor="rm")
+
+            corpo_top = y1 + hdr_h + 10
+            corpo_bot = y2 - 12
+            passo_p = (corpo_bot - corpo_top) / max(1, jog_por_lote)
+
+            if confirmado:
+                for p_i in range(jog_por_lote):
+                    ry = corpo_top + passo_p * (p_i + 0.5)
+                    if p_i > 0:
+                        ly_sep = int(corpo_top + passo_p * p_i)
+                        d_main.line([(x1 + 26, ly_sep), (x2 - 24, ly_sep)], fill=(48, 10, 16, 255), width=2)
+                    nk_p = nicks_brutos[p_i] if p_i < len(nicks_brutos) else "—"
+                    nk_limpo = _card_truncar_px(d_main, nk_p, f_nick_team, cw_i - 106)
+                    bx_p = x1 + 40
+                    d_main.polygon([(bx_p, ry - 15), (bx_p + 18, ry - 15), (bx_p + 14, ry + 15), (bx_p - 4, ry + 15)], fill=(128, 8, 16, 255))
+                    d_main.text((bx_p + 7, ry), f"{p_i + 1}", font=f_idx_team, fill=(252, 236, 238, 255), anchor="mm")
+                    d_main.text((x1 + 74, ry), nk_limpo, font=f_nick_team, fill=(250, 244, 245, 255), anchor="lm")
+            else:
+                cy_free = (corpo_top + corpo_bot) / 2
+                for p_i in range(1, jog_por_lote):
+                    ly_sep = int(corpo_top + passo_p * p_i)
+                    d_main.line([(x1 + 28, ly_sep), (x2 - 28, ly_sep)], fill=(24, 10, 14, 255), width=2)
+                lw_b, lh_b = 246, 48
+                d_main.polygon(
+                    _card_pts_chanfro((x1 + x2) / 2 - lw_b / 2, cy_free - lh_b / 2, (x1 + x2) / 2 + lw_b / 2, cy_free + lh_b / 2, 10, 10, 10, 10),
+                    fill=(18, 7, 10, 255), outline=(62, 16, 24, 255), width=2,
+                )
+                d_main.text(((x1 + x2) / 2, cy_free), "VAGA LIVRE", font=f_livre_team, fill=(104, 58, 66, 255), anchor="mm")
+
+    # Rodapé
+    f_micro = _card_carregar_fonte("bold", 20)
+    rodape_str = "FIRE FORCE COMPETITIVE SYSTEM   •   TABELA EM TEMPO REAL   •   ID E SENHA LIBERADOS 5 MIN ANTES"
+    if atualizado_em:
+        rodape_str += f"   •   ATUALIZADO ÀS {atualizado_em}"
+    d_main.text((W // 2, H - 48), rodape_str, font=f_micro, fill=(148, 74, 82, 255), anchor="mm")
+
+    final_rgb = card.convert("RGB").resize((W // 2, H // 2), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    final_rgb.save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+async def montar_tabela_visual(
+    horario: dict,
+    slots_data: list,
+    ocupadas: int = 0,
+    atualizado_em: str = "",
+) -> tuple[discord.Embed, Optional[bytes]]:
+    """Monta a Embed minimalista Vermelho Escuro + bytes do PNG HD da Tabela Oficial de Posições."""
+    tipo = str(horario.get("tipo") or "solo").lower()
+    categoria = str(horario.get("categoria") or "premium")
+    total = LOTES_POR_MODO.get(tipo, len(slots_data or []) or 48)
+
+    if _PIL_DISPONIVEL:
+        try:
+            png_bytes = await asyncio.to_thread(
+                renderizar_tabela_sala_png,
+                dict(horario),
+                list(slots_data or []),
+                int(ocupadas or 0),
+                str(atualizado_em or ""),
+            )
+            nome_arq = "tabela_fireforce.png"
+            descricao = (
+                f"**🏆 Premiação:** `{horario.get('premiacao') or 'Por Kill'}`"
+                f"  •  **💰 Valor:** `{formatar_moeda(horario.get('valor'))}`"
+                f"  •  **🎫 {texto_slots_plural(tipo)}:** `{ocupadas}/{total}`"
+            )
+            embed = criar_embed(
+                titulo=f"🔥 {formatar_rotulo_diario(tipo, categoria)} — {horario.get('horario', '--:--')}",
+                descricao=descricao,
+                cor_nome="Vermelho Escuro",
+                image=f"attachment://{nome_arq}",
+                footer=("Fire Force • Tabela Oficial em Imagem HD" + (f" • {atualizado_em}" if atualizado_em else "")),
+            )
+            return embed, png_bytes
+        except Exception as erro_tab:
+            _log_arquivo(f"[TABELA] falha ao gerar PNG da sala #{horario.get('id')}: {erro_tab}")
+
+    return montar_embed_tabela(horario, slots_data, ocupadas, atualizado_em=atualizado_em), None
 
 
 async def obter_slots_data(horario_id: int) -> list:
@@ -3587,12 +4004,13 @@ class SalaTabelaPainelView(discord.ui.View):
             )
 
 
-async def atualizar_tabela(guild: discord.Guild, horario_id: int):
-    """Edita (ou publica) a tabela em texto + painel minimalista no canal do diário."""
+async def atualizar_tabela(guild: discord.Guild, horario_id: int, forcar: bool = False):
+    """Edita (ou publica) a Tabela Oficial em Imagem HD + painel minimalista no canal do diário."""
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (horario_id,))).fetchone()
         if not horario or not horario["canal_tabela"]:
+            _TABELA_ASSINATURA_CACHE.pop(int(horario_id), None)
             return
         ocupadas = (await (await db.execute(
             "SELECT COUNT(*) FROM slots WHERE horario_id = ? AND confirmado = 1", (horario_id,)
@@ -3603,27 +4021,66 @@ async def atualizar_tabela(guild: discord.Guild, horario_id: int):
         return
 
     dados_slots = await obter_slots_data(horario_id)
-    embed = montar_embed_tabela(
+    assinatura_slots = tuple(
+        (
+            int(s.get("numero") or 0),
+            bool(s.get("confirmado")),
+            tuple(
+                str((j.get("ff_nome") if isinstance(j, dict) else j) or "").strip()
+                for j in (s.get("jogadores") or [])
+            ),
+        )
+        for s in (dados_slots or [])
+    )
+    msg_id_atual = int(horario["msg_tabela"] or 0)
+    assinatura_atual = (
+        int(horario["id"]),
+        msg_id_atual,
+        str(horario["tipo"] or ""),
+        str(horario["categoria"] or ""),
+        str(horario["horario"] or ""),
+        str(horario["premiacao"] or ""),
+        float(horario["valor"] or 0.0),
+        int(ocupadas or 0),
+        assinatura_slots,
+    )
+
+    if not forcar and msg_id_atual > 0 and _TABELA_ASSINATURA_CACHE.get(int(horario_id)) == assinatura_atual:
+        return
+
+    embed, png_bytes = await montar_tabela_visual(
         dict(horario), dados_slots, ocupadas,
-        atualizado_em=agora_brt().strftime("%H:%M:%S")
+        atualizado_em=agora_brt().strftime("%H:%M"),
     )
     view_sala = _garantir_view_sala_registrada(horario_id)
 
-    if horario["msg_tabela"]:
+    if msg_id_atual > 0:
         try:
-            mensagem = await canal.fetch_message(horario["msg_tabela"])
-            if mensagem.components:
-                await mensagem.edit(embed=embed)
-            else:
-                await mensagem.edit(embed=embed, view=view_sala)
+            mensagem = await canal.fetch_message(msg_id_atual)
+            kwargs_edit: dict = {"embed": embed}
+            if png_bytes:
+                kwargs_edit["attachments"] = [discord.File(io.BytesIO(png_bytes), filename="tabela_fireforce.png")]
+            if not getattr(mensagem, "components", None):
+                kwargs_edit["view"] = view_sala
+            await mensagem.edit(**kwargs_edit)
+            _TABELA_ASSINATURA_CACHE[int(horario_id)] = assinatura_atual
             return
         except discord.NotFound:
-            pass
+            _TABELA_ASSINATURA_CACHE.pop(int(horario_id), None)
 
-    nova_msg = await canal.send(embed=embed, view=view_sala)
+    kwargs_send: dict = {"embed": embed, "view": view_sala}
+    if png_bytes:
+        kwargs_send["file"] = discord.File(io.BytesIO(png_bytes), filename="tabela_fireforce.png")
+    nova_msg = await canal.send(**kwargs_send)
+    novo_msg_id = int(nova_msg.id)
     async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute("UPDATE horarios SET msg_tabela = ? WHERE id = ?", (nova_msg.id, horario_id))
+        await db.execute("UPDATE horarios SET msg_tabela = ? WHERE id = ?", (novo_msg_id, horario_id))
         await db.commit()
+    _TABELA_ASSINATURA_CACHE[int(horario_id)] = (
+        assinatura_atual[0],
+        novo_msg_id,
+        *assinatura_atual[2:],
+    )
 
 
 async def criar_canal_tabela(guild: discord.Guild, horario_id: int):
@@ -7129,18 +7586,21 @@ async def enviar_sala(guild: discord.Guild, tipo: str, categoria: str, horario: 
                     cor_nome="Esmeralda",
                     footer="Fire Force • Boa sorte e bom jogo!"
                 )
-                embed_tabela = montar_embed_tabela(
+                embed_tabela, png_tabela = await montar_tabela_visual(
                     dict(h), slots_data, ocupadas,
-                    atualizado_em=agora_brt().strftime("%H:%M:%S")
+                    atualizado_em=agora_brt().strftime("%H:%M"),
                 )
 
                 mencoes_str = " ".join(dict.fromkeys(mencoes_h))
                 aviso = f"🚨🚨🚨 {mencoes_str} 🚨🚨🚨" if mencoes_str else "🚨🚨🚨 **SALA LIBERADA!** 🚨🚨🚨"
+                kwargs_lib: dict = {"embeds": [embed_sala, embed_tabela]}
+                if png_tabela:
+                    kwargs_lib["file"] = discord.File(io.BytesIO(png_tabela), filename="tabela_fireforce.png")
 
                 if len(aviso) > 1900:
-                    await canal.send("🚨🚨🚨 **SALA LIBERADA!** 🚨🚨🚨", embeds=[embed_sala, embed_tabela])
+                    await canal.send("🚨🚨🚨 **SALA LIBERADA!** 🚨🚨🚨", **kwargs_lib)
                     chunk = ""
-                    for mencao_txt in dict.fromkeys(mencoes_h):
+                    for mencao_txt in dict.fromkeys(mencao_txt for mencao_txt in mencoes_h):
                         if len(chunk) + len(mencao_txt) > 1800:
                             await canal.send(chunk)
                             chunk = mencao_txt + " "
@@ -7149,7 +7609,7 @@ async def enviar_sala(guild: discord.Guild, tipo: str, categoria: str, horario: 
                     if chunk:
                         await canal.send(chunk)
                 else:
-                    await canal.send(aviso, embeds=[embed_sala, embed_tabela])
+                    await canal.send(aviso, **kwargs_lib)
 
             await db.execute(
                 "UPDATE horarios SET sala_id = ?, sala_senha = ?, alerta_ish_enviado = 1 WHERE id = ?",
@@ -9713,7 +10173,7 @@ def renderizar_card_perfil_png(
         faixa_total = max(1, int(prox["min_pts"]) - int(pat["min_pts"]))
         avanco = max(0, int(dados["pontos"]) - int(pat["min_pts"]))
         pct = min(1.0, avanco / faixa_total)
-        rota_txt = f"{pat['nome'].upper()}   ▸   {prox['nome'].upper()}"
+        rota_txt = f"{pat['nome'].upper()}   »   {prox['nome'].upper()}"
         rodape_esq = f"BASE DA FAIXA: {pat['min_pts']} PTS"
         rodape_dir = f"FALTAM {dados['faltam_pts']} PTS P/ {prox['nome'].upper()}  •  {int(round(pct * 100))}%"
     else:
