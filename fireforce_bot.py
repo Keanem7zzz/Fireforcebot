@@ -89,7 +89,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.6"
+VERSAO_BOT = "13.7"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -871,6 +871,9 @@ async def init_db():
             ("tickets", "nota", "REAL"), ("tickets", "nota_desc", "TEXT"), ("tickets", "pago_nota", "REAL"),
             ("tickets", "fechado_em", "TEXT"), ("tickets", "fechado_por", "INTEGER"),
             ("tickets", "categoria", "TEXT DEFAULT 'suporte'"),
+            ("tickets", "horario_id", "INTEGER"),
+            ("tickets", "slot_id", "INTEGER"),
+            ("tickets", "premiacao_creditada", "INTEGER DEFAULT 0"),
             ("cupons", "msg_id", "INTEGER"), ("cupons", "canal_id", "INTEGER"),
             ("cupons", "esgotado_avisado", "INTEGER DEFAULT 0"), ("cupons", "ativo", "INTEGER DEFAULT 1"),
             ("depositos", "canal_id", "INTEGER"), ("depositos", "assumido_por", "INTEGER"),
@@ -4666,6 +4669,8 @@ class ReceberPremiacaoDiarioView(discord.ui.View):
             assunto=assunto_tk,
             categoria_ticket="receber_premiacao",
             detalhes_extras=detalhes_extras,
+            horario_id=self.horario_id,
+            slot_id=(int(slot["id"]) if slot else None),
         )
 
 
@@ -16800,6 +16805,8 @@ async def abrir_ticket(
     assunto: str = "",
     categoria_ticket: str = "suporte",
     detalhes_extras: str = "",
+    horario_id: Optional[int] = None,
+    slot_id: Optional[int] = None,
 ):
     tipo = "suporte"          # atendimento com jogador = SEMPRE suporte
     if categoria_ticket not in ("suporte", "duvida_pagamento", "receber_premiacao"):
@@ -16848,9 +16855,19 @@ async def abrir_ticket(
             nome_canal_tk, category=categoria, overwrites=overwrites)
         async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
             cursor = await db.execute(
-                "INSERT INTO tickets (guild_id, channel_id, user_id, status, tipo, criado_em, categoria) "
-                "VALUES (?, ?, ?, 'aberto', ?, ?, ?)",
-                (interaction.guild.id, canal.id, interaction.user.id, tipo, agora_brt().isoformat(), categoria_ticket))
+                "INSERT INTO tickets (guild_id, channel_id, user_id, status, tipo, criado_em, categoria, horario_id, slot_id, premiacao_creditada) "
+                "VALUES (?, ?, ?, 'aberto', ?, ?, ?, ?, ?, 0)",
+                (
+                    interaction.guild.id,
+                    canal.id,
+                    interaction.user.id,
+                    tipo,
+                    agora_brt().isoformat(),
+                    categoria_ticket,
+                    (int(horario_id) if horario_id else None),
+                    (int(slot_id) if slot_id else None),
+                ),
+            )
             ticket_id = cursor.lastrowid
             await db.commit()
     except Exception as erro:
@@ -16917,6 +16934,557 @@ async def abrir_ticket(
         "Azul")
 
 
+# ---------- CRÉDITO DE PREMIAÇÃO POR KILL COM DUPLA CONFIRMAÇÃO (v13.7) ----------
+
+def _extrair_valor_kill_sugerido(texto_premiacao: str) -> str:
+    """Extrai sugestão numérica apenas quando o texto menciona 'kill' (evita confundir prêmio cheio com valor unitário)."""
+    txt = (texto_premiacao or "").strip()
+    if "kill" not in txt.lower():
+        return ""
+    m = re.search(r"(\d+(?:[.,]\d{1,2})?)", txt)
+    if not m:
+        return ""
+    try:
+        val = float(m.group(1).replace(",", "."))
+        if 0 < val <= 1000:
+            return f"{val:.2f}".replace(".", ",")
+    except Exception:
+        pass
+    return ""
+
+
+async def _obter_contexto_diario_ticket(ticket_dict: dict) -> tuple[Optional[str], list[str], str, str]:
+    """Retorna `(modo, nomes_jogadores, valor_kill_sugerido, rotulo_diario)` se o ticket veio de uma sala."""
+    hid = ticket_dict.get("horario_id")
+    sid = ticket_dict.get("slot_id")
+    uid_tk = int(ticket_dict.get("user_id") or 0)
+    if not hid:
+        return (None, [], "", "")
+
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        h = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (int(hid),))).fetchone()
+        if not h:
+            return (None, [], "", "")
+        modo = str(h["tipo"] or "squad").strip().lower()
+        if modo not in ("solo", "duo", "trio", "squad"):
+            modo = "squad"
+        rotulo_d = f"{formatar_rotulo_diario(h['tipo'], h['categoria'])} ({h['horario']})"
+        sug_kill = _extrair_valor_kill_sugerido(str(h["premiacao"] or ""))
+
+        if not sid and uid_tk:
+            sl_row = await (await db.execute(
+                "SELECT id FROM slots WHERE horario_id = ? AND comprador_id = ? AND confirmado = 1 ORDER BY id DESC LIMIT 1",
+                (int(hid), uid_tk),
+            )).fetchone()
+            if sl_row:
+                sid = int(sl_row["id"])
+
+        nomes = []
+        if sid:
+            jogs = await (await db.execute(
+                "SELECT posicao, ff_nome FROM slot_jogadores WHERE slot_id = ? ORDER BY posicao ASC",
+                (int(sid),),
+            )).fetchall()
+            nomes = [str(j["ff_nome"] or "").strip() for j in jogs]
+
+    return (modo, nomes, sug_kill, rotulo_d)
+
+
+def _montar_embed_resumo_kills_etapa1(dados_k: dict) -> discord.Embed:
+    modo_lbl = {"solo": "Solo (1 Jogador)", "duo": "Duo (2 Jogadores)", "trio": "Trio (3 Jogadores)", "squad": "Squad (4 Jogadores)"}.get(
+        dados_k["modo"], dados_k["modo"].capitalize()
+    )
+    linhas_j = []
+    escala = len(dados_k["itens"])
+    for item in dados_k["itens"]:
+        pos = item["pos"]
+        nick = f" (`{item['nome']}`)" if item.get("nome") else ""
+        rot_j = f"Jogador{nick}" if escala == 1 else f"Jogador {pos}{nick}"
+        linhas_j.append(
+            f"• **{rot_j}:** `{item['kills']}` kill(s) ➜ `{formatar_moeda(item['subtotal'])}`"
+        )
+
+    bloco_diario = f"• **Diário:** {dados_k['rotulo_diario']}\n" if dados_k.get("rotulo_diario") else ""
+    desc = (
+        f"**Recebedor na Carteira:** {mencao(dados_k['alvo_user_id'])}\n"
+        f"• **Modo:** `{modo_lbl}`\n"
+        f"{bloco_diario}\n"
+        f"**🔫 Kills por Jogador:**\n"
+        + "\n".join(linhas_j)
+        + f"\n\n• **Soma de Kills:** **`{dados_k['soma_kills']}` kill(s)**\n"
+        f"• **Premiação por Kill:** `{formatar_moeda(dados_k['valor_kill'])}`\n"
+        f"• 💰 **TOTAL A PAGAR:** **`{formatar_moeda(dados_k['total_pagar'])}`**\n\n"
+        f"❓ **1ª Confirmação:** Foi isso mesmo? Confira se as kills e o valor acima estão corretos:"
+    )
+    return criar_embed("🧐 1ª Confirmação — Conferir Kills e Total", desc, "Amarelo")
+
+
+def _montar_embed_resumo_kills_etapa2(dados_k: dict) -> discord.Embed:
+    desc = (
+        f"Você revisou os dados:\n"
+        f"• **Total de Kills:** `{dados_k['soma_kills']}` kill(s) × `{formatar_moeda(dados_k['valor_kill'])}`\n"
+        f"• **Valor Final:** **`{formatar_moeda(dados_k['total_pagar'])}`**\n"
+        f"• **Conta de destino:** {mencao(dados_k['alvo_user_id'])}\n\n"
+        f"⚠️ **2ª Confirmação Final:** Você quer **realmente aplicar `{formatar_moeda(dados_k['total_pagar'])}` em moedas** na carteira de {mencao(dados_k['alvo_user_id'])} agora?"
+    )
+    return criar_embed("⚠️ 2ª Confirmação Final — Aplicar Moedas na Conta?", desc, "Dourado")
+
+
+class EscolherModoCreditarKillsView(discord.ui.View):
+    """Permite escolher Solo / Duo / Trio / Squad quando o ticket não veio vinculado a um horário específico (ou ao trocar modo)."""
+
+    def __init__(self, autor_id: int, ticket_dict: dict, nomes_atuais: Optional[list[str]] = None, valor_kill_sug: str = "", rotulo_diario: str = ""):
+        super().__init__(timeout=240)
+        self.autor_id = int(autor_id)
+        self.ticket_dict = dict(ticket_dict)
+        self.nomes_atuais = list(nomes_atuais or [])
+        self.valor_kill_sug = valor_kill_sug
+        self.rotulo_diario = rotulo_diario
+        sel = discord.ui.Select(
+            placeholder="🎮 Escolha o modo da partida p/ informar as kills...",
+            options=[
+                discord.SelectOption(label="Solo (1 Jogador)", value="solo", emoji="👤", description="Informa as kills do jogador + valor por kill"),
+                discord.SelectOption(label="Duo (2 Jogadores)", value="duo", emoji="👥", description="Informa kills dos Jogadores 1 e 2 + valor por kill"),
+                discord.SelectOption(label="Trio (3 Jogadores)", value="trio", emoji="🔥", description="Informa kills dos Jogadores 1, 2 e 3 + valor por kill"),
+                discord.SelectOption(label="Squad (4 Jogadores)", value="squad", emoji="🛡️", description="Informa kills dos Jogadores 1, 2, 3 e 4 + valor por kill"),
+            ],
+        )
+        sel.callback = self._escolher_modo
+        self.add_item(sel)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.autor_id or not await e_dono_ou_gerente(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Restrito", "Apenas quem iniciou este lançamento (Dono/Gerente) pode continuar.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _escolher_modo(self, interaction: discord.Interaction):
+        modo = interaction.data["values"][0]
+        await interaction.response.send_modal(
+            CreditarKillsModal(
+                autor_id=self.autor_id,
+                ticket_dict=self.ticket_dict,
+                modo=modo,
+                nomes_jogadores=self.nomes_atuais,
+                valor_kill_sugerido=self.valor_kill_sug,
+                rotulo_diario=self.rotulo_diario,
+            )
+        )
+
+
+class CreditarKillsModal(discord.ui.Modal):
+    """Modal adaptável: Solo (1 campo de kill), Duo (2), Trio (3) ou Squad (4) + Premiação por Kill (R$)."""
+
+    def __init__(
+        self,
+        autor_id: int,
+        ticket_dict: dict,
+        modo: str,
+        nomes_jogadores: Optional[list[str]] = None,
+        valor_kill_sugerido: str = "",
+        rotulo_diario: str = "",
+        kills_preenchidas: Optional[list[int]] = None,
+    ):
+        modo_norm = modo if modo in ("solo", "duo", "trio", "squad") else "squad"
+        qtd_jog = JOGADORES_POR_LOTE.get(modo_norm, 4)
+        super().__init__(title=f"🪙 Creditar Kills — {modo_norm.capitalize()}"[:45])
+        self.autor_id = int(autor_id)
+        self.ticket_dict = dict(ticket_dict)
+        self.modo = modo_norm
+        self.qtd_jog = qtd_jog
+        self.nomes_jogadores = list(nomes_jogadores or [])
+        self.rotulo_diario = rotulo_diario
+
+        self.campos_kills: list[discord.ui.TextInput] = []
+        for idx in range(1, qtd_jog + 1):
+            nick = self.nomes_jogadores[idx - 1].strip() if idx - 1 < len(self.nomes_jogadores) else ""
+            if qtd_jog == 1:
+                lbl = (f"Kills do Jogador ({nick})" if nick else "Kills do Jogador")[:45]
+            else:
+                lbl = (f"Kills — Jogador {idx} ({nick})" if nick else f"Kills — Jogador {idx}")[:45]
+            val_padrao = (
+                str(kills_preenchidas[idx - 1])
+                if (kills_preenchidas and idx - 1 < len(kills_preenchidas))
+                else ("0" if qtd_jog > 1 else "")
+            )
+            campo_k = discord.ui.TextInput(
+                label=lbl,
+                placeholder="Quantidade de kills (ex: 3)" if qtd_jog == 1 else f"Kills feitas pelo Jogador {idx} (ex: 0, 2, 5)",
+                default=val_padrao,
+                min_length=1,
+                max_length=4,
+                required=True,
+            )
+            self.campos_kills.append(campo_k)
+            self.add_item(campo_k)
+
+        self.campo_valor_kill = discord.ui.TextInput(
+            label="Premiação por Kill em R$",
+            placeholder="Ex: 1,50 ou 2,00",
+            default=valor_kill_sugerido or "",
+            min_length=1,
+            max_length=12,
+            required=True,
+        )
+        self.add_item(self.campo_valor_kill)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Apenas Dono ou Gerente podem creditar premiação.", "Vermelho"),
+                ephemeral=True,
+            )
+
+        bruto_val = (self.campo_valor_kill.value or "").upper().replace("R$", "").strip().replace(",", ".")
+        try:
+            valor_kill = arredondar(float(bruto_val))
+        except Exception:
+            valor_kill = -1.0
+        if not math.isfinite(valor_kill) or valor_kill <= 0 or valor_kill > 5000:
+            return await interaction.response.send_message(
+                embed=criar_embed("⚠️ Valor por Kill Inválido", "Informe um valor maior que zero para cada kill (ex.: `1,00`, `1,50`, `2,00`).", "Amarelo"),
+                ephemeral=True,
+            )
+
+        itens = []
+        kills_lista = []
+        for idx, campo in enumerate(self.campos_kills, start=1):
+            txt_k = (campo.value or "").strip()
+            if txt_k == "":
+                txt_k = "0"
+            if not txt_k.isdigit():
+                return await interaction.response.send_message(
+                    embed=criar_embed("⚠️ Quantidade de Kills Inválida", f"No **Jogador {idx}**, digite apenas números inteiros (`0`, `1`, `2`...).", "Amarelo"),
+                    ephemeral=True,
+                )
+            k_int = int(txt_k)
+            if k_int < 0 or k_int > 99:
+                return await interaction.response.send_message(
+                    embed=criar_embed("⚠️ Quantidade Fora do Limite", f"Revise as kills do **Jogador {idx}** (`0` a `99`).", "Amarelo"),
+                    ephemeral=True,
+                )
+            nick = self.nomes_jogadores[idx - 1].strip() if idx - 1 < len(self.nomes_jogadores) else ""
+            kills_lista.append(k_int)
+            itens.append({
+                "pos": idx,
+                "nome": nick,
+                "kills": k_int,
+                "subtotal": arredondar(k_int * valor_kill),
+            })
+
+        soma_kills = sum(kills_lista)
+        if soma_kills <= 0:
+            return await interaction.response.send_message(
+                embed=criar_embed("⚠️ Zero Kills Informadas", "A soma de kills precisa ser pelo menos **`1`** para gerar premiação.", "Amarelo"),
+                ephemeral=True,
+            )
+
+        total_pagar = arredondar(soma_kills * valor_kill)
+        dados_k = {
+            "ticket_id": int(self.ticket_dict["id"]),
+            "channel_id": int(self.ticket_dict["channel_id"]),
+            "alvo_user_id": int(self.ticket_dict["user_id"]),
+            "modo": self.modo,
+            "nomes_jogadores": self.nomes_jogadores,
+            "kills_lista": kills_lista,
+            "itens": itens,
+            "soma_kills": soma_kills,
+            "valor_kill": valor_kill,
+            "valor_kill_str": f"{valor_kill:.2f}".replace(".", ","),
+            "total_pagar": total_pagar,
+            "rotulo_diario": self.rotulo_diario,
+            "ticket_dict": self.ticket_dict,
+        }
+
+        await interaction.response.send_message(
+            embed=_montar_embed_resumo_kills_etapa1(dados_k),
+            view=ConfirmarCreditarKillsEtapa1View(self.autor_id, dados_k),
+            ephemeral=True,
+        )
+
+
+class ConfirmarCreditarKillsEtapa1View(discord.ui.View):
+    """1ª Confirmação: mostra o cálculo completo de cada jogador + total e pergunta 'Foi isso mesmo?'."""
+
+    def __init__(self, autor_id: int, dados_k: dict):
+        super().__init__(timeout=300)
+        self.autor_id = int(autor_id)
+        self.dados_k = dict(dados_k)
+        sel = discord.ui.Select(
+            placeholder="🧐 1ª Confirmação: foi isso mesmo?",
+            options=[
+                discord.SelectOption(
+                    label=f"Sim, foi isso mesmo! ({formatar_moeda(self.dados_k['total_pagar'])})"[:100],
+                    value="confirmar_1",
+                    emoji="✅",
+                    description="Avança para a 2ª confirmação antes de aplicar as moedas",
+                ),
+                discord.SelectOption(
+                    label="Corrigir Kills ou Valor por Kill",
+                    value="corrigir",
+                    emoji="✏️",
+                    description="Reabre a janela preenchida para ajustar algum número",
+                ),
+                discord.SelectOption(
+                    label="Trocar Modo (Solo / Duo / Trio / Squad)",
+                    value="trocar_modo",
+                    emoji="🔄",
+                    description="Altera a quantidade de jogadores do cálculo",
+                ),
+                discord.SelectOption(
+                    label="Cancelar",
+                    value="cancelar",
+                    emoji="❌",
+                    description="Cancela sem aplicar nenhuma moeda",
+                ),
+            ],
+        )
+        sel.callback = self._decidir_etapa1
+        self.add_item(sel)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.autor_id or not await e_dono_ou_gerente(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Restrito", "Apenas quem iniciou este lançamento pode confirmar.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _decidir_etapa1(self, interaction: discord.Interaction):
+        acao = interaction.data["values"][0]
+        if acao == "cancelar":
+            return await interaction.response.edit_message(
+                embed=criar_embed("❌ Operação Cancelada", "Nenhuma moeda foi creditada.", "Cinza Escuro"),
+                view=None,
+            )
+        if acao == "corrigir":
+            return await interaction.response.send_modal(
+                CreditarKillsModal(
+                    autor_id=self.autor_id,
+                    ticket_dict=self.dados_k["ticket_dict"],
+                    modo=self.dados_k["modo"],
+                    nomes_jogadores=self.dados_k["nomes_jogadores"],
+                    valor_kill_sugerido=self.dados_k["valor_kill_str"],
+                    rotulo_diario=self.dados_k["rotulo_diario"],
+                    kills_preenchidas=self.dados_k["kills_lista"],
+                )
+            )
+        if acao == "trocar_modo":
+            return await interaction.response.edit_message(
+                embed=criar_embed(
+                    "🎮 Trocar Modo do Cálculo",
+                    "Selecione abaixo se a partida foi **Solo, Duo, Trio ou Squad**:",
+                    "Cinza Escuro",
+                ),
+                view=EscolherModoCreditarKillsView(
+                    autor_id=self.autor_id,
+                    ticket_dict=self.dados_k["ticket_dict"],
+                    nomes_atuais=self.dados_k["nomes_jogadores"],
+                    valor_kill_sug=self.dados_k["valor_kill_str"],
+                    rotulo_diario=self.dados_k["rotulo_diario"],
+                ),
+            )
+        if acao == "confirmar_1":
+            return await interaction.response.edit_message(
+                embed=_montar_embed_resumo_kills_etapa2(self.dados_k),
+                view=ConfirmarCreditarKillsEtapa2View(self.autor_id, self.dados_k),
+            )
+
+
+class ConfirmarCreditarKillsEtapa2View(discord.ui.View):
+    """2ª Confirmação Final: pergunta se quer realmente aplicar essas moedas na conta agora."""
+
+    def __init__(self, autor_id: int, dados_k: dict):
+        super().__init__(timeout=300)
+        self.autor_id = int(autor_id)
+        self.dados_k = dict(dados_k)
+        sel = discord.ui.Select(
+            placeholder="⚠️ 2ª Confirmação: aplicar estas moedas na conta agora?",
+            options=[
+                discord.SelectOption(
+                    label=f"SIM, APLICAR {formatar_moeda(self.dados_k['total_pagar'])} EM MOEDAS AGORA"[:100],
+                    value="aplicar",
+                    emoji="🪙",
+                    description="Credita o valor na carteira do jogador e envia o comprovante",
+                ),
+                discord.SelectOption(
+                    label="Voltar para Revisar Detalhes (1ª Confirmação)",
+                    value="voltar",
+                    emoji="↩️",
+                    description="Retorna à tela com as kills de cada jogador",
+                ),
+                discord.SelectOption(
+                    label="Cancelar (Não aplicar moedas)",
+                    value="cancelar",
+                    emoji="❌",
+                    description="Aborta sem creditar nada",
+                ),
+            ],
+        )
+        sel.callback = self._decidir_etapa2
+        self.add_item(sel)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.autor_id or not await e_dono_ou_gerente(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Restrito", "Apenas quem iniciou este lançamento pode confirmar.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _decidir_etapa2(self, interaction: discord.Interaction):
+        acao = interaction.data["values"][0]
+        if acao == "cancelar":
+            return await interaction.response.edit_message(
+                embed=criar_embed("❌ Operação Cancelada", "Nenhuma moeda foi aplicada na conta.", "Cinza Escuro"),
+                view=None,
+            )
+        if acao == "voltar":
+            return await interaction.response.edit_message(
+                embed=_montar_embed_resumo_kills_etapa1(self.dados_k),
+                view=ConfirmarCreditarKillsEtapa1View(self.autor_id, self.dados_k),
+            )
+        if acao != "aplicar":
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        if not guild:
+            return
+
+        tid = int(self.dados_k["ticket_id"])
+        alvo_uid = int(self.dados_k["alvo_user_id"])
+        total_pagar = arredondar(self.dados_k["total_pagar"])
+        soma_kills = int(self.dados_k["soma_kills"])
+        valor_kill = arredondar(self.dados_k["valor_kill"])
+        rot_diario = self.dados_k.get("rotulo_diario") or self.dados_k["modo"].capitalize()
+
+        async with _lock_deposito:
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                cur = await db.execute(
+                    "UPDATE tickets SET premiacao_creditada = 1 WHERE id = ? AND COALESCE(premiacao_creditada, 0) = 0",
+                    (tid,),
+                )
+                await db.commit()
+                if cur.rowcount != 1:
+                    return await interaction.edit_original_response(
+                        embed=criar_embed(
+                            "⚠️ Já Aplicado",
+                            "A premiação deste ticket já havia sido creditada anteriormente.",
+                            "Amarelo",
+                        ),
+                        view=None,
+                    )
+
+            desc_extrato = f"Premiação de Kills ({soma_kills}x {formatar_moeda(valor_kill)}) • {rot_diario}"
+            novo_saldo = await creditar_saldo(
+                alvo_uid,
+                guild.id,
+                total_pagar,
+                "premiacao_kills",
+                desc_extrato,
+                ref=f"kills-tk:{tid}",
+            )
+
+        marcar_sujo()
+
+        escala = len(self.dados_k["itens"])
+        linhas_det = []
+        for it in self.dados_k["itens"]:
+            nick = f" (`{it['nome']}`)" if it.get("nome") else ""
+            rot_j = f"Jogador{nick}" if escala == 1 else f"Jogador {it['pos']}{nick}"
+            linhas_det.append(f"• **{rot_j}:** `{it['kills']}` kill(s) ➜ `{formatar_moeda(it['subtotal'])}`")
+        resumo_jogs = "\n".join(linhas_det)
+
+        canal_tk = guild.get_channel(int(self.dados_k["channel_id"])) or interaction.channel
+        emb_publico = criar_embed(
+            "🪙 Premiação de Kills Creditada na Carteira!",
+            f"Parabéns, {mencao(alvo_uid)}! Sua premiação foi conferida e aplicada pela gerência ({interaction.user.mention}):\n\n"
+            f"{resumo_jogs}\n\n"
+            f"• **Total de Kills:** `{soma_kills}` kill(s) × `{formatar_moeda(valor_kill)}`\n"
+            f"• 💰 **Creditado em Moedas:** **`{formatar_moeda(total_pagar)}`**\n"
+            f"• 💳 **Novo Saldo na Carteira:** `{formatar_moeda(novo_saldo)}`\n\n"
+            f"-# Você pode usar seu saldo nos próximos diários ou solicitar saque em `/carteira`!",
+            "Esmeralda",
+        )
+        if canal_tk and hasattr(canal_tk, "send"):
+            try:
+                await canal_tk.send(content=mencao(alvo_uid), embed=emb_publico)
+            except Exception:
+                pass
+
+        await avisar_jogador(
+            guild,
+            alvo_uid,
+            embed=criar_embed(
+                "🪙 Premiação Recebida na Carteira!",
+                f"Você recebeu **`{formatar_moeda(total_pagar)}`** em moedas referente às suas kills em **{guild.name}**!\n\n"
+                f"{resumo_jogs}\n\n"
+                f"• **Cálculo:** `{soma_kills}` kill(s) × `{formatar_moeda(valor_kill)}`\n"
+                f"• **Novo saldo:** `{formatar_moeda(novo_saldo)}`",
+                "Esmeralda",
+            ),
+        )
+
+        await registrar_log(
+            guild,
+            "🏆 PREMIAÇÃO KILLS",
+            "🪙 Premiação de kills creditada no ticket",
+            f"• **Recebedor:** {mencao(alvo_uid)} (Ticket `#{tid}`)\n"
+            f"• **Aprovado por:** {interaction.user.mention}\n"
+            f"• **Referência:** {rot_diario}\n"
+            f"• **Cálculo:** `{soma_kills}` kill(s) × `{formatar_moeda(valor_kill)}` = **`{formatar_moeda(total_pagar)}`**\n"
+            f"{resumo_jogs}\n"
+            f"• **Saldo após crédito:** `{formatar_moeda(novo_saldo)}`",
+            "Esmeralda",
+        )
+
+        await interaction.edit_original_response(
+            embed=criar_embed(
+                "✅ Moedas Aplicadas com Sucesso!",
+                f"**`{formatar_moeda(total_pagar)}`** creditados na carteira de {mencao(alvo_uid)}!\n"
+                f"• **Novo saldo dele:** `{formatar_moeda(novo_saldo)}`\n"
+                f"-# Quando terminar o atendimento, basta usar **🔒 Fechar Atendimento** no seletor do canal.",
+                "Esmeralda",
+            ),
+            view=None,
+        )
+
+
+async def _iniciar_fluxo_creditar_kills_ticket(interaction: discord.Interaction, ticket_dict: dict):
+    """Abre direto o Modal se o ticket já tem modo do diário vinculado, ou pergunta Solo/Duo/Trio/Squad."""
+    modo_vinc, nomes_vinc, sug_kill, rotulo_d = await _obter_contexto_diario_ticket(ticket_dict)
+    if modo_vinc in ("solo", "duo", "trio", "squad"):
+        return await interaction.response.send_modal(
+            CreditarKillsModal(
+                autor_id=interaction.user.id,
+                ticket_dict=ticket_dict,
+                modo=modo_vinc,
+                nomes_jogadores=nomes_vinc,
+                valor_kill_sugerido=sug_kill,
+                rotulo_diario=rotulo_d,
+            )
+        )
+    await interaction.response.send_message(
+        embed=criar_embed(
+            "🪙 Creditar Premiação de Kills",
+            f"Selecione abaixo o **modo da partida** de {mencao(ticket_dict['user_id'])} para informar as kills e o valor por kill:",
+            "Dourado",
+        ),
+        view=EscolherModoCreditarKillsView(
+            autor_id=interaction.user.id,
+            ticket_dict=ticket_dict,
+        ),
+        ephemeral=True,
+    )
+
+
 class TicketView(discord.ui.View):
     """Painel minimalista de atendimento (Select único moderno, persistente após restart)."""
 
@@ -16938,6 +17506,12 @@ class TicketView(discord.ui.View):
                     value="reassumir",
                     emoji="🔄",
                     description="Assume se o atendente saiu de serviço (ou gerência troca)",
+                ),
+                discord.SelectOption(
+                    label="Creditar Premiação de Kills (Moedas)",
+                    value="creditar_kills",
+                    emoji="🪙",
+                    description="Dono/Gerente: calcula kills (Solo a Squad) c/ dupla confirmação",
                 ),
                 discord.SelectOption(
                     label="Adicionar Pessoa",
@@ -17054,6 +17628,30 @@ class TicketView(discord.ui.View):
                 f"{mencao(interaction.user.id)} {'reassumiu' if trocou_at else 'assumiu'} o protocolo `#{ticket['id']}` "
                 f"(fila `{ticket['tipo']}`) de {mencao(ticket['user_id'])}.", "Verde",
             )
+
+        if acao == "creditar_kills":
+            if not await e_dono_ou_gerente(interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente Dono ou Gerente podem creditar premiação de kills.", "Vermelho"),
+                    ephemeral=True,
+                )
+            ticket = await self._ticket(interaction.channel.id)
+            if not ticket:
+                return await interaction.response.send_message(
+                    embed=criar_embed("❌ Atendimento não encontrado", "Este canal não possui registro de ticket ativo.", "Vermelho"),
+                    ephemeral=True,
+                )
+            tk_d = dict(ticket)
+            if int(tk_d.get("premiacao_creditada") or 0) == 1:
+                return await interaction.response.send_message(
+                    embed=criar_embed(
+                        "⚠️ Premiação Já Creditada",
+                        "Este ticket já teve uma premiação de kills aplicada na carteira para evitar pagamento duplicado.",
+                        "Amarelo",
+                    ),
+                    ephemeral=True,
+                )
+            return await _iniciar_fluxo_creditar_kills_ticket(interaction, tk_d)
 
         if acao == "add":
             if not await self._pode_gerenciar(interaction):
