@@ -92,7 +92,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.3"
+VERSAO_BOT = "13.4"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -783,6 +783,10 @@ async def init_db():
             ("config", "cargos_patentes", "TEXT"),
             ("config", "manutencao_ativa", "INTEGER DEFAULT 0"),
             ("config", "manutencao_motivo", "TEXT"),
+            ("config", "canal_booyah", "INTEGER"),
+            ("ff_cache", "avatar_id", "TEXT"),
+            ("ff_cache", "avatar_url", "TEXT"),
+            ("horarios", "finalizado_aviso", "INTEGER DEFAULT 0"),
             ("pix", "atualizado_em", "TEXT"),
         ):
             try:
@@ -2041,7 +2045,9 @@ _CHAVES_NIVEL = ("level", "accountlevel", "nivel", "account_level")
 _CHAVES_REGIAO = ("region", "accountregion", "server", "regiao")
 _CHAVES_RANK = ("rank", "brrank", "rankname")
 _CHAVES_PRIME = ("primelevel", "prime_level")
-_CHAVES_CLA = ("clanname", "guildname")
+_CHAVES_CLA = ("clanname", "clan_name", "guildname", "guild_name", "nome_guilda", "nome_cla", "guilda", "cla")
+_CHAVES_AVATAR_ID = ("headpic", "head_pic", "avatarid", "avatar_id")
+_CHAVES_AVATAR_URL = ("avatarurl", "avatar_url", "headpicurl", "head_pic_url", "iconurl", "icon_url", "profilepic", "profile_pic")
 
 
 _SUBS_IGNORADOS_JOGADOR = {
@@ -2063,9 +2069,9 @@ def _ff_procurar(objeto, chaves, profundidade=0, permitir_cla: bool = False):
                     return valor
         # depois nos sub-objetos prioritários da conta
         subs_prioritarios = (
-            ("clanBasicInfo", "clan_basic_info", "guild", "guildInfo", "basicInfo", "basic_info", "data", "result")
+            ("clanBasicInfo", "clan_basic_info", "guild", "guildInfo", "guild_info", "clan", "basicInfo", "basic_info", "data", "result")
             if permitir_cla
-            else ("basicInfo", "basic_info", "accountInfo", "account_info", "primeInfo", "data", "result", "player", "account")
+            else ("basicInfo", "basic_info", "profileInfo", "profile_info", "accountInfo", "account_info", "primeInfo", "data", "result", "player", "account")
         )
         for sub in subs_prioritarios:
             if isinstance(objeto.get(sub), dict):
@@ -2128,9 +2134,35 @@ def _ff_extrair(dados) -> Optional[dict]:
         prime = 0
 
     cla = _ff_procurar(dados, _CHAVES_CLA, permitir_cla=True)
-    cla = str(cla)[:26] if cla else ""
+    if isinstance(cla, (dict, list)) or cla is None:
+        cla = ""
+    else:
+        cla_s = str(cla).strip()
+        # Evita confundir ID numérico de guilda com nome do clã
+        cla = "" if (cla_s.isdigit() and len(cla_s) >= 6) else cla_s[:26]
 
-    return {"nome": nome, "nivel": nivel, "regiao": regiao, "rank": rank, "prime": prime, "cla": cla}
+    avatar_id_raw = _ff_procurar(dados, _CHAVES_AVATAR_ID)
+    avatar_id = ""
+    if avatar_id_raw not in (None, "", 0, []):
+        av_s = re.sub(r"\D", "", str(avatar_id_raw))
+        if 5 <= len(av_s) <= 15:
+            avatar_id = av_s
+
+    avatar_url_raw = _ff_procurar(dados, _CHAVES_AVATAR_URL)
+    avatar_url = ""
+    if isinstance(avatar_url_raw, str) and avatar_url_raw.strip().lower().startswith(("http://", "https://")):
+        avatar_url = avatar_url_raw.strip()[:300]
+
+    return {
+        "nome": nome,
+        "nivel": nivel,
+        "regiao": regiao,
+        "rank": rank,
+        "prime": prime,
+        "cla": cla,
+        "avatar_id": avatar_id,
+        "avatar_url": avatar_url,
+    }
 
 
 def _ff_uid_invalido(dados) -> bool:
@@ -2205,10 +2237,11 @@ async def _ff_cache_salvar(uid: str, jogador: dict, provedor: str) -> None:
     try:
         async with aiosqlite.connect(DATABASE_FILE) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO ff_cache (uid, nick, nivel, regiao, rank, prime, cla, provedor, atualizado_em) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO ff_cache (uid, nick, nivel, regiao, rank, prime, cla, avatar_id, avatar_url, provedor, atualizado_em) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (uid, jogador.get("nome", ""), jogador.get("nivel", 0), jogador.get("regiao", ""),
                  jogador.get("rank", ""), jogador.get("prime", 0), jogador.get("cla", ""),
+                 jogador.get("avatar_id", ""), jogador.get("avatar_url", ""),
                  provedor, agora_brt().isoformat())
             )
             await db.commit()
@@ -2364,6 +2397,7 @@ async def verificar_ff(uid: str, forcar: bool = False) -> dict:
         return {
             "ok": True, "nome": salvo["nick"], "nivel": salvo["nivel"], "regiao": salvo["regiao"],
             "rank": salvo["rank"] or "", "prime": salvo["prime"] or 0, "cla": salvo["cla"] or "",
+            "avatar_id": salvo.get("avatar_id") or "", "avatar_url": salvo.get("avatar_url") or "",
             "provedor": salvo["provedor"] or "cache", "cache": True, "aviso": None,
             "atualizado": salvo["atualizado_em"],
         }
@@ -2430,6 +2464,7 @@ async def verificar_ff(uid: str, forcar: bool = False) -> dict:
         return {
             "ok": True, "nome": jogador["nome"], "nivel": jogador["nivel"], "regiao": jogador["regiao"],
             "rank": jogador.get("rank", ""), "prime": jogador.get("prime", 0), "cla": jogador.get("cla", ""),
+            "avatar_id": jogador.get("avatar_id", ""), "avatar_url": jogador.get("avatar_url", ""),
             "provedor": provedor, "cache": False, "aviso": None,
             "atualizado": agora_brt().isoformat(),
         }
@@ -2444,6 +2479,7 @@ async def verificar_ff(uid: str, forcar: bool = False) -> dict:
         return {
             "ok": True, "nome": salvo["nick"], "nivel": salvo["nivel"], "regiao": salvo["regiao"],
             "rank": salvo["rank"] or "", "prime": salvo["prime"] or 0, "cla": salvo["cla"] or "",
+            "avatar_id": salvo.get("avatar_id") or "", "avatar_url": salvo.get("avatar_url") or "",
             "provedor": salvo["provedor"] or "cache", "cache": True,
             "aviso": "Os servidores de consulta estão instáveis agora — mostrando o último dado salvo.",
             "atualizado": salvo["atualizado_em"],
@@ -3269,6 +3305,530 @@ async def montar_tabela_visual(
     return montar_embed_tabela(horario, slots_data, ocupadas, atualizado_em=atualizado_em), None
 
 
+_CACHE_AVATAR_FF_BYTES: dict[str, bytes] = {}
+_CACHE_AVATAR_FF_MAX = 64
+
+
+async def _baixar_avatar_ff(
+    uid: str = "",
+    regiao: str = "BR",
+    avatar_id: str = "",
+    avatar_url: str = "",
+) -> Optional[bytes]:
+    """Baixa a foto/ícone de avatar equipado pelo jogador no Free Fire (com cache leve em RAM e múltiplos CDNs)."""
+    av_id = re.sub(r"\D", "", str(avatar_id or ""))
+    av_url = str(avatar_url or "").strip()
+    chave_cache = av_url or (f"id:{av_id}" if av_id else "")
+    if chave_cache and chave_cache in _CACHE_AVATAR_FF_BYTES:
+        return _CACHE_AVATAR_FF_BYTES[chave_cache]
+
+    candidatas: list[str] = []
+    if av_url.startswith(("http://", "https://")):
+        candidatas.append(av_url)
+    if av_id:
+        candidatas.extend([
+            f"https://cdn.jsdelivr.net/gh/ShahGCreator/icon@main/PNG/{av_id}.png",
+            f"https://cdn.jsdelivr.net/gh/fakestarexx/FFItems@master/assets/icons/{av_id}.png",
+            f"https://raw.githubusercontent.com/ShahGCreator/icon/main/PNG/{av_id}.png",
+            f"https://raw.githubusercontent.com/fakestarexx/FFItems/master/assets/icons/{av_id}.png",
+        ])
+    if uid and not candidatas:
+        reg = (regiao or "BR").upper()
+        candidatas.append(f"https://freefireapis.lat/outfit?uid={uid}&region={reg}")
+
+    if not candidatas:
+        return None
+
+    sessao = _ff_sessao()
+    timeout_curto = aiohttp.ClientTimeout(total=4.5, connect=2.5)
+    for url in candidatas:
+        try:
+            async with sessao.get(url, timeout=timeout_curto) as resp:
+                if resp.status != 200:
+                    continue
+                raw = await resp.read()
+                if not raw or len(raw) < 120 or len(raw) > 4_000_000:
+                    continue
+                if _PIL_DISPONIVEL:
+                    with Image.open(io.BytesIO(raw)) as im_chk:
+                        im_chk.verify()
+                if chave_cache:
+                    if len(_CACHE_AVATAR_FF_BYTES) >= _CACHE_AVATAR_FF_MAX:
+                        _CACHE_AVATAR_FF_BYTES.pop(next(iter(_CACHE_AVATAR_FF_BYTES)), None)
+                    _CACHE_AVATAR_FF_BYTES[chave_cache] = raw
+                return raw
+        except Exception:
+            continue
+    return None
+
+
+async def coletar_perfis_booyah_ff(jogadores_base: list[dict]) -> list[dict]:
+    """Consulta em paralelo os jogadores do time vencedor no Free Fire (foto, nome atualizado, nível e clã)."""
+    async def _resolver_um(jb: dict) -> dict:
+        uid = re.sub(r"\D", "", str(jb.get("ff_uid") or jb.get("uid") or ""))
+        nome_fb = str(jb.get("ff_nome") or jb.get("nome") or "JOGADOR").strip()
+        niv_fb = int(jb.get("ff_nivel") or jb.get("nivel") or 0)
+        cla_fb = str(jb.get("cla") or "").strip()
+        av_id = str(jb.get("avatar_id") or "").strip()
+        av_url = str(jb.get("avatar_url") or "").strip()
+        regiao = str(jb.get("regiao") or "BR").strip() or "BR"
+
+        if uid and (5 <= len(uid) <= 15):
+            try:
+                dados = await verificar_ff(uid, forcar=False)
+                # Se veio de cache antigo (pré-v13.4) sem avatar_id, tenta 1 atualização ao vivo
+                if dados.get("ok") and dados.get("cache") and not dados.get("avatar_id") and not dados.get("avatar_url"):
+                    dados_vivo = await verificar_ff(uid, forcar=True)
+                    if dados_vivo.get("ok"):
+                        dados = dados_vivo
+                if dados.get("ok"):
+                    nome_fb = str(dados.get("nome") or nome_fb).strip()
+                    niv_fb = int(dados.get("nivel") or niv_fb or 0)
+                    cla_fb = str(dados.get("cla") or cla_fb or "").strip()
+                    av_id = str(dados.get("avatar_id") or av_id or "").strip()
+                    av_url = str(dados.get("avatar_url") or av_url or "").strip()
+                    regiao = str(dados.get("regiao") or regiao or "BR").strip()
+            except Exception:
+                pass
+
+        avatar_bytes = None
+        if jb.get("avatar_bytes"):
+            avatar_bytes = jb["avatar_bytes"]
+        else:
+            avatar_bytes = await _baixar_avatar_ff(uid=uid, regiao=regiao, avatar_id=av_id, avatar_url=av_url)
+
+        return {
+            "ff_uid": uid,
+            "ff_nome": nome_fb or "JOGADOR",
+            "ff_nivel": niv_fb,
+            "cla": cla_fb,
+            "avatar_id": av_id,
+            "avatar_bytes": avatar_bytes,
+        }
+
+    return list(await asyncio.gather(*(_resolver_um(dict(j)) for j in (jogadores_base or [])[:4])))
+
+
+def _booyah_desenhar_trofeu_vetor(d, cx: int, cy: int, s: float = 1.0) -> None:
+    """Desenha coroa/troféu vetorial em vermelho-carmesim e prata metálica (sem depender de emoji Unicode)."""
+    # Escudo octogonal de fundo
+    r = int(42 * s)
+    pts_bg = [
+        (cx - r, cy - int(r * 0.45)), (cx - int(r * 0.45), cy - r),
+        (cx + int(r * 0.45), cy - r), (cx + r, cy - int(r * 0.45)),
+        (cx + r, cy + int(r * 0.45)), (cx + int(r * 0.45), cy + r),
+        (cx - int(r * 0.45), cy + r), (cx - r, cy + int(r * 0.45)),
+    ]
+    d.polygon(pts_bg, fill=(38, 8, 12, 245), outline=(218, 38, 54, 255), width=max(2, int(3 * s)))
+    # Coroa interna de 3 pontas
+    w_c = int(24 * s)
+    h_c = int(17 * s)
+    coroa = [
+        (cx - w_c, cy + int(10 * s)),
+        (cx - int(w_c * 1.08), cy - int(10 * s)),
+        (cx - int(w_c * 0.42), cy - int(1 * s)),
+        (cx, cy - h_c),
+        (cx + int(w_c * 0.42), cy - int(1 * s)),
+        (cx + int(w_c * 1.08), cy - int(10 * s)),
+        (cx + w_c, cy + int(10 * s)),
+    ]
+    d.polygon(coroa, fill=(242, 236, 238, 255), outline=(228, 44, 62, 255), width=max(2, int(2 * s)))
+    d.rounded_rectangle(
+        (cx - w_c, cy + int(13 * s), cx + w_c, cy + int(19 * s)),
+        radius=max(2, int(3 * s)),
+        fill=(220, 36, 52, 255),
+    )
+
+
+def _booyah_avatar_quadrado_hd(avatar_bytes: Optional[bytes], tamanho: int, inicial_txt: str) -> "Image.Image":
+    """Monta o retrato quadrado arredondado da foto do jogador do Free Fire (ou emblema vetorial caso sem foto)."""
+    box = Image.new("RGBA", (tamanho, tamanho), (0, 0, 0, 0))
+    mask = Image.new("L", (tamanho, tamanho), 0)
+    dm = ImageDraw.Draw(mask)
+    raio_canto = max(16, int(tamanho * 0.14))
+    dm.rounded_rectangle((0, 0, tamanho - 1, tamanho - 1), radius=raio_canto, fill=255)
+
+    carregou_foto = False
+    if avatar_bytes:
+        try:
+            with Image.open(io.BytesIO(avatar_bytes)) as src_im:
+                im_rgba = src_im.convert("RGBA")
+                sw, sh = im_rgba.size
+                lado = min(sw, sh)
+                left = max(0, (sw - lado) // 2)
+                top = max(0, (sh - lado) // 2)
+                im_crop = im_rgba.crop((left, top, left + lado, top + lado)).resize(
+                    (tamanho, tamanho), Image.Resampling.LANCZOS
+                )
+                fundo_av = _card_gradiente_vertical(tamanho, tamanho, (34, 9, 13, 255), (12, 6, 8, 255))
+                fundo_av = Image.alpha_composite(fundo_av, im_crop)
+                box.paste(fundo_av, (0, 0), mask)
+                carregou_foto = True
+        except Exception:
+            carregou_foto = False
+
+    if not carregou_foto:
+        fundo_fb = _card_gradiente_vertical(tamanho, tamanho, (46, 10, 15, 255), (12, 6, 8, 255))
+        dfb = ImageDraw.Draw(fundo_fb)
+        cx_a, cy_a = tamanho // 2, tamanho // 2
+        # Emblema tático Free Force + inicial do nick
+        r_ext = int(tamanho * 0.34)
+        dfb.ellipse(
+            (cx_a - r_ext, cy_a - r_ext, cx_a + r_ext, cy_a + r_ext),
+            fill=(26, 7, 10, 235),
+            outline=(205, 34, 50, 220),
+            width=4,
+        )
+        f_ini = _card_carregar_fonte("black", max(32, int(tamanho * 0.34)))
+        ini_limpa = _card_limpar_texto((inicial_txt or "FF")[:2].upper(), f_ini, fallback="FF", remover_simbolos=True)
+        dfb.text((cx_a, cy_a), ini_limpa or "FF", font=f_ini, fill=(246, 240, 242, 255), anchor="mm")
+        box.paste(fundo_fb, (0, 0), mask)
+
+    # Moldura dupla carmesim + brilho interno
+    d_borda = ImageDraw.Draw(box)
+    d_borda.rounded_rectangle(
+        (1, 1, tamanho - 2, tamanho - 2),
+        radius=raio_canto,
+        outline=(220, 38, 54, 245),
+        width=5,
+    )
+    d_borda.rounded_rectangle(
+        (9, 9, tamanho - 10, tamanho - 10),
+        radius=max(8, raio_canto - 7),
+        outline=(255, 255, 255, 42),
+        width=2,
+    )
+    return box
+
+
+def renderizar_card_booyah_png(
+    modo: str,
+    categoria: str,
+    horario_str: str,
+    jogadores: list[dict],
+    numero_slot: Optional[int] = None,
+) -> bytes:
+    """Renderiza o Card Oficial de BOOYAH! em HD (Vermelho Escuro + Preto), com foto FF, nick e clã de cada jogador."""
+    modo_l = str(modo or "squad").strip().lower()
+    modo_up = {"solo": "SOLO", "duo": "DUO", "trio": "TRIO", "squad": "SQUAD"}.get(modo_l, modo_l.upper() or "DIARIO")
+    cat_raw = str(categoria or "premium").strip()
+    cat_up = {"premium": "PREMIUM", "basico": "BÁSICO", "básico": "BÁSICO"}.get(cat_raw.lower(), cat_raw.upper())
+    hora_up = str(horario_str or "--:--").strip()
+
+    lista = list(jogadores or [])[:4]
+    if not lista:
+        lista = [{"ff_nome": "CAMPEÃO", "cla": "", "ff_uid": "", "ff_nivel": 0, "avatar_bytes": None}]
+    qtd = len(lista)
+
+    W, H = 2000, 1160
+    card = _card_gradiente_vertical(W, H, (17, 7, 10, 255), (5, 4, 5, 255))
+    _card_glow_radial_local(card, W // 2, 165, 920, 340, (195, 22, 38), 112)
+    _card_glow_radial_local(card, 240, H - 180, 520, 300, (130, 12, 24), 68)
+    _card_glow_radial_local(card, W - 240, H - 180, 520, 300, (130, 12, 24), 68)
+
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d_ov = ImageDraw.Draw(ov)
+
+    # Textura tática diagonal sutil
+    for k in range(-H, W + H, 68):
+        d_ov.line([(k, 0), (k - H, H)], fill=(210, 32, 48, 12), width=2)
+
+    # Moldura mestra externa + cantoneiras esportivas
+    d_ov.rounded_rectangle((22, 22, W - 23, H - 23), radius=30, outline=(145, 24, 36, 220), width=4)
+    d_ov.rounded_rectangle((34, 34, W - 35, H - 35), radius=24, outline=(58, 18, 24, 185), width=2)
+    d_ov.rounded_rectangle((260, 20, W - 260, 29), radius=4, fill=(228, 38, 54, 255))
+
+    # Header de Campeonato
+    _booyah_desenhar_trofeu_vetor(d_ov, 150, 148, s=1.35)
+    _booyah_desenhar_trofeu_vetor(d_ov, W - 150, 148, s=1.35)
+
+    f_kicker = _card_carregar_fonte("bold", 24)
+    f_booyah = _card_carregar_fonte("black", 104)
+    f_chip = _card_carregar_fonte("bold", 26)
+
+    subtitulo_topo = "FIRE FORCE OFICIAL   •   CAMPEÃO DA QUEDA" if qtd == 1 else "FIRE FORCE OFICIAL   •   CAMPEÕES DA QUEDA"
+    d_ov.text((W // 2, 68), subtitulo_topo, font=f_kicker, fill=(225, 86, 98, 245), anchor="mm")
+    # Sombra carmesim + texto branco puro BOOYAH!
+    d_ov.text((W // 2 + 4, 154), "BOOYAH!", font=f_booyah, fill=(140, 14, 26, 220), anchor="mm")
+    d_ov.text((W // 2, 150), "BOOYAH!", font=f_booyah, fill=(250, 246, 247, 255), anchor="mm")
+
+    # Chips de informações da partida: MODO • CATEGORIA • HORÁRIO (+ VAGA/LOTE opcional)
+    chips_info = [
+        f"MODO: {modo_up}",
+        f"CATEGORIA: {_card_limpar_texto(cat_up, f_chip, fallback='DIÁRIO', remover_simbolos=True)}",
+        f"HORÁRIO: {_card_limpar_texto(hora_up, f_chip, fallback='--:--', remover_simbolos=True)}",
+    ]
+    if numero_slot and int(numero_slot) > 0:
+        rot_s = "VAGA" if modo_l == "solo" else "LOTE"
+        chips_info.append(f"{rot_s}: #{int(numero_slot):02d}")
+
+    larguras_chips = []
+    for txt_c in chips_info:
+        bb_c = d_ov.textbbox((0, 0), txt_c, font=f_chip)
+        larguras_chips.append((bb_c[2] - bb_c[0]) + 64)
+    gap_chip = 22
+    total_w_chips = sum(larguras_chips) + gap_chip * (len(chips_info) - 1)
+    cur_cx = (W - total_w_chips) // 2
+    chip_y1, chip_y2 = 228, 286
+    for idx_c, (txt_c, w_c) in enumerate(zip(chips_info, larguras_chips)):
+        destaque = idx_c == 0
+        d_ov.rounded_rectangle(
+            (cur_cx, chip_y1, cur_cx + w_c, chip_y2),
+            radius=14,
+            fill=(165, 22, 36, 235) if destaque else (24, 11, 15, 235),
+            outline=(235, 58, 74, 255) if destaque else (128, 28, 38, 215),
+            width=3,
+        )
+        d_ov.text(
+            (cur_cx + w_c // 2, (chip_y1 + chip_y2) // 2),
+            txt_c,
+            font=f_chip,
+            fill=(252, 248, 248, 255) if destaque else (238, 212, 216, 255),
+            anchor="mm",
+        )
+        cur_cx += w_c + gap_chip
+
+    # Divisória horizontal sutil
+    d_ov.line([(86, 318), (W - 86, 318)], fill=(125, 24, 34, 150), width=2)
+
+    card = Image.alpha_composite(card, ov)
+
+    # Sub-cards dos jogadores (1 p/ Solo, 2 p/ Duo, 3 p/ Trio, 4 p/ Squad)
+    area_top = 352
+    area_bot = H - 96
+    card_h = area_bot - area_top  # 712px em 2x
+
+    if qtd == 1:
+        col_w, gap_col, av_sz = 680, 0, 340
+    elif qtd == 2:
+        col_w, gap_col, av_sz = 620, 48, 320
+    elif qtd == 3:
+        col_w, gap_col, av_sz = 540, 38, 300
+    else:
+        col_w, gap_col, av_sz = 430, 28, 276
+
+    total_row_w = qtd * col_w + (qtd - 1) * gap_col
+    start_x = (W - total_row_w) // 2
+
+    layer_jog = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d_jog = ImageDraw.Draw(layer_jog)
+
+    f_lvl = _card_carregar_fonte("bold", 22)
+    f_cla_lbl = _card_carregar_fonte("bold", 20)
+    f_cla_val = _card_carregar_fonte("bold", 25)
+    f_uid_sub = _card_carregar_fonte("bold", 21)
+
+    avatares_colar: list[tuple["Image.Image", int, int, int]] = []
+
+    for idx_j, j in enumerate(lista):
+        x1 = start_x + idx_j * (col_w + gap_col)
+        x2 = x1 + col_w
+        y1, y2 = area_top, area_bot
+        cx = (x1 + x2) // 2
+
+        # Painel obsidiana com topo vermelho escuro
+        d_jog.rounded_rectangle(
+            (x1, y1, x2, y2),
+            radius=24,
+            fill=(15, 9, 12, 238),
+            outline=(140, 26, 38, 225),
+            width=3,
+        )
+        d_jog.rounded_rectangle(
+            (x1 + 42, y1, x2 - 42, y1 + 8),
+            radius=4,
+            fill=(224, 38, 54, 255),
+        )
+
+        # Halo radial atrás da foto do jogador
+        av_x = cx - av_sz // 2
+        av_y = y1 + 44
+        d_jog.rounded_rectangle(
+            (av_x - 8, av_y - 8, av_x + av_sz + 8, av_y + av_sz + 8),
+            radius=max(20, int(av_sz * 0.16)),
+            fill=(58, 10, 16, 145),
+        )
+
+        nome_raw = str(j.get("ff_nome") or "JOGADOR").strip() or "JOGADOR"
+        av_img = _booyah_avatar_quadrado_hd(j.get("avatar_bytes"), av_sz, nome_raw)
+        avatares_colar.append((av_img, av_x, av_y, int(j.get("ff_nivel") or 0)))
+
+        # Nome do jogador no Free Fire (auto-ajuste de fonte para nunca cortar feio)
+        y_nick = av_y + av_sz + 56
+        f_nick, nick_txt = _card_ajustar_titulo(
+            d_jog,
+            nome_raw,
+            "black",
+            tam_max=40 if qtd <= 2 else 34,
+            tam_min=22,
+            larg_max=col_w - 44,
+            remover_simbolos=True,
+        )
+        if not nick_txt:
+            nick_txt = f"JOGADOR {idx_j + 1}"
+        d_jog.text((cx, y_nick), nick_txt, font=f_nick, fill=(248, 244, 245, 255), anchor="mm")
+
+        # Sub-bloco do Clã / Guilda logo embaixo do nome
+        cla_raw = str(j.get("cla") or "").strip()
+        cla_limpo = _card_truncar_px(d_jog, cla_raw, f_cla_val, col_w - 92, remover_simbolos=True) if cla_raw else ""
+        cla_box_y1 = y_nick + 42
+        cla_box_y2 = cla_box_y1 + 84
+        d_jog.rounded_rectangle(
+            (x1 + 26, cla_box_y1, x2 - 26, cla_box_y2),
+            radius=16,
+            fill=(28, 10, 14, 238) if cla_limpo else (18, 12, 14, 215),
+            outline=(172, 30, 44, 215) if cla_limpo else (64, 34, 40, 165),
+            width=2,
+        )
+        d_jog.text(
+            (cx, cla_box_y1 + 24),
+            "CLÃ / GUILDA",
+            font=f_cla_lbl,
+            fill=(214, 84, 96, 235) if cla_limpo else (138, 104, 110, 210),
+            anchor="mm",
+        )
+        d_jog.text(
+            (cx, cla_box_y1 + 58),
+            cla_limpo if cla_limpo else "SEM CLÃ",
+            font=f_cla_val,
+            fill=(244, 234, 236, 255) if cla_limpo else (152, 128, 134, 220),
+            anchor="mm",
+        )
+
+        # Linha discreta de ID numérico no rodapé do sub-card
+        uid_str = str(j.get("ff_uid") or "").strip()
+        rodape_j = f"ID FF: {uid_str}" if uid_str else f"INTEGRANTE #{idx_j + 1}"
+        d_jog.text((cx, y2 - 32), rodape_j, font=f_uid_sub, fill=(162, 112, 120, 220), anchor="mm")
+
+    card = Image.alpha_composite(card, layer_jog)
+
+    # Cola os retratos dos avatares FF + selo de nível por cima
+    layer_av = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    for av_im, ax, ay, niv_j in avatares_colar:
+        layer_av.paste(av_im, (ax, ay), av_im)
+        if niv_j > 0:
+            d_av = ImageDraw.Draw(layer_av)
+            txt_lv = f"NV. {niv_j}"
+            bb_lv = d_av.textbbox((0, 0), txt_lv, font=f_lvl)
+            lw_lv = (bb_lv[2] - bb_lv[0]) + 28
+            bx2 = ax + av_im.size[0] - 10
+            by2 = ay + av_im.size[1] - 10
+            d_av.rounded_rectangle(
+                (bx2 - lw_lv, by2 - 36, bx2, by2),
+                radius=10,
+                fill=(185, 24, 38, 245),
+                outline=(252, 228, 232, 220),
+                width=2,
+            )
+            d_av.text((bx2 - lw_lv // 2, by2 - 18), txt_lv, font=f_lvl, fill=(255, 250, 250, 255), anchor="mm")
+
+    card = Image.alpha_composite(card, layer_av)
+
+    d_fin = ImageDraw.Draw(card)
+    f_foot = _card_carregar_fonte("bold", 20)
+    d_fin.text(
+        (W // 2, H - 48),
+        f"FIRE FORCE COMPETITIVE SYSTEM   •   HALL OF BOOYAH   •   {modo_up} {cat_up} {hora_up}",
+        font=f_foot,
+        fill=(152, 76, 84, 245),
+        anchor="mm",
+    )
+
+    final_rgb = card.convert("RGB").resize((W // 2, H // 2), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    final_rgb.save(buf, format="PNG", compress_level=6)
+    return buf.getvalue()
+
+
+async def publicar_booyah_canal(
+    guild: discord.Guild,
+    modo: str,
+    categoria: str,
+    horario_str: str,
+    jogadores_base: list[dict],
+    comprador_id: Optional[int] = None,
+    numero_slot: Optional[int] = None,
+    autor_staff: Optional[discord.abc.User] = None,
+) -> tuple[bool, str]:
+    """Gera o Card Oficial HD de Booyah (foto FF + nome + clã) e publica no canal de Booyah configurado."""
+    cfg = await obter_config(guild.id)
+    canal_id = cfg.get("canal_booyah")
+    canal_destino = guild.get_channel(int(canal_id)) if canal_id else None
+    if not canal_destino:
+        return (
+            False,
+            "O **Canal de Booyah** ainda não foi definido! Configure em `/config canal_booyah:#canal` ou `/booyah`.",
+        )
+
+    perfis = await coletar_perfis_booyah_ff(jogadores_base)
+    if not perfis:
+        return (False, "Nenhum jogador encontrado para gerar o Booyah.")
+
+    modo_l = str(modo or "squad").strip().lower()
+    rotulo_diario = formatar_rotulo_diario(modo_l, str(categoria or "premium"))
+    linhas_jog = []
+    for idx, p in enumerate(perfis, 1):
+        cla_info = f" • 🛡️ Clã: `{p['cla']}`" if p.get("cla") else " • 🛡️ Clã: `Sem clã`"
+        uid_info = f" *(ID `{p['ff_uid']}`)*" if p.get("ff_uid") else ""
+        linhas_jog.append(f"> **{idx}.** `{p['ff_nome']}`{cla_info}{uid_info}")
+
+    linha_slot = ""
+    if numero_slot and int(numero_slot) > 0:
+        linha_slot = f"• **{texto_slot(modo_l)}:** `#{int(numero_slot)}`" + (
+            f" ({mencao(comprador_id)})" if comprador_id else ""
+        ) + "\n"
+
+    descricao = (
+        f"• **Modo:** `{modo_l.upper()}`\n"
+        f"• **Categoria:** `{str(categoria or 'premium').upper()}`\n"
+        f"• **Horário:** `{horario_str}`\n"
+        f"{linha_slot}\n"
+        f"**🏆 Elenco Campeão:**\n" + "\n".join(linhas_jog)
+    )
+
+    png_bytes = None
+    if _PIL_DISPONIVEL:
+        try:
+            png_bytes = await asyncio.to_thread(
+                renderizar_card_booyah_png,
+                modo_l,
+                str(categoria or "premium"),
+                str(horario_str or "--:--"),
+                perfis,
+                numero_slot,
+            )
+        except Exception as erro_by:
+            _log_arquivo(f"[BOOYAH] falha ao renderizar PNG: {erro_by}")
+
+    nome_arq = "booyah_fireforce.png"
+    embed = criar_embed(
+        titulo=f"🔥 BOOYAH! • {rotulo_diario} — {horario_str}",
+        descricao=descricao,
+        cor_nome="Vermelho Escuro",
+        image=f"attachment://{nome_arq}" if png_bytes else None,
+        footer=f"Fire Force • Booyah Oficial • {agora_brt().strftime('%d/%m/%Y às %H:%M')}",
+    )
+
+    conteudo_msg = mencao(comprador_id) if comprador_id else None
+    kwargs_send: dict = {"content": conteudo_msg, "embed": embed}
+    if png_bytes:
+        kwargs_send["file"] = discord.File(io.BytesIO(png_bytes), filename=nome_arq)
+    await canal_destino.send(**kwargs_send)
+
+    if autor_staff:
+        await registrar_log(
+            guild,
+            "🏆 BOOYAH",
+            "🔥 Booyah Oficial Publicado",
+            f"• **Responsável:** {mencao(autor_staff.id)}\n"
+            f"• **Diário:** `{rotulo_diario}` às `{horario_str}`\n"
+            f"• **Canal:** {canal_destino.mention}\n"
+            f"• **Campeões:** {', '.join(p['ff_nome'] for p in perfis)}",
+            "Vermelho Escuro",
+        )
+    return (True, f"Booyah publicado com sucesso em {canal_destino.mention}!")
+
+
 async def obter_slots_data(horario_id: int) -> list:
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
@@ -3312,6 +3872,7 @@ def _garantir_view_sala_registrada(horario_id: int) -> "SalaTabelaPainelView":
     if hid not in _SALAS_VIEWS_REGISTRADAS:
         try:
             bot.add_view(view)
+            bot.add_view(ReceberPremiacaoDiarioView(hid))
             _SALAS_VIEWS_REGISTRADAS.add(hid)
         except Exception:
             pass
@@ -3818,18 +4379,207 @@ class ConfirmarCancelamentoQuorumView(discord.ui.View):
         )
 
 
+class ReceberPremiacaoDiarioView(discord.ui.View):
+    """Seletor persistente da 1ª Etapa de Finalização: abre ticket na categoria Receber Premiação (Kills)."""
+
+    def __init__(self, horario_id: int):
+        super().__init__(timeout=None)
+        self.horario_id = int(horario_id)
+        sel = discord.ui.Select(
+            custom_id=f"ff_prem_sel:{self.horario_id}",
+            placeholder="💰 Fez kill? Clique aqui p/ abrir Ticket de Recebimento...",
+            options=[
+                discord.SelectOption(
+                    label="Receber Premiação em Moedas na Carteira",
+                    value="moedas",
+                    emoji="🪙",
+                    description="Abre ticket de recebimento p/ enviar o print das kills e receber em moedas",
+                ),
+                discord.SelectOption(
+                    label="Solicitar Saque PIX (Respeitando Saque Mínimo)",
+                    value="saque",
+                    emoji="💸",
+                    description="Abre ticket p/ enviar print (se sem caixa no momento, cai em moedas)",
+                ),
+            ],
+        )
+        sel.callback = self._abrir
+        self.add_item(sel)
+
+    async def _abrir(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return
+        escolha = interaction.data["values"][0]
+        try:
+            await interaction.message.edit(view=ReceberPremiacaoDiarioView(self.horario_id))
+        except Exception:
+            pass
+
+        async with aiosqlite.connect(DATABASE_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            horario = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (self.horario_id,))).fetchone()
+            slot = await (await db.execute(
+                "SELECT * FROM slots WHERE horario_id = ? AND comprador_id = ? AND confirmado = 1",
+                (self.horario_id, interaction.user.id),
+            )).fetchone()
+            jogadores_slot = []
+            if slot:
+                jogadores_slot = await (await db.execute(
+                    "SELECT ff_nome, ff_uid FROM slot_jogadores WHERE slot_id = ? ORDER BY posicao",
+                    (slot["id"],),
+                )).fetchall()
+
+        saque_min = await cfgv(interaction.guild.id, "saque_min", CARTEIRA_SAQUE_MIN)
+        if horario:
+            rotulo_d = formatar_rotulo_diario(horario["tipo"], horario["categoria"])
+            hora_str = str(horario["horario"] or "--:--")
+            prem_str = str(horario["premiacao"] or "Por Kill")
+            rot_slot = texto_slot(horario["tipo"])
+        else:
+            rotulo_d = f"Diário #{self.horario_id}"
+            hora_str = "--:--"
+            prem_str = "Por Kill"
+            rot_slot = "Vaga/Lote"
+
+        if slot:
+            nicks_l = ", ".join(f"`{j['ff_nome']}`" for j in jogadores_slot if j["ff_nome"]) or "`—`"
+            info_vaga = f"• **{rot_slot} identificada:** `#{slot['numero']}` — {nicks_l}\n"
+        else:
+            info_vaga = f"• **{rot_slot}:** *informe o nº da sua {rot_slot.lower()} junto com o print*\n"
+
+        if escolha == "saque":
+            pref_txt = (
+                f"💸 **Saque via PIX** *(saque mínimo: `{formatar_moeda(saque_min)}` — "
+                f"caso não haja caixa imediato no momento, depositamos em **Moedas na Carteira** para você sacar depois)*"
+            )
+        else:
+            pref_txt = "🪙 **Depositar em Moedas na Carteira** *(crédito direto no seu saldo)*"
+
+        detalhes_extras = (
+            f"**🏆 Dados do Diário Finalizado:**\n"
+            f"• **Diário:** `{rotulo_d}` — `{hora_str}`\n"
+            f"• **Premiação configurada:** `{prem_str}`\n"
+            f"{info_vaga}"
+            f"• **Opção escolhida:** {pref_txt}\n\n"
+            f"📸 **Envie agora neste canal o print da tela final da partida** mostrando as kills feitas por você ou pelo seu time!"
+        )
+        assunto_tk = f"Receber Premiação (Kills) — {rotulo_d} ({hora_str})"
+        await abrir_ticket(
+            interaction,
+            "suporte",
+            assunto=assunto_tk,
+            categoria_ticket="receber_premiacao",
+            detalhes_extras=detalhes_extras,
+        )
+
+
+class SelecionarVagaBooyahView(discord.ui.View):
+    """Seletor minimalista (com paginação se > 23 vagas no Solo) para escolher quem fez o Booyah na sala."""
+
+    POR_PAGINA = 23
+
+    def __init__(self, horario_id: int, horario_dict: dict, vagas_confirmadas: list[dict], pagina: int = 0):
+        super().__init__(timeout=180)
+        self.horario_id = int(horario_id)
+        self.horario_dict = dict(horario_dict)
+        self.vagas_confirmadas = list(vagas_confirmadas)
+        total_pags = max(1, math.ceil(len(self.vagas_confirmadas) / self.POR_PAGINA))
+        self.pagina = max(0, min(int(pagina), total_pags - 1))
+
+        inicio = self.pagina * self.POR_PAGINA
+        fatia = self.vagas_confirmadas[inicio: inicio + self.POR_PAGINA]
+        rot = texto_slot(self.horario_dict.get("tipo", "squad"))
+
+        opcoes: list[discord.SelectOption] = []
+        if self.pagina > 0:
+            opcoes.append(discord.SelectOption(
+                label=f"Página anterior ({self.pagina}/{total_pags})",
+                value=f"pag:{self.pagina - 1}",
+                emoji="⬅️",
+                description="Ver vagas anteriores desta sala",
+            ))
+
+        for v in fatia:
+            nicks = ", ".join(j.get("ff_nome") or "?" for j in v.get("jogadores", [])) or "Sem nick"
+            opcoes.append(discord.SelectOption(
+                label=f"{rot} #{v['numero']} — {nicks}"[:100],
+                value=f"slot:{v['id']}",
+                emoji="🏆",
+                description=f"Publicar Booyah desta {rot.lower()} no canal oficial"[:100],
+            ))
+
+        if self.pagina + 1 < total_pags:
+            opcoes.append(discord.SelectOption(
+                label=f"Próxima página ({self.pagina + 2}/{total_pags})",
+                value=f"pag:{self.pagina + 1}",
+                emoji="➡️",
+                description="Ver próximas vagas desta sala",
+            ))
+
+        sel = discord.ui.Select(
+            placeholder=f"🏆 Escolha a {rot} campeã (Booyah)...",
+            options=opcoes[:25],
+        )
+        sel.callback = self._escolher
+        self.add_item(sel)
+
+    async def _escolher(self, interaction: discord.Interaction):
+        if not interaction.guild or not await e_staff(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas ADM, Gerente ou Dono pode registrar o Booyah.", "Vermelho"),
+                ephemeral=True,
+            )
+        escolha = interaction.data["values"][0]
+        if escolha.startswith("pag:"):
+            nova_pag = int(escolha.split(":", 1)[1])
+            return await interaction.response.edit_message(
+                view=SelecionarVagaBooyahView(self.horario_id, self.horario_dict, self.vagas_confirmadas, pagina=nova_pag)
+            )
+
+        slot_id = int(escolha.split(":", 1)[1])
+        alvo = next((x for x in self.vagas_confirmadas if int(x["id"]) == slot_id), None)
+        if not alvo:
+            return await interaction.response.edit_message(
+                embed=criar_embed("❌ Vaga não encontrada", "Atualize a seleção e tente novamente.", "Vermelho"),
+                view=None,
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, msg = await publicar_booyah_canal(
+            guild=interaction.guild,
+            modo=str(self.horario_dict.get("tipo") or "squad"),
+            categoria=str(self.horario_dict.get("categoria") or "premium"),
+            horario_str=str(self.horario_dict.get("horario") or "--:--"),
+            jogadores_base=list(alvo.get("jogadores") or []),
+            comprador_id=int(alvo["comprador_id"]) if alvo.get("comprador_id") else None,
+            numero_slot=int(alvo["numero"]) if alvo.get("numero") else None,
+            autor_staff=interaction.user,
+        )
+        await interaction.edit_original_response(
+            embed=criar_embed(
+                "🔥 Booyah Publicado!" if ok else "⚠️ Não foi possível publicar o Booyah",
+                msg,
+                "Vermelho Escuro" if ok else "Amarelo",
+            ),
+            view=None,
+        )
+
+
 class SalaTabelaPainelView(discord.ui.View):
     """Painel minimalista único no canal da tabela da sala:
     • Jogadores confirmados: substituir membro da line / liberar visão somente-leitura p/ equipe
-    • Staff (ADM/Gerente/Dono): definir ID e Senha direto na sala
-    • Dono e Gerente: cancelar sem quórum (estorno em moedas) / fechar e apagar o canal manualmente."""
+    • Staff (ADM/Gerente/Dono): definir ID e Senha direto na sala / registrar Booyah da partida
+    • Dono e Gerente:
+        - 1ª Etapa: Finalizar Diário (avisa inscritos sobre kills + abre seletor de Ticket de Recebimento sem apagar a sala)
+        - Cancelar sem quórum (estorno em moedas)
+        - 2ª Etapa: Fechar e apagar o canal manualmente quando encerrar os atendimentos."""
 
     def __init__(self, horario_id: int):
         super().__init__(timeout=None)
         self.horario_id = int(horario_id)
         sel = discord.ui.Select(
             custom_id=f"ff_tab_sel:{self.horario_id}",
-            placeholder="⚙️ Opções desta sala (Line • ID/Senha • Gerência)...",
+            placeholder="⚙️ Opções desta sala (Line • ID/Senha • Booyah • Finalizar)...",
             options=[
                 discord.SelectOption(
                     label="Substituir Jogador da Minha Line",
@@ -3850,16 +4600,28 @@ class SalaTabelaPainelView(discord.ui.View):
                     description="ADM/Gerente/Dono registra ID e Senha direto neste canal",
                 ),
                 discord.SelectOption(
+                    label="Enviar Booyah desta Sala",
+                    value="booyah_sala",
+                    emoji="🏆",
+                    description="ADM/Gerência: posta foto FF, nick e clã do campeão no canal de Booyah",
+                ),
+                discord.SelectOption(
+                    label="Finalizar Diário (1ª Etapa: Aviso de Kills)",
+                    value="finalizar_diario",
+                    emoji="🏁",
+                    description="Dono/Gerente: avisa quem fez kill p/ abrir ticket de recebimento",
+                ),
+                discord.SelectOption(
                     label="Cancelar Sala (Sem Quórum) + Estornar",
                     value="cancelar_quorum",
                     emoji="↩️",
                     description="Dono/Gerente: devolve em moedas a todos os inscritos",
                 ),
                 discord.SelectOption(
-                    label="Fechar e Apagar Canal desta Sala",
+                    label="Fechar e Apagar Canal desta Sala (2ª Etapa)",
                     value="fechar_canal",
                     emoji="🔒",
-                    description="Dono/Gerente: encerra manualmente e apaga este canal",
+                    description="Dono/Gerente: encerra definitivamente e apaga este canal",
                 ),
             ],
         )
@@ -3882,6 +4644,146 @@ class SalaTabelaPainelView(discord.ui.View):
                     ephemeral=True,
                 )
             return await interaction.response.send_modal(DefinirSalaCanalModal(self.horario_id))
+
+        if acao == "booyah_sala":
+            if not await e_staff(interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Restrito à Equipe", "Apenas ADM, Gerente ou Dono pode publicar o Booyah da sala.", "Vermelho"),
+                    ephemeral=True,
+                )
+            cfg_by = await obter_config(interaction.guild.id)
+            if not cfg_by.get("canal_booyah") or not interaction.guild.get_channel(int(cfg_by["canal_booyah"])):
+                return await interaction.response.send_message(
+                    embed=criar_embed(
+                        "⚙️ Canal de Booyah não configurado",
+                        "Defina primeiro o canal onde os Booyahs serão postados usando `/config canal_booyah:#canal` ou `/booyah`.",
+                        "Amarelo",
+                    ),
+                    ephemeral=True,
+                )
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                db.row_factory = aiosqlite.Row
+                horario_by = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (self.horario_id,))).fetchone()
+                if not horario_by:
+                    return await interaction.response.send_message(
+                        embed=criar_embed("❌ Sala não encontrada", "Este horário não existe mais.", "Vermelho"),
+                        ephemeral=True,
+                    )
+                slots_by = await (await db.execute(
+                    "SELECT id, numero, comprador_id FROM slots WHERE horario_id = ? AND confirmado = 1 ORDER BY numero",
+                    (self.horario_id,),
+                )).fetchall()
+                vagas_lista = []
+                for sb in slots_by:
+                    jogs_sb = await (await db.execute(
+                        "SELECT ff_uid, ff_nome, ff_nivel FROM slot_jogadores WHERE slot_id = ? ORDER BY posicao",
+                        (sb["id"],),
+                    )).fetchall()
+                    vagas_lista.append({
+                        "id": int(sb["id"]),
+                        "numero": int(sb["numero"] or 0),
+                        "comprador_id": int(sb["comprador_id"] or 0),
+                        "jogadores": [dict(x) for x in jogs_sb],
+                    })
+            if not vagas_lista:
+                return await interaction.response.send_message(
+                    embed=criar_embed("⚠️ Nenhuma vaga confirmada", "Esta sala ainda não possui inscritos confirmados.", "Amarelo"),
+                    ephemeral=True,
+                )
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "🏆 Selecionar Vencedor do Booyah",
+                    f"Escolha abaixo qual **{texto_slot(horario_by['tipo'])}** conquistou o **BOOYAH!** em "
+                    f"**{formatar_rotulo_diario(horario_by['tipo'], horario_by['categoria'])} (`{horario_by['horario']}`)**:\n"
+                    f"-# O bot vai buscar a foto do Free Fire, nick e clã de cada integrante e postar no canal oficial!",
+                    "Vermelho Escuro",
+                ),
+                view=SelecionarVagaBooyahView(self.horario_id, dict(horario_by), vagas_lista, pagina=0),
+                ephemeral=True,
+            )
+
+        if acao == "finalizar_diario":
+            if not await e_dono_ou_gerente(interaction.user):
+                return await interaction.response.send_message(
+                    embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente **Dono** ou **Gerente** pode finalizar o diário.", "Vermelho"),
+                    ephemeral=True,
+                )
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                db.row_factory = aiosqlite.Row
+                horario_f = await (await db.execute("SELECT * FROM horarios WHERE id = ?", (self.horario_id,))).fetchone()
+                if not horario_f:
+                    return await interaction.followup.send(
+                        embed=criar_embed("❌ Sala não encontrada", "Este horário não está mais registrado.", "Vermelho"),
+                        ephemeral=True,
+                    )
+                slots_conf = await (await db.execute(
+                    "SELECT DISTINCT comprador_id FROM slots WHERE horario_id = ? AND confirmado = 1",
+                    (self.horario_id,),
+                )).fetchall()
+                await db.execute(
+                    "UPDATE horarios SET encerrado_hoje = 1, finalizado_aviso = 1 WHERE id = ?",
+                    (self.horario_id,),
+                )
+                await db.commit()
+            marcar_sujo()
+
+            try:
+                await rebuild_painel(interaction.guild, int(horario_f["painel_id"]))
+            except Exception:
+                pass
+
+            _garantir_view_sala_registrada(self.horario_id)
+            saque_min_val = await cfgv(interaction.guild.id, "saque_min", CARTEIRA_SAQUE_MIN)
+            rotulo_fin = formatar_rotulo_diario(horario_f["tipo"], horario_f["categoria"])
+            prem_fin = horario_f["premiacao"] or "Por Kill"
+
+            mencoes_inscritos = " ".join(
+                mencao(int(r["comprador_id"])) for r in slots_conf if r["comprador_id"]
+            )
+            if len(mencoes_inscritos) > 1800:
+                mencoes_inscritos = mencoes_inscritos[:1800]
+
+            embed_aviso = criar_embed(
+                f"🏁 Partida Finalizada — {rotulo_fin} ({horario_f['horario']})",
+                f"A queda deste diário foi encerrada! Leia com atenção para receber sua premiação:\n\n"
+                f"• **🏆 Premiação da Sala:** `{prem_fin}`\n\n"
+                f"**📸 Fez Kill (você ou alguém da sua line)?**\n"
+                f"> **1.** Use o seletor logo abaixo para abrir um **Ticket na categoria Receber Premiação**.\n"
+                f"> **2.** Dentro do ticket, envie o **print da tela final da partida** comprovando as kills feitas!\n\n"
+                f"**💰 Como funciona o pagamento das kills:**\n"
+                f"> • 🪙 **Depositar em Moedas na Carteira:** creditado direto no seu saldo para jogar outros diários ou acumular.\n"
+                f"> • 💸 **Sacar via PIX:** disponível quando o valor das suas kills atingir o **saque mínimo de `{formatar_moeda(saque_min_val)}`**.\n"
+                f"> • ⚠️ *Caso o caixa não tenha disponibilidade imediata no momento para o saque, depositamos o valor em **Moedas na Carteira** para você sacar assim que disponível!*",
+                "Vermelho Escuro",
+                footer="Fire Force • 1ª Etapa: Recebimento de Premiação • O canal permanece aberto para abertura dos tickets",
+            )
+
+            if interaction.channel and hasattr(interaction.channel, "send"):
+                await interaction.channel.send(
+                    content=mencoes_inscritos or None,
+                    embed=embed_aviso,
+                    view=ReceberPremiacaoDiarioView(self.horario_id),
+                )
+
+            await registrar_log(
+                interaction.guild,
+                "🏁 DIÁRIO FINALIZADO",
+                "🏁 1ª Etapa — Aviso de Recebimento (Kills) enviado",
+                f"• **Responsável:** {interaction.user.mention}\n"
+                f"• **Diário:** `{rotulo_fin}` às `{horario_f['horario']}`\n"
+                f"• **Inscritos avisados:** `{len(slots_conf)}` vaga(s)/lote(s)",
+                "Vermelho Escuro",
+            )
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "✅ 1ª Etapa Concluída — Aviso Enviado!",
+                    "O aviso oficial de recebimento por kill e o seletor de **Abrir Ticket de Recebimento** foram publicados neste canal.\n"
+                    "-# O canal **não** foi apagado. Quando todos já tiverem aberto ticket, use **🔒 Fechar e Apagar Canal desta Sala (2ª Etapa)**.",
+                    "Esmeralda",
+                ),
+                ephemeral=True,
+            )
 
         if acao == "cancelar_quorum":
             if not await e_dono_ou_gerente(interaction.user):
@@ -9559,6 +10461,7 @@ async def cmd_help(interaction: discord.Interaction):
         embed.add_field(
             name="👥 Equipe (ADM & Suporte)",
             value="• `/pix` — Chave PIX e ganhos do ADM\n"
+                  "• `/booyah` — Publicar Booyah oficial (foto FF, nick e clã)\n"
                   "• `/trabalho` — Carteira de trabalho do Suporte",
             inline=False
         )
@@ -9566,7 +10469,7 @@ async def cmd_help(interaction: discord.Interaction):
             name="👑 Exclusivo Dono & Gerente",
             value="• **`/admin`** — Painel Mestre Unificado (Patentes, Vaga VIP, Manutenção, Relatório, Blacklist, Regras e Backup)\n"
                   "• `/vagavip` • `/relatorio` • `/blacklist` • `/setup` • `/diagnostico` • `/config` • `/logs` • `/saude`\n"
-                  "• `/diario` • `/painel` • `/ish` • `/painelcupom` • `/reset` • `/vitoria`\n"
+                  "• `/diario` • `/painel` • `/ish` • `/booyah` • `/painelcupom` • `/reset` • `/vitoria`\n"
                   "• `/painelcarteira` • `/addsaldo` • `/ticket` • `/staff` • `/parceria` • `/divulgacao`\n"
                   "• `/vaga` • `/anunciar` • `/embed` • `/evento` • `/painelranking` • `/backup` • `/restaurar` • `/dados`",
             inline=False
@@ -13552,6 +14455,7 @@ async def cmd_saude(interaction: discord.Interaction):
                        canal_cupons="Canal que anuncia os cupons automaticamente",
                        canal_eventos="Canal que anuncia os eventos",
                        canal_rankings="Canal do painel de rankings",
+                       canal_booyah="Canal onde o bot publica os Booyahs oficiais dos diários",
                        dia_fechamento="Dia do fechamento semanal do suporte")
 @app_commands.choices(dia_fechamento=[
     app_commands.Choice(name="Domingo (recomendado)", value=6),
@@ -13571,6 +14475,7 @@ async def cmd_config(interaction: discord.Interaction,
                      canal_cupons: Optional[discord.TextChannel] = None,
                      canal_eventos: Optional[discord.TextChannel] = None,
                      canal_rankings: Optional[discord.TextChannel] = None,
+                     canal_booyah: Optional[discord.TextChannel] = None,
                      dia_fechamento: Optional[app_commands.Choice[int]] = None):
     if not await e_dono_ou_gerente(interaction.user):
         return await interaction.response.send_message(
@@ -13603,7 +14508,8 @@ async def cmd_config(interaction: discord.Interaction,
                                      ("Logs do atendimento", canal_logs_suporte, "canal_logs_suporte"),
                                      ("Canal de cupons", canal_cupons, "canal_cupons"),
                                      ("Canal de eventos", canal_eventos, "canal_eventos"),
-                                     ("Canal de rankings", canal_rankings, "canal_rankings")):
+                                     ("Canal de rankings", canal_rankings, "canal_rankings"),
+                                     ("Canal de Booyah", canal_booyah, "canal_booyah")):
         if canal is not None:
             novos[chave] = canal.id
             _CACHE_LOGS.pop(interaction.guild.id, None)
@@ -13639,6 +14545,7 @@ async def cmd_config(interaction: discord.Interaction,
             f"> 🎟️ Canal de cupons: {_canal(cfg.get('canal_cupons'))}\n"
             f"> 🎉 Canal de eventos: {_canal(cfg.get('canal_eventos'))}\n"
             f"> 🏆 Canal de rankings: {_canal(cfg.get('canal_rankings'))}\n"
+            f"> 🔥 Canal de Booyah: {_canal(cfg.get('canal_booyah'))}\n"
             f"> 📅 Fechamento do suporte: `{dias[int(await cfgv(interaction.guild.id, 'dia_fechamento', 0))]}` à meia-noite\n"
             f"> ☁️ Supabase: `{'conectado' if supabase_configurado() else 'não configurado'}`",
             "Cinza Escuro")
@@ -15490,6 +16397,12 @@ class TicketPainelView(discord.ui.View):
                 description="Dúvidas, diários, cupons ou suporte técnico",
             ),
             discord.SelectOption(
+                label="Receber Premiação (Kills)",
+                value="receber_premiacao",
+                emoji="🏆",
+                description="Enviar print da partida p/ receber em moedas ou saque PIX",
+            ),
+            discord.SelectOption(
                 label="Pagamentos & Carteira",
                 value="pagamento",
                 emoji="💰",
@@ -15525,7 +16438,21 @@ class TicketPainelView(discord.ui.View):
             except Exception:
                 pass
             return
-        if escolha == "pagamento":
+        if escolha == "receber_premiacao":
+            saq_m = await cfgv(interaction.guild.id, "saque_min", CARTEIRA_SAQUE_MIN)
+            extra_prem = (
+                "📸 **Envie neste canal o print do final da partida** mostrando as kills feitas (e informe o horário/modo do diário)!\n"
+                f"• Você pode escolher **receber em Moedas na Carteira** ou **solicitar Saque PIX** *(saque mínimo: `{formatar_moeda(saq_m)}` — "
+                "se não houver caixa imediato no momento, creditamos em Moedas para você sacar depois)*."
+            )
+            await abrir_ticket(
+                interaction,
+                "suporte",
+                assunto="Receber Premiação (Kills)",
+                categoria_ticket="receber_premiacao",
+                detalhes_extras=extra_prem,
+            )
+        elif escolha == "pagamento":
             await abrir_ticket(interaction, "suporte", assunto="Dúvida de pagamento", categoria_ticket="duvida_pagamento")
         else:
             await abrir_ticket(interaction, "suporte")
@@ -15535,9 +16462,16 @@ class TicketPainelView(discord.ui.View):
             pass
 
 
-async def abrir_ticket(interaction: discord.Interaction, tipo: str = "suporte", assunto: str = "", categoria_ticket: str = "suporte"):
+async def abrir_ticket(
+    interaction: discord.Interaction,
+    tipo: str = "suporte",
+    assunto: str = "",
+    categoria_ticket: str = "suporte",
+    detalhes_extras: str = "",
+):
     tipo = "suporte"          # atendimento com jogador = SEMPRE suporte
-    categoria_ticket = "duvida_pagamento" if categoria_ticket == "duvida_pagamento" else "suporte"
+    if categoria_ticket not in ("suporte", "duvida_pagamento", "receber_premiacao"):
+        categoria_ticket = "suporte"
     await _reconciliar_ticket_estado(interaction.guild, usuario_id=interaction.user.id)
     cfg = await obter_config(interaction.guild.id)
     if not any(cfg.get(k) for k in cargos_da_fila(tipo)):
@@ -15548,16 +16482,21 @@ async def abrir_ticket(interaction: discord.Interaction, tipo: str = "suporte", 
 
     async with aiosqlite.connect(DATABASE_FILE) as db:
         existente = await (await db.execute(
-            "SELECT 1 FROM tickets WHERE guild_id = ? AND user_id = ? AND status = 'aberto'",
+            "SELECT channel_id FROM tickets WHERE guild_id = ? AND user_id = ? AND status = 'aberto'",
             (interaction.guild.id, interaction.user.id)
         )).fetchone()
     if existente:
+        ref_ex = f"<#{existente[0]}>" if existente[0] else "seu canal atual"
         return await interaction.response.send_message(
             embed=criar_embed("⚠️ Você já tem um atendimento aberto",
-                              "Finalize o atendimento atual antes de abrir outro.", "Amarelo"), ephemeral=True)
+                              f"Acesse {ref_ex} (ou finalize o atendimento atual antes de abrir outro).", "Amarelo"), ephemeral=True)
 
     categoria = interaction.guild.get_channel(cfg.get("cat_tickets"))
-    rotulo = "🎧" if tipo == "suporte" else "🤝"
+    if categoria_ticket == "receber_premiacao":
+        nome_canal_tk = f"💰│receber-{interaction.user.display_name}"[:100]
+    else:
+        rotulo = "🎧" if tipo == "suporte" else "🤝"
+        nome_canal_tk = f"{rotulo}│{interaction.user.display_name}"[:100]
     overwrites = {
         interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
         interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True,
@@ -15574,7 +16513,7 @@ async def abrir_ticket(interaction: discord.Interaction, tipo: str = "suporte", 
     canal = None
     try:
         canal = await interaction.guild.create_text_channel(
-            f"{rotulo}│{interaction.user.display_name}"[:100], category=categoria, overwrites=overwrites)
+            nome_canal_tk, category=categoria, overwrites=overwrites)
         async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
             cursor = await db.execute(
                 "INSERT INTO tickets (guild_id, channel_id, user_id, status, tipo, criado_em, categoria) "
@@ -15596,15 +16535,26 @@ async def abrir_ticket(interaction: discord.Interaction, tipo: str = "suporte", 
 
     nomes = {"suporte": "Suporte 🎧"}
     dica = "Quem assume aqui é o **suporte** — dúvidas, diários, carteira e comprovantes. 🎧"
-    titulo_atendimento = "Dúvida de pagamento 💰" if categoria_ticket == "duvida_pagamento" else nomes.get(tipo, "Suporte 🎧")
+    if categoria_ticket == "receber_premiacao":
+        titulo_atendimento = "Receber Premiação (Kills) 💰"
+        cor_tk = "Vermelho Escuro"
+    elif categoria_ticket == "duvida_pagamento":
+        titulo_atendimento = "Dúvida de pagamento 💰"
+        cor_tk = "Cinza Escuro"
+    else:
+        titulo_atendimento = nomes.get(tipo, "Suporte 🎧")
+        cor_tk = "Cinza Escuro"
+
+    bloco_extra = f"\n{detalhes_extras.strip()}\n\n" if detalhes_extras else ""
     embed = criar_embed(
         f"🎫 Atendimento — {titulo_atendimento}",
-        f"Olá {interaction.user.mention}, descreva o que você precisa.\n"
+        f"Olá {interaction.user.mention}!\n"
+        f"{bloco_extra}"
         f"• {dica}\n"
         + (f"• 📌 **Assunto:** {assunto}\n" if assunto else "")
         + "• 🙋 **Assumir:** o primeiro atendente disponível assume o canal.\n"
         "• 🔒 **Fechar:** encerre quando concluir e avalie o atendimento.",
-        "Cinza Escuro", footer=f"Fire Force • Atendimento #{ticket_id}"
+        cor_tk, footer=f"Fire Force • Atendimento #{ticket_id}"
     )
     try:
         await canal.send(content=mencao(interaction.user.id), embed=embed, view=TicketView(ticket_id))
@@ -16125,6 +17075,7 @@ async def cmd_meu_ticket_fechar(interaction: discord.Interaction):
     categoria=[
         app_commands.Choice(name="Suporte geral", value="suporte"),
         app_commands.Choice(name="Dúvida de pagamento", value="duvida_pagamento"),
+        app_commands.Choice(name="Receber premiação (kills)", value="receber_premiacao"),
     ])
 async def cmd_tickets_fechar(
     interaction: discord.Interaction,
@@ -17522,6 +18473,117 @@ async def cmd_vitoria(interaction: discord.Interaction, usuario: discord.Member,
         interaction.guild, "🏆 RANKING", "🏆 Vitória registrada",
         f"{usuario.mention} +{quantidade} vitória(s) — total `{total}` • streak `{streak_atual}` • patente `{pat_depois['nome']}` (por {interaction.user.mention}).",
         "Dourado",
+    )
+
+
+@bot.tree.command(name="booyah", description="🔥 Definir o canal de Booyah ou publicar um Booyah oficial com foto FF, nick e clã")
+@app_commands.guild_only()
+@app_commands.describe(
+    canal_booyah="Definir/alterar o canal onde os Booyahs serão enviados (Dono/Gerente)",
+    modo="Modo da partida vencida (Solo, Duo, Trio ou Squad)",
+    categoria="Categoria da partida (ex: Premium, Básico, Evento)",
+    horario="Horário da sala (ex: 22:00)",
+    ids_ff="IDs do Free Fire dos vencedores separados por espaço ou vírgula (1 no Solo até 4 no Squad)",
+)
+@app_commands.choices(
+    modo=[
+        app_commands.Choice(name="Solo (1 jogador)", value="solo"),
+        app_commands.Choice(name="Duo (2 jogadores)", value="duo"),
+        app_commands.Choice(name="Trio (3 jogadores)", value="trio"),
+        app_commands.Choice(name="Squad (4 jogadores)", value="squad"),
+    ]
+)
+async def cmd_booyah(
+    interaction: discord.Interaction,
+    canal_booyah: Optional[discord.TextChannel] = None,
+    modo: Optional[app_commands.Choice[str]] = None,
+    categoria: Optional[str] = None,
+    horario: Optional[str] = None,
+    ids_ff: Optional[str] = None,
+):
+    if not await e_staff(interaction.user):
+        return await interaction.response.send_message(
+            embed=criar_embed("❌ Sem Permissão", "Apenas ADM, Gerente ou Dono pode usar `/booyah`.", "Vermelho"),
+            ephemeral=True,
+        )
+
+    # 1. Configurar canal de Booyah
+    if canal_booyah is not None and not ids_ff:
+        if not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente Dono ou Gerente pode definir o canal oficial de Booyah.", "Vermelho"),
+                ephemeral=True,
+            )
+        await salvar_config(interaction.guild.id, canal_booyah=canal_booyah.id)
+        marcar_sujo()
+        await registrar_log(
+            interaction.guild,
+            "⚙️ CONFIG",
+            "🔥 Canal de Booyah definido",
+            f"{interaction.user.mention} definiu {canal_booyah.mention} como canal oficial de Booyah.",
+            "Esmeralda",
+        )
+        return await interaction.response.send_message(
+            embed=criar_embed(
+                "🔥 Canal de Booyah Configurado!",
+                f"Todos os Booyahs (tanto pelas salas quanto por `/booyah`) serão publicados em {canal_booyah.mention}.",
+                "Esmeralda",
+            ),
+            ephemeral=True,
+        )
+
+    if canal_booyah is not None and await e_dono_ou_gerente(interaction.user):
+        await salvar_config(interaction.guild.id, canal_booyah=canal_booyah.id)
+        marcar_sujo()
+
+    # 2. Se chamado sem argumentos, mostra status + instruções rápidas
+    if not ids_ff:
+        cfg_atual = await obter_config(interaction.guild.id)
+        cid_b = cfg_atual.get("canal_booyah")
+        ref_b = f"<#{cid_b}>" if cid_b else "`não definido`"
+        return await interaction.response.send_message(
+            embed=criar_embed(
+                "🔥 Central de Booyah — Fire Force",
+                f"• **Canal oficial atual:** {ref_b}\n\n"
+                f"**Como usar:**\n"
+                f"> **1.** Direto no canal da sala: abra o menu da sala e escolha **🏆 Enviar Booyah desta Sala** *(puxa modo, categoria, horário e IDs da vaga automaticamente!)*\n"
+                f"> **2.** Manualmente aqui: `/booyah modo:Squad categoria:Premium horario:22:00 ids_ff:12345678 87654321 ...`\n"
+                f"> **3.** Definir canal: `/booyah canal_booyah:#booyah` ou `/config canal_booyah:#booyah`",
+                "Vermelho Escuro",
+            ),
+            ephemeral=True,
+        )
+
+    uids = [u for u in re.findall(r"\d{5,15}", ids_ff or "")][:4]
+    if not uids:
+        return await interaction.response.send_message(
+            embed=criar_embed("❌ IDs Inválidos", "Informe de 1 a 4 IDs numéricos do Free Fire (5 a 15 dígitos).", "Vermelho"),
+            ephemeral=True,
+        )
+
+    modo_str = modo.value if modo else {1: "solo", 2: "duo", 3: "trio"}.get(len(uids), "squad")
+    qtd_max_modo = JOGADORES_POR_LOTE.get(modo_str, 4)
+    uids = uids[:qtd_max_modo]
+    cat_str = (categoria or "Premium").strip()[:30]
+    hora_str = (horario or agora_brt().strftime("%H:%M")).strip()[:12]
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    jogadores_base = [{"ff_uid": u, "ff_nome": f"ID {u}"} for u in uids]
+    ok, msg = await publicar_booyah_canal(
+        guild=interaction.guild,
+        modo=modo_str,
+        categoria=cat_str,
+        horario_str=hora_str,
+        jogadores_base=jogadores_base,
+        autor_staff=interaction.user,
+    )
+    await interaction.followup.send(
+        embed=criar_embed(
+            "🔥 Booyah Publicado!" if ok else "⚠️ Não foi possível publicar o Booyah",
+            msg,
+            "Vermelho Escuro" if ok else "Amarelo",
+        ),
+        ephemeral=True,
     )
 
 
