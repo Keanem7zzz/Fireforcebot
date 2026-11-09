@@ -89,7 +89,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.5"
+VERSAO_BOT = "13.6"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -1726,19 +1726,32 @@ async def sincronizar_cargo_patente(guild: discord.Guild, user_id: int) -> dict:
     if not guild or not mapa_cargos:
         return resumo
 
-    # Só aplica cargo automático se a pessoa já tiver ao menos 1 ponto (jogou ou venceu no servidor)
-    if resumo["pontos"] <= 0:
-        return resumo
-
     membro = await membro_do_guild(guild, int(user_id))
     if not membro or getattr(membro, "bot", False):
+        return resumo
+
+    ids_atuais_membro = {int(r.id) for r in getattr(membro, "roles", []) if getattr(r, "id", None)}
+
+    # Se zerou os pontos (ex.: vitórias lançadas por engano foram removidas), retira cargos de patente!
+    if resumo["pontos"] <= 0:
+        para_limpar = [
+            guild.get_role(int(rid))
+            for rid in set(mapa_cargos.values())
+            if rid and int(rid) in ids_atuais_membro
+        ]
+        para_limpar = [r for r in para_limpar if r is not None]
+        if para_limpar:
+            try:
+                await membro.remove_roles(*para_limpar, reason="Pontuação zerada após remoção de vitórias")
+                resumo["cargos_removidos"] = [r.name for r in para_limpar]
+            except Exception as erro:
+                _log_arquivo(f"[PATENTE] falha ao limpar cargos c/ 0 pts user={user_id}: {erro}")
         return resumo
 
     slug_atual = resumo["patente"]["slug"]
     role_alvo_id = mapa_cargos.get(slug_atual)
     role_alvo = guild.get_role(int(role_alvo_id)) if role_alvo_id else None
 
-    ids_atuais_membro = {int(r.id) for r in getattr(membro, "roles", []) if getattr(r, "id", None)}
     todos_roles_patente = {
         int(rid): guild.get_role(int(rid))
         for sl, rid in mapa_cargos.items()
@@ -1788,6 +1801,40 @@ async def registrar_sequencia_vitoria(guild_id: int, user_id: int, incremento: i
                 atualizado_em = excluded.atualizado_em
             """,
             (int(user_id), int(guild_id), nova_seq, novo_rec, agora_iso),
+        )
+        await db.commit()
+    marcar_sujo()
+    return nova_seq, novo_rec
+
+
+async def reduzir_sequencia_apos_remocao_vitoria(
+    guild_id: int, user_id: int, removidas: int, novo_total_vitorias: int
+) -> tuple[int, int]:
+    """Desfaz na sequência atual e no recorde (se inflado pelo lançamento acidental) as vitórias removidas."""
+    agora_iso = agora_brt().isoformat()
+    removidas = max(1, int(removidas))
+    teto_vit = max(0, int(novo_total_vitorias))
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        atual = await (await db.execute(
+            "SELECT sequencia_atual, melhor_sequencia FROM estatisticas_jogador WHERE guild_id = ? AND user_id = ?",
+            (int(guild_id), int(user_id)),
+        )).fetchone()
+        if not atual:
+            return 0, 0
+        seq_ant = int(atual["sequencia_atual"] or 0)
+        rec_ant = int(atual["melhor_sequencia"] or 0)
+
+        nova_seq = min(teto_vit, max(0, seq_ant - removidas))
+        if rec_ant == seq_ant:
+            novo_rec = min(teto_vit, max(nova_seq, rec_ant - removidas))
+        else:
+            novo_rec = min(teto_vit, max(nova_seq, rec_ant))
+
+        await db.execute(
+            "UPDATE estatisticas_jogador SET sequencia_atual = ?, melhor_sequencia = ?, atualizado_em = ? "
+            "WHERE guild_id = ? AND user_id = ?",
+            (nova_seq, novo_rec, agora_iso, int(guild_id), int(user_id)),
         )
         await db.commit()
     marcar_sujo()
@@ -10643,7 +10690,7 @@ async def cmd_help(interaction: discord.Interaction):
             name="👑 Exclusivo Dono & Gerente",
             value="• **`/admin`** — Painel Mestre Unificado (Patentes, Vaga VIP, Manutenção, Relatório, Blacklist, Regras e Backup)\n"
                   "• `/vagavip` • `/relatorio` • `/blacklist` • `/setup` • `/diagnostico` • `/config` • `/logs` • `/saude`\n"
-                  "• `/diario` • `/painel` • `/ish` • `/booyah` • `/painelcupom` • `/reset` • `/vitoria`\n"
+                  "• `/diario` • `/painel` • `/ish` • `/booyah` • `/painelcupom` • `/reset` • `/vitoria` • `/removervitoria`\n"
                   "• `/painelcarteira` • `/addsaldo` • `/ticket` • `/staff` • `/parceria` • `/divulgacao`\n"
                   "• `/vaga` • `/anunciar` • `/embed` • `/evento` • `/painelranking` • `/backup` • `/restaurar` • `/dados`",
             inline=False
@@ -18743,6 +18790,101 @@ async def cmd_vitoria(interaction: discord.Interaction, usuario: discord.Member,
         interaction.guild, "🏆 RANKING", "🏆 Vitória registrada",
         f"{usuario.mention} +{quantidade} vitória(s) — total `{total}` • streak `{streak_atual}` • patente `{pat_depois['nome']}` (por {interaction.user.mention}).",
         "Dourado",
+    )
+
+
+@bot.tree.command(name="removervitoria", description="📉 Remover vitórias lançadas por engano (recalcula pontos e patente)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.describe(
+    usuario="Jogador que terá vitórias removidas",
+    quantidade="Quantas vitórias remover (padrão 1)",
+)
+async def cmd_remover_vitoria(interaction: discord.Interaction, usuario: discord.Member, quantidade: Optional[int] = 1):
+    if not await e_dono_ou_gerente(interaction.user):
+        return await interaction.response.send_message(
+            embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente podem remover vitórias.", "Vermelho"),
+            ephemeral=True,
+        )
+
+    qtd_pedida = max(1, int(quantidade or 1))
+    dados_antes = await obter_estatisticas_completas_jogador(interaction.guild.id, usuario.id)
+    vit_antes = int(dados_antes["vitorias"])
+    pts_antes = int(dados_antes["pontos"])
+    pat_antes = dados_antes["patente"]
+
+    if vit_antes <= 0:
+        return await interaction.response.send_message(
+            embed=criar_embed(
+                "ℹ️ Nenhuma Vitória para Remover",
+                f"{usuario.mention} já está com **`0` vitórias** registradas.",
+                "Amarelo",
+            ),
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(thinking=True)
+
+    removidas = min(vit_antes, qtd_pedida)
+    novo_total = max(0, vit_antes - removidas)
+
+    async with aiosqlite.connect(DATABASE_FILE) as db:
+        if novo_total <= 0:
+            await db.execute(
+                "DELETE FROM vitorias WHERE user_id = ? AND guild_id = ?",
+                (usuario.id, interaction.guild.id),
+            )
+        else:
+            await db.execute(
+                "UPDATE vitorias SET qtd = ? WHERE user_id = ? AND guild_id = ?",
+                (novo_total, usuario.id, interaction.guild.id),
+            )
+        await db.commit()
+
+    streak_atual, maior_streak = await reduzir_sequencia_apos_remocao_vitoria(
+        interaction.guild.id, usuario.id, removidas, novo_total
+    )
+    dados_depois = await sincronizar_cargo_patente(interaction.guild, usuario.id)
+    pat_depois = dados_depois["patente"] if dados_depois else pat_antes
+    pts_depois = int(dados_depois["pontos"]) if dados_depois else max(0, pts_antes - removidas * 3)
+    pts_removidos = max(0, pts_antes - pts_depois)
+    desceu_patente = pat_depois["slug"] != pat_antes["slug"]
+    marcar_sujo()
+
+    if pts_depois <= 0 and dados_depois.get("cargos_removidos"):
+        linha_patente = (
+            f"\n• 📉 **Patente zerada:** cargo(s) `{', '.join(dados_depois['cargos_removidos'])}` removido(s) (`0 pts`)"
+        )
+    elif desceu_patente:
+        linha_patente = (
+            f"\n• 📉 **DESCEU DE PATENTE:** {pat_antes['emoji']} `{pat_antes['nome']}` ➜ "
+            f"{pat_depois['emoji']} **{pat_depois['nome']}** (`{pts_antes} pts` ➜ `{pts_depois} pts`)"
+        )
+    else:
+        linha_patente = (
+            f"\n• 🎖️ **Patente atual:** {pat_depois['emoji']} **{pat_depois['nome']}** "
+            f"(`{pts_antes} pts` ➜ `{pts_depois} pts`)"
+        )
+
+    await interaction.followup.send(
+        embed=criar_embed(
+            "📉 Vitória(s) Removida(s) e Pontos Ajustados",
+            f"Ajuste aplicado em {usuario.mention}:\n\n"
+            f"• 🏆 **Vitórias:** `{vit_antes}` ➜ **`{novo_total}`** (`-{removidas}`)\n"
+            f"• 📊 **Pontos descontados:** `-{pts_removidos} pts` (`{pts_antes}` ➜ `{pts_depois} pts`)\n"
+            f"• 🔥 **Sequência ajustada:** `{streak_atual}` *(recorde: `{maior_streak}`)*"
+            f"{linha_patente}",
+            "Amarelo",
+        )
+    )
+    await registrar_log(
+        interaction.guild,
+        "🏆 RANKING",
+        "📉 Vitória(s) removida(s)",
+        f"{usuario.mention} teve `-{removidas}` vitória(s) removida(s) por {interaction.user.mention} — "
+        f"vitórias `{vit_antes}` ➜ `{novo_total}` • pontos `{pts_antes}` ➜ `{pts_depois}` • "
+        f"patente `{pat_antes['nome']}` ➜ `{pat_depois['nome']}`.",
+        "Amarelo",
     )
 
 
