@@ -89,8 +89,14 @@ jobs:
           function Escrever($t) { Add-Content -Path $log -Value "[vigia] $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss') $t" -Encoding UTF8 }
           if ((Test-Path $log) -and ((Get-Item $log).Length -gt 4MB)) { Remove-Item $log -Force }
           $q = 0
+          $flagFim = Join-Path $PSScriptRoot "_encerrar_ciclo.flag"
+          if (Test-Path $flagFim) { Remove-Item $flagFim -Force -ErrorAction SilentlyContinue }
           Escrever "vigia ligado (auto-update ativo)"
           while ($true) {
+            if (Test-Path $flagFim) {
+              Escrever "fim de ciclo sinalizado - vigia encerrando de forma limpa."
+              break
+            }
             if (Test-Path (Join-Path $PSScriptRoot ".git")) {
               git fetch origin main --quiet 2>$null
               if ($LASTEXITCODE -eq 0) {
@@ -103,6 +109,10 @@ jobs:
             Escrever "subindo o bot (tentativa $q)"
             python fireforce_bot.py *>> $log
             $codigo = $LASTEXITCODE
+            if (Test-Path $flagFim) {
+              Escrever "bot salvou estado e encerrou para troca limpa de maquina (codigo $codigo)."
+              break
+            }
             if ($codigo -eq 42) {
               $q = 0
               Escrever "auto-update aplicado com sucesso (codigo 42) - relancando nova versao em 1s!"
@@ -227,7 +237,16 @@ jobs:
             $resta = [int](($fim - (Get-Date)).TotalMinutes)
             Write-Host "[$(Get-Date -Format 'HH:mm')] bot: $(if ($proc) { 'NO AR (PID ' + ($proc.ProcessId -join ',') + ')' } else { 'PARADO' }) | faltam $resta min"
           }
-          Write-Host "Fim do ciclo. O estado ja esta no Supabase e o proximo run da fila assume."
+          Write-Host "Sinalizando encerramento limpo para o bot salvar 100% do estado no Supabase antes de desligar..."
+          Set-Content -Path "$env:GITHUB_WORKSPACE\_encerrar_ciclo.flag" -Value "1" -Encoding UTF8
+          for ($i = 0; $i -lt 20; $i++) {
+            $ainda = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
+            if (-not $ainda) { break }
+            Start-Sleep -Seconds 1
+          }
+          Remove-Item "$env:GITHUB_WORKSPACE\_encerrar_ciclo.flag" -Force -ErrorAction SilentlyContinue
+          Write-Host "Fim do ciclo limpo! O estado ja esta salvo no Supabase e o proximo run da fila assume."
 
       - name: 📄 Resumo e últimas linhas do log
         if: always()

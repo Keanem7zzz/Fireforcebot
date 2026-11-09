@@ -1,20 +1,14 @@
 # ══════════════════════════════════════════════════════════════
-#  🔥 FIRE FORCE — BOT PREMIUM v11.6
-#  Liga de Diário Free Fire
+#  🔥 FIRE FORCE — BOT PREMIUM v13.5 (BLINDADO & AUTO-UPDATE)
+#  Liga Oficial de Diários Free Fire
 #
-#  • Consulta de ID do Free Fire OB55 confiável (corrida multi-provedores +
-#    regiões + cache de 24h + disjuntor) — seção 'CONSULTA DE ID FREE FIRE'
-#  • Inscrição obrigatória por ID numérico do Free Fire (puxa Nick e Level na API)
-#  • Tabela Oficial do Diário em IMAGEM HD (Solo, Duo, Trio e Squad) — Vermelho Escuro & Preto
-#  • Vaga e acesso liberados depois do pagamento aprovado pelo ADM
-#  • CARTEIRA: painel minimalista privado, depósito/saque PIX direto aos Donos e moedas do bot
-#  • v11.6: Log completo de ganhos/recebimentos do ADM (com cupom/desconto,
-#    valor pago e total do dia/semana do ADM), API OB55 multi-provedor,
-#    Keep-Alive Supabase (2 dias), PIX direto ao ADM (/pix), carteira de
-#    trabalho exclusiva do Suporte, regra +R$ 1,00 PIX em moedas, Repetição
-#    Diária por painel, tempo dinâmico configurável de bloqueio e ID FF obrigatório
-#
-#  pip install -r requirements.txt
+#  • Consulta de ID do Free Fire OB55 multi-provedor + cache + Avatar/Clã
+#  • Tabelas Oficiais HD, Card de Perfil HD e Card de Booyah HD (Vermelho Escuro & Preto)
+#  • Finalização de Diário em 2 Etapas (Premiação por Kill + Ticket de Recebimento)
+#  • Carteira Minimalista Privada, PIX Direto ao ADM, Vaga VIP e Carteira do Suporte
+#  • Auto-Update em segundo plano (60s) sem desligar a máquina + Encerramento Limpo de Ciclo
+#  • Blindagem Anti-Falhas: SQLite WAL + busy_timeout global, Escudo Global de Views/Modals,
+#    Roteador Dinâmico de Componentes Persistentes e Trava Anti-Wipe no Supabase
 # ══════════════════════════════════════════════════════════════
 import sys
 import discord
@@ -95,7 +89,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.4"
+VERSAO_BOT = "13.5"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -282,8 +276,18 @@ async def membro_do_guild(guild: discord.Guild, user_id: int):
         return None
 
 
+def _erro_interacao_expirada(erro: BaseException) -> bool:
+    """Ignora corridas normais do Discord (interação já respondida 40060 ou expirada 10062)."""
+    codigo = getattr(erro, "code", None)
+    if codigo in (10062, 40060):
+        return True
+    if isinstance(erro, discord.NotFound) and "Unknown interaction" in str(erro):
+        return True
+    return False
+
+
 async def _responder_erro_interacao(interaction: discord.Interaction, embed: discord.Embed):
-    """Responde sem tentar usar response duas vezes."""
+    """Responde sem tentar usar response duas vezes e sem explodir se a interação já expirou."""
     try:
         if interaction.response.is_done():
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -291,11 +295,73 @@ async def _responder_erro_interacao(interaction: discord.Interaction, embed: dis
             await interaction.response.send_message(embed=embed, ephemeral=True)
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         pass
+    except Exception:
+        pass
+
+
+async def _registrar_e_responder_erro_ui(interaction: discord.Interaction, erro: BaseException, origem: str):
+    """Escudo global para todas as Views (69+) e Modals (26+): evita 'Esta interação falhou' sem log."""
+    original = getattr(erro, "original", erro)
+    if _erro_interacao_expirada(original):
+        return
+    guild_id = getattr(interaction, "guild_id", 0) or 0
+    user_id = getattr(getattr(interaction, "user", None), "id", 0) or 0
+    try:
+        _log_arquivo(
+            f"[ERRO UI] guild={guild_id} user={user_id} origem={origem} "
+            f"{type(original).__name__}: {str(original)[:500]}"
+        )
+    except Exception:
+        pass
+    try:
+        logging.getLogger("fireforce").error(
+            "Falha em componente %s (guild=%s user=%s)",
+            origem,
+            guild_id,
+            user_id,
+            exc_info=(type(original), original, getattr(original, "__traceback__", None)),
+        )
+    except Exception:
+        pass
+    if isinstance(original, discord.Forbidden):
+        await _responder_erro_interacao(
+            interaction,
+            criar_embed(
+                "🛠️ Permissão do bot ausente",
+                "O bot não tem permissão suficiente neste canal/cargo para concluir essa ação.",
+                "Vermelho",
+            ),
+        )
+        return
+    await _responder_erro_interacao(
+        interaction,
+        criar_embed(
+            "⚠️ Não consegui concluir agora",
+            "Houve uma oscilação rápida ao processar esta opção. Tente clicar novamente em alguns segundos.",
+            "Amarelo",
+        ),
+    )
+
+
+async def _view_on_error_global(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+    cid = getattr(item, "custom_id", None) or type(item).__name__
+    await _registrar_e_responder_erro_ui(interaction, error, f"{type(self).__name__}:{cid}")
+
+
+async def _modal_on_error_global(self, interaction: discord.Interaction, error: Exception) -> None:
+    await _registrar_e_responder_erro_ui(interaction, error, f"Modal:{type(self).__name__}")
+
+
+discord.ui.View.on_error = _view_on_error_global
+discord.ui.Modal.on_error = _modal_on_error_global
 
 
 @bot.tree.error
 async def _erro_comando_app(interaction: discord.Interaction, error: app_commands.AppCommandError):
     """Erros de slash commands com mensagem segura ao usuário e log interno."""
+    original = getattr(error, "original", error)
+    if _erro_interacao_expirada(original):
+        return
     if isinstance(error, app_commands.CommandOnCooldown):
         espera = max(1, int(getattr(error, "retry_after", 1)))
         return await _responder_erro_interacao(
@@ -303,7 +369,7 @@ async def _erro_comando_app(interaction: discord.Interaction, error: app_command
     if isinstance(error, app_commands.MissingPermissions):
         return await _responder_erro_interacao(
             interaction, criar_embed("🔒 Sem permissão", "Sua conta não tem as permissões necessárias.", "Vermelho"))
-    if isinstance(error, app_commands.BotMissingPermissions):
+    if isinstance(error, app_commands.BotMissingPermissions) or isinstance(original, discord.Forbidden):
         nomes = ", ".join(getattr(error, "missing_permissions", []) or [])
         return await _responder_erro_interacao(
             interaction, criar_embed("🛠️ Permissão do bot ausente",
@@ -313,7 +379,6 @@ async def _erro_comando_app(interaction: discord.Interaction, error: app_command
         return await _responder_erro_interacao(
             interaction, criar_embed("🔒 Ação não autorizada", "Este comando não está liberado para sua conta.", "Vermelho"))
 
-    original = getattr(error, "original", error)
     comando = getattr(interaction.command, "qualified_name", "comando desconhecido")
     guild_id = interaction.guild_id or 0
     user_id = getattr(interaction.user, "id", 0)
@@ -335,7 +400,49 @@ async def _erro_comando_app(interaction: discord.Interaction, error: app_command
                     "Vermelho"))
 
 
-# ==================== BANCO DE DADOS ====================
+# ==================== BANCO DE DADOS (BLINDAGEM GLOBAL WAL + BUSY_TIMEOUT) ====================
+
+_aiosqlite_connect_original = aiosqlite.connect
+
+
+class _ConexaoSQLiteBlindada:
+    """Garante timeout=30s + PRAGMA busy_timeout=30000 + synchronous=NORMAL em TODAS as 246 conexões."""
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, database, **kwargs):
+        if float(kwargs.get("timeout") or 0) < 30.0:
+            kwargs["timeout"] = 30.0
+        self._conn = _aiosqlite_connect_original(database, **kwargs)
+
+    async def _preparar(self, db):
+        try:
+            await db.execute("PRAGMA busy_timeout=30000")
+            await db.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+        return db
+
+    def __await__(self):
+        async def _abrir():
+            db = await self._conn
+            return await self._preparar(db)
+        return _abrir().__await__()
+
+    async def __aenter__(self):
+        db = await self._conn.__aenter__()
+        return await self._preparar(db)
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return await self._conn.__aexit__(exc_type, exc_val, exc_tb)
+
+
+def _conectar_sqlite_blindado(database, **kwargs):
+    return _ConexaoSQLiteBlindada(database, **kwargs)
+
+
+aiosqlite.connect = _conectar_sqlite_blindado
+
 
 async def init_db():
     async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
@@ -4038,6 +4145,12 @@ class SubstituirJogadorSelectView(discord.ui.View):
                 description=f"ID atual: {j['ff_uid']} (Nv. {j['ff_nivel'] or 0})"[:100],
             )
             for j in jogadores[:25]
+        ] or [
+            discord.SelectOption(
+                label="Nenhum jogador disponível para troca",
+                value="0",
+                emoji="⚠️",
+            )
         ]
         sel = discord.ui.Select(
             placeholder="🔄 Escolha qual jogador da sua line deseja trocar...",
@@ -4048,6 +4161,11 @@ class SubstituirJogadorSelectView(discord.ui.View):
 
     async def _escolher(self, interaction: discord.Interaction):
         pos = int(interaction.data["values"][0])
+        if pos <= 0 or pos not in self.mapa:
+            return await interaction.response.send_message(
+                embed=criar_embed("⚠️ Indisponível", "Nenhum jogador encontrado nesta vaga.", "Amarelo"),
+                ephemeral=True,
+            )
         j = self.mapa.get(pos, {})
         await interaction.response.send_modal(
             SubstituirJogadorModal(self.horario_id, self.slot_id, pos, str(j.get("ff_nome") or "???"))
@@ -4179,7 +4297,13 @@ class DefinirSalaCanalModal(discord.ui.Modal, title="🔑 Definir ID e Senha des
 
         if diferenca <= 300:
             total_env = await enviar_sala(
-                interaction.guild, horario["tipo"], horario["categoria"], horario["horario"], sid, snh
+                interaction.guild,
+                horario["tipo"],
+                horario["categoria"],
+                horario["horario"],
+                sid,
+                snh,
+                horario_id=self.horario_id,
             )
             async with aiosqlite.connect(DATABASE_FILE) as db:
                 await db.execute(
@@ -8597,15 +8721,33 @@ class EmbedBuilderModal(discord.ui.Modal, title="📝 Construtor de Embed"):
 
 # ==================== ENVIO DE SALA (ID E SENHA) ====================
 
-async def enviar_sala(guild: discord.Guild, tipo: str, categoria: str, horario: str, sala_id: str, sala_senha: str):
+async def enviar_sala(
+    guild: discord.Guild,
+    tipo: str,
+    categoria: str,
+    horario: str,
+    sala_id: str,
+    sala_senha: str,
+    horario_id: Optional[int] = None,
+):
     """Avisa todo mundo que a sala abriu no canal coletivo E envia ID + Senha na DM dos inscritos."""
     usuarios_dm: dict[int, tuple[Optional[discord.TextChannel], list[int]]] = {}
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
-        horarios = await (await db.execute(
-            "SELECT * FROM horarios WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? AND ativo = 1",
-            (guild.id, tipo, categoria, horario)
-        )).fetchall()
+        if horario_id:
+            horarios = await (await db.execute(
+                "SELECT * FROM horarios WHERE id = ? AND guild_id = ?",
+                (int(horario_id), guild.id),
+            )).fetchall()
+        else:
+            # Aceita tanto diários com ativo=1 quanto salas cujo canal oficial ainda está aberto
+            # (evita falha silenciosa caso o ADM envie ou refaça o ID/Senha segundos após o horário dar :00).
+            horarios = await (await db.execute(
+                "SELECT * FROM horarios WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? "
+                "AND (ativo = 1 OR COALESCE(canal_tabela, 0) > 0) "
+                "ORDER BY ativo DESC, id DESC",
+                (guild.id, tipo, categoria, horario),
+            )).fetchall()
 
         if not horarios:
             return 0
@@ -8676,19 +8818,22 @@ async def enviar_sala(guild: discord.Guild, tipo: str, categoria: str, horario: 
                 if png_tabela:
                     kwargs_lib["file"] = discord.File(io.BytesIO(png_tabela), filename="tabela_fireforce.png")
 
-                if len(aviso) > 1900:
-                    await canal.send("🚨🚨🚨 **SALA LIBERADA!** 🚨🚨🚨", **kwargs_lib)
-                    chunk = ""
-                    for mencao_txt in dict.fromkeys(mencao_txt for mencao_txt in mencoes_h):
-                        if len(chunk) + len(mencao_txt) > 1800:
+                try:
+                    if len(aviso) > 1900:
+                        await canal.send("🚨🚨🚨 **SALA LIBERADA!** 🚨🚨🚨", **kwargs_lib)
+                        chunk = ""
+                        for mencao_txt in dict.fromkeys(mencao_txt for mencao_txt in mencoes_h):
+                            if len(chunk) + len(mencao_txt) > 1800:
+                                await canal.send(chunk)
+                                chunk = mencao_txt + " "
+                            else:
+                                chunk += mencao_txt + " "
+                        if chunk:
                             await canal.send(chunk)
-                            chunk = mencao_txt + " "
-                        else:
-                            chunk += mencao_txt + " "
-                    if chunk:
-                        await canal.send(chunk)
-                else:
-                    await canal.send(aviso, **kwargs_lib)
+                    else:
+                        await canal.send(aviso, **kwargs_lib)
+                except Exception as erro_canal_sala:
+                    _log_arquivo(f"[ENVIAR SALA] falha ao publicar no canal #{getattr(canal, 'id', 0)}: {erro_canal_sala}")
 
             await db.execute(
                 "UPDATE horarios SET sala_id = ?, sala_senha = ?, alerta_ish_enviado = 1 WHERE id = ?",
@@ -8856,101 +9001,107 @@ async def loop_expirar():
             estornos_moedas = []
             paineis_para_atualizar = list(paineis_virada)
 
-            async with aiosqlite.connect(DATABASE_FILE) as db:
-                db.row_factory = aiosqlite.Row
+            async with _lock_aprovacao:
+                async with aiosqlite.connect(DATABASE_FILE) as db:
+                    db.row_factory = aiosqlite.Row
 
-                # ---------- 1) reservas pendentes antigas (sem pagamento e sem moedas debitadas) ----------
-                limite = (agora - datetime.timedelta(minutes=RESERVA_MINUTOS)).isoformat()
-                pendentes_antigas = await (await db.execute(
-                    "SELECT * FROM slots WHERE confirmado = 0 AND COALESCE(pago_moedas, 0) = 0 AND criado_em < ?",
-                    (limite,),
-                )).fetchall()
-
-                horarios_vaga_aberta = set()
-                for p in pendentes_antigas:
-                    if p["cupom_id"]:
-                        await db.execute("UPDATE cupons SET usos_atuais = MAX(0, usos_atuais - 1) WHERE id = ?", (p["cupom_id"],))
-                        await db.execute(
-                            "UPDATE cupons_usados SET usos = MAX(0, usos - 1) WHERE cupom_id = ? AND user_id = ?",
-                            (p["cupom_id"], p["comprador_id"]),
-                        )
-                    h_exp = await (await db.execute(
-                        "SELECT painel_id FROM horarios WHERE id = ?", (p["horario_id"],)
-                    )).fetchone()
-                    if h_exp:
-                        paineis_para_atualizar.append((int(p["guild_id"]), int(h_exp["painel_id"])))
-                    horarios_vaga_aberta.add((int(p["guild_id"]), int(p["horario_id"])))
-                    await db.execute("DELETE FROM slot_jogadores WHERE slot_id = ?", (p["id"],))
-                    await db.execute("DELETE FROM slots WHERE id = ?", (p["id"],))
-                    guild = bot.get_guild(p["guild_id"])
-                    canal = guild.get_channel(p["canal_pag"]) if guild and p["canal_pag"] else None
-                    if canal:
-                        avisos.append((
-                            canal,
-                            "⌛ Reserva Expirada",
-                            f"A reserva ficou **{RESERVA_MINUTOS} minutos** sem pagamento e foi cancelada.\n"
-                            f"Sem problema: é só fazer a inscrição novamente quando quiser."
-                        ))
-                if pendentes_antigas:
-                    await db.commit()
-
-                # ---------- 2) diários que já começaram ----------
-                horarios = await (await db.execute(
-                    "SELECT h.*, COALESCE(p.repetir_diario, 0) AS repetir_diario "
-                    "FROM horarios h LEFT JOIN paineis p ON h.painel_id = p.id WHERE h.ativo = 1"
-                )).fetchall()
-                for h in horarios:
-                    h_dict = dict(h)
-                    if (horario_para_datetime(h["horario"]) - agora).total_seconds() >= 0:
-                        continue
-
-                    repetir = bool(h_dict.get("repetir_diario", 0))
-                    if repetir and bool(h_dict.get("encerrado_hoje", 0)) and (h_dict.get("data_ciclo") == hoje):
-                        continue
-
-                    pendentes = await (await db.execute(
-                        "SELECT * FROM slots WHERE horario_id = ? AND confirmado = 0", (h["id"],)
+                    # ---------- 1) reservas pendentes antigas (sem pagamento e sem moedas debitadas) ----------
+                    # Se um ADM já assumiu e enviou o QR Code PIX, dá fôlego dobrado (mín. 25 min) p/ não derrubar pagamento em análise!
+                    limite_sem_adm = (agora - datetime.timedelta(minutes=RESERVA_MINUTOS)).isoformat()
+                    limite_com_adm = (agora - datetime.timedelta(minutes=max(RESERVA_MINUTOS * 2, 25))).isoformat()
+                    pendentes_antigas = await (await db.execute(
+                        "SELECT * FROM slots WHERE confirmado = 0 AND COALESCE(pago_moedas, 0) = 0 "
+                        "AND ((COALESCE(assumido_por, 0) = 0 AND criado_em < ?) "
+                        "     OR (COALESCE(assumido_por, 0) > 0 AND criado_em < ?))",
+                        (limite_sem_adm, limite_com_adm),
                     )).fetchall()
-                    for p in pendentes:
-                        p_dict = dict(p)
-                        if int(p_dict.get("pago_moedas") or 0) == 1:
-                            estornos_moedas.append(p_dict)
+
+                    horarios_vaga_aberta = set()
+                    for p in pendentes_antigas:
                         if p["cupom_id"]:
                             await db.execute("UPDATE cupons SET usos_atuais = MAX(0, usos_atuais - 1) WHERE id = ?", (p["cupom_id"],))
                             await db.execute(
                                 "UPDATE cupons_usados SET usos = MAX(0, usos - 1) WHERE cupom_id = ? AND user_id = ?",
                                 (p["cupom_id"], p["comprador_id"]),
                             )
+                        h_exp = await (await db.execute(
+                            "SELECT painel_id FROM horarios WHERE id = ?", (p["horario_id"],)
+                        )).fetchone()
+                        if h_exp:
+                            paineis_para_atualizar.append((int(p["guild_id"]), int(h_exp["painel_id"])))
+                        horarios_vaga_aberta.add((int(p["guild_id"]), int(p["horario_id"])))
                         await db.execute("DELETE FROM slot_jogadores WHERE slot_id = ?", (p["id"],))
                         await db.execute("DELETE FROM slots WHERE id = ?", (p["id"],))
                         guild = bot.get_guild(p["guild_id"])
                         canal = guild.get_channel(p["canal_pag"]) if guild and p["canal_pag"] else None
                         if canal:
-                            msg_canc = (
-                                "O diário já começou sem a liberação do ADM. Sua reserva foi encerrada e as moedas foram estornadas para sua carteira."
-                                if int(p_dict.get("pago_moedas") or 0) == 1
-                                else "O diário já começou e esta reserva foi cancelada."
+                            avisos.append((
+                                canal,
+                                "⌛ Reserva Expirada",
+                                f"A reserva ficou sem confirmação de pagamento dentro do prazo e foi cancelada.\n"
+                                f"Sem problema: é só fazer a inscrição novamente quando quiser."
+                            ))
+                    if pendentes_antigas:
+                        await db.commit()
+
+                    # ---------- 2) diários que já começaram ----------
+                    horarios = await (await db.execute(
+                        "SELECT h.*, COALESCE(p.repetir_diario, 0) AS repetir_diario "
+                        "FROM horarios h LEFT JOIN paineis p ON h.painel_id = p.id WHERE h.ativo = 1"
+                    )).fetchall()
+                    for h in horarios:
+                        h_dict = dict(h)
+                        if (horario_para_datetime(h["horario"]) - agora).total_seconds() >= 0:
+                            continue
+
+                        repetir = bool(h_dict.get("repetir_diario", 0))
+                        if repetir and bool(h_dict.get("encerrado_hoje", 0)) and (h_dict.get("data_ciclo") == hoje):
+                            continue
+
+                        pendentes = await (await db.execute(
+                            "SELECT * FROM slots WHERE horario_id = ? AND confirmado = 0", (h["id"],)
+                        )).fetchall()
+                        for p in pendentes:
+                            p_dict = dict(p)
+                            if int(p_dict.get("pago_moedas") or 0) == 1 or int(p_dict.get("usou_vaga_vip") or 0) == 1:
+                                estornos_moedas.append(p_dict)
+                            if p["cupom_id"]:
+                                await db.execute("UPDATE cupons SET usos_atuais = MAX(0, usos_atuais - 1) WHERE id = ?", (p["cupom_id"],))
+                                await db.execute(
+                                    "UPDATE cupons_usados SET usos = MAX(0, usos - 1) WHERE cupom_id = ? AND user_id = ?",
+                                    (p["cupom_id"], p["comprador_id"]),
+                                )
+                            await db.execute("DELETE FROM slot_jogadores WHERE slot_id = ?", (p["id"],))
+                            await db.execute("DELETE FROM slots WHERE id = ?", (p["id"],))
+                            guild = bot.get_guild(p["guild_id"])
+                            canal = guild.get_channel(p["canal_pag"]) if guild and p["canal_pag"] else None
+                            if canal:
+                                if int(p_dict.get("usou_vaga_vip") or 0) == 1:
+                                    msg_canc = "O diário já começou sem a liberação do ADM. Sua reserva foi encerrada e sua **🎟️ Vaga VIP** foi devolvida intacta."
+                                elif int(p_dict.get("pago_moedas") or 0) == 1:
+                                    msg_canc = "O diário já começou sem a liberação do ADM. Sua reserva foi encerrada e as moedas foram estornadas para sua carteira."
+                                else:
+                                    msg_canc = "O diário já começou e esta reserva foi cancelada."
+                                avisos.append((canal, "⌛ Reserva Encerrada", msg_canc))
+
+                        confirmadas = (await (await db.execute(
+                            "SELECT COUNT(*) FROM slots WHERE horario_id = ? AND confirmado = 1", (h["id"],)
+                        )).fetchone())[0]
+
+                        if repetir:
+                            # Mantém ativo=1 para permanecer visível no painel até liberar amanhã!
+                            await db.execute(
+                                "UPDATE horarios SET encerrado_hoje = 1, data_ciclo = ?, lotes_usados = ? WHERE id = ?",
+                                (hoje, confirmadas, h["id"]),
                             )
-                            avisos.append((canal, "⌛ Reserva Encerrada", msg_canc))
+                        else:
+                            await db.execute(
+                                "UPDATE horarios SET ativo = 0, lotes_usados = ? WHERE id = ?",
+                                (confirmadas, h["id"]),
+                            )
+                        paineis_para_atualizar.append((h["guild_id"], h["painel_id"]))
 
-                    confirmadas = (await (await db.execute(
-                        "SELECT COUNT(*) FROM slots WHERE horario_id = ? AND confirmado = 1", (h["id"],)
-                    )).fetchone())[0]
-
-                    if repetir:
-                        # Mantém ativo=1 para permanecer visível no painel até liberar amanhã!
-                        await db.execute(
-                            "UPDATE horarios SET encerrado_hoje = 1, data_ciclo = ?, lotes_usados = ? WHERE id = ?",
-                            (hoje, confirmadas, h["id"]),
-                        )
-                    else:
-                        await db.execute(
-                            "UPDATE horarios SET ativo = 0, lotes_usados = ? WHERE id = ?",
-                            (confirmadas, h["id"]),
-                        )
-                    paineis_para_atualizar.append((h["guild_id"], h["painel_id"]))
-
-                await db.commit()
+                    await db.commit()
 
             for p_dict in estornos_moedas:
                 guild_e = bot.get_guild(int(p_dict["guild_id"]))
@@ -9055,18 +9206,20 @@ async def loop_salas():
                             "Amarelo",
                         )
 
-            # 2) Envio automático do ID e Senha 5 minutos antes (apaga a linha de agendamento após entregar)
+            # 2) Envio automático do ID e Senha 5 minutos antes (tolerância até -15 min p/ nunca perder virada de minuto)
             for s in salas:
                 diferenca = (horario_para_datetime(s["horario"]) - agora).total_seconds()
-                if 0 < diferenca <= 300:  # 5 minutos
-                    guild = bot.get_guild(s["guild_id"])
-                    if guild:
-                        await enviar_sala(guild, s["tipo"], s["categoria"], s["horario"], s["sala_id"], s["sala_senha"])
-
+                if -900 <= diferenca <= 300:
                     async with aiosqlite.connect(DATABASE_FILE) as db:
                         await db.execute("DELETE FROM salas WHERE id = ?", (s["id"],))
                         await db.commit()
                     marcar_sujo()
+                    guild = bot.get_guild(s["guild_id"])
+                    if guild:
+                        try:
+                            await enviar_sala(guild, s["tipo"], s["categoria"], s["horario"], s["sala_id"], s["sala_senha"])
+                        except Exception as erro_sala:
+                            _log_arquivo(f"[LOOP SALAS] erro ao entregar sala #{s['id']}: {erro_sala}")
         except Exception as e:
             print("Erro no loop de salas:", e)
         await asyncio.sleep(15)
@@ -9680,9 +9833,9 @@ async def cmd_pix(
     categoria=[app_commands.Choice(name="Premium 💎", value="premium"), app_commands.Choice(name="Básico 🪙", value="basico")]
 )
 async def cmd_ish(interaction: discord.Interaction, tipo: app_commands.Choice[str], categoria: app_commands.Choice[str], horario: str, sala_id: str, senha: str):
-    if not await e_dono_ou_gerente(interaction.user):
+    if not await e_staff(interaction.user):
         return await interaction.response.send_message(
-            embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente podem definir ID e Senha.", "Vermelho"),
+            embed=criar_embed("❌ Sem Permissão", "Apenas ADM (Mediador), Gerente ou Dono podem definir ID e Senha.", "Vermelho"),
             ephemeral=True
         )
 
@@ -9695,18 +9848,28 @@ async def cmd_ish(interaction: discord.Interaction, tipo: app_commands.Choice[st
             ephemeral=True
         )
 
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    sid = sala_id.strip()
+    snh = senha.strip()
+
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         horario_db = await (await db.execute(
-            "SELECT 1 FROM horarios WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? AND ativo = 1",
+            "SELECT id, ativo, canal_tabela FROM horarios "
+            "WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? "
+            "AND (ativo = 1 OR COALESCE(canal_tabela, 0) > 0) "
+            "ORDER BY ativo DESC, id DESC LIMIT 1",
             (interaction.guild.id, tipo.value, categoria.value, horario_fmt)
         )).fetchone()
 
         if not horario_db:
-            return await interaction.response.send_message(
-                embed=criar_embed("⚠️ Não Localizado", f"Não há diário cadastrado para {formatar_rotulo_diario(tipo.value, categoria.value)} às `{horario_fmt}`.", "Amarelo"),
+            return await interaction.followup.send(
+                embed=criar_embed("⚠️ Não Localizado", f"Não há diário ativo ou sala aberta para {formatar_rotulo_diario(tipo.value, categoria.value)} às `{horario_fmt}`.", "Amarelo"),
                 ephemeral=True
             )
+
+        hid_alvo = int(horario_db["id"])
+        canal_aberto = int(horario_db["canal_tabela"] or 0) > 0
 
         await db.execute(
             "DELETE FROM salas WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? AND enviado = 0",
@@ -9714,26 +9877,27 @@ async def cmd_ish(interaction: discord.Interaction, tipo: app_commands.Choice[st
         )
         await db.execute(
             "INSERT INTO salas (guild_id, tipo, categoria, horario, sala_id, sala_senha, enviado, criado_em) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
-            (interaction.guild.id, tipo.value, categoria.value, horario_fmt, sala_id, senha, agora_brt().isoformat())
+            (interaction.guild.id, tipo.value, categoria.value, horario_fmt, sid, snh, agora_brt().isoformat())
         )
         await db.execute(
-            "UPDATE horarios SET sala_id = ?, sala_senha = ?, alerta_ish_enviado = 1 "
-            "WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ? AND ativo = 1",
-            (sala_id, senha, interaction.guild.id, tipo.value, categoria.value, horario_fmt)
+            "UPDATE horarios SET sala_id = ?, sala_senha = ?, alerta_ish_enviado = 1 WHERE id = ?",
+            (sid, snh, hid_alvo)
         )
         await db.commit()
 
     diferenca = (horario_para_datetime(horario_fmt) - agora_brt()).total_seconds()
     embed = criar_embed(
-        "✅ Sala Agendada",
+        "✅ Sala Configurada",
         f"**{formatar_rotulo_diario(tipo.value, categoria.value)}** — `{horario_fmt}`\n\n"
-        f"> 🆔 **ID:** `{sala_id}`\n"
-        f"> 🔑 **Senha:** `{senha}`",
+        f"> 🆔 **ID:** `{sid}`\n"
+        f"> 🔑 **Senha:** `{snh}`",
         "Esmeralda"
     )
 
-    if 0 < diferenca <= 300:
-        total = await enviar_sala(interaction.guild, tipo.value, categoria.value, horario_fmt, sala_id, senha)
+    if (-3600 <= diferenca <= 300) or (diferenca <= 300 and canal_aberto):
+        total = await enviar_sala(
+            interaction.guild, tipo.value, categoria.value, horario_fmt, sid, snh, horario_id=hid_alvo
+        )
         async with aiosqlite.connect(DATABASE_FILE) as db:
             await db.execute(
                 "DELETE FROM salas WHERE guild_id = ? AND tipo = ? AND categoria = ? AND horario = ?",
@@ -9745,9 +9909,9 @@ async def cmd_ish(interaction: discord.Interaction, tipo: app_commands.Choice[st
     elif diferenca > 300:
         embed.add_field(name="📩 Programado", value=f"O envio ocorrerá automaticamente **5 minutos antes** (`~{int(diferenca // 60)} min`).", inline=False)
     else:
-        embed.add_field(name="⚠️ Expirado", value="Este horário já encerrou.", inline=False)
+        embed.add_field(name="⚠️ Horário Encerrado", value="Este horário já passou há mais de 1h; ID/Senha salvos apenas no registro.", inline=False)
 
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="ticket", description="🎫 Publicar painel minimalista de atendimento no canal")
@@ -14419,16 +14583,19 @@ async def cmd_saude(interaction: discord.Interaction):
     def _ha(quando: float) -> str:
         return f"há {int(time.time() - quando)}s" if quando else "ainda não"
 
+    loops_vivos = sum(1 for t in _TAREFAS_BACKGROUND.values() if t and not t.done())
+    loops_totais = max(len(_TAREFAS_BACKGROUND), 10)
     embed = criar_embed("🩺 Status Operacional", "", "Esmeralda" if not fora else "Amarelo")
     embed.add_field(
         name="🟢 No ar",
         value=f"> Ligado {await _ha_iso(INICIADO_EM.isoformat())} "
               f"({_tempo_texto(int((agora_brt() - INICIADO_EM).total_seconds() // 60))} rodando)\n"
-              f"> Último pulso: {await _ha_iso(await _meta_ler('ultimo_pulso'))}",
+              f"> Último pulso: {await _ha_iso(await _meta_ler('ultimo_pulso'))} • Loops ativos: `{loops_vivos}/{loops_totais}`",
         inline=False)
     embed.add_field(
         name="☁️ Supabase",
-        value=(f"> {'✅ configurado' if supabase_configurado() else '❌ não configurado'}\n"
+        value=(f"> {'✅ configurado' if supabase_configurado() else '❌ não configurado'}"
+               f"{' • 🛡️ proteção anti-wipe aguardando nuvem' if _SUPABASE_BLOQUEIO_BANCO_VAZIO else ''}\n"
                f"> Backup completo: {_ha(_sync_ultimo)}\n"
                f"> Tempo real (config/rankings): {_ha(_sql_ultimo)}\n"
                f"> Keep-alive (a cada 2 dias): {await _ha_iso(await _meta_ler('ultimo_ping_supabase'))}"
@@ -14826,17 +14993,38 @@ async def recuperar_apos_queda(fora_min: int) -> dict:
 
 
 async def loop_pulso():
-    """Mantém o pulso de prova de vida e checagem de fila interna sem API externa."""
+    """Mantém o pulso de prova de vida, supervisor de loops e encerramento limpo no fim do ciclo de 6h."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            for guild in bot.guilds:
-                await processar_fila_saques(guild.id)
-                await checar_reserva(guild)
+            flag_fim = os.path.join(_DIRETORIO_BOT, "_encerrar_ciclo.flag")
+            if os.path.exists(flag_fim):
+                _log_arquivo("[CICLO] _encerrar_ciclo.flag detectado — salvando estado e encerrando de forma limpa.")
+                print("  🛑 [CICLO] Sinal de encerramento de ciclo recebido — salvando backup no Supabase...")
+                await bot.close()
+                return
+
+            # Supervisor: revive automaticamente qualquer tarefa de background que tenha parado
+            _iniciar_tarefas_background()
+
+            for guild in list(bot.guilds):
+                try:
+                    await processar_fila_saques(guild.id)
+                    await checar_reserva(guild)
+                except Exception as erro_g:
+                    _log_arquivo(f"[PULSO] guild={guild.id}: {erro_g}")
             await _pulso_periodico()
         except Exception as erro:
             _log_arquivo(f"[PULSO] erro no loop: {erro}")
-        await asyncio.sleep(PULSO_INTERVALO)
+
+        # Checa o sinal de fim de ciclo a cada 5s (totalizando PULSO_INTERVALO)
+        passos = max(1, int(PULSO_INTERVALO // 5))
+        for _ in range(passos):
+            if bot.is_closed():
+                return
+            if os.path.exists(os.path.join(_DIRETORIO_BOT, "_encerrar_ciclo.flag")):
+                break
+            await asyncio.sleep(5)
 
 
 async def loop_relatorio():
@@ -14847,17 +15035,20 @@ async def loop_relatorio():
             agora = agora_brt()
             if agora.hour == 23 and agora.minute >= 55:
                 hoje = agora.strftime("%Y-%m-%d")
-                for guild in bot.guilds:
-                    async with aiosqlite.connect(DATABASE_FILE) as db:
-                        ja = await (await db.execute(
-                            "SELECT 1 FROM relatorios_dia WHERE guild_id = ? AND dia = ?", (guild.id, hoje)
-                        )).fetchone()
-                        if ja:
-                            continue
-                        await db.execute("INSERT INTO relatorios_dia (guild_id, dia, enviado_em) VALUES (?, ?, ?)",
-                                         (guild.id, hoje, agora.isoformat()))
-                        await db.commit()
-                    await enviar_relatorio_diario(guild, hoje)
+                for guild in list(bot.guilds):
+                    try:
+                        async with aiosqlite.connect(DATABASE_FILE) as db:
+                            ja = await (await db.execute(
+                                "SELECT 1 FROM relatorios_dia WHERE guild_id = ? AND dia = ?", (guild.id, hoje)
+                            )).fetchone()
+                            if ja:
+                                continue
+                            await db.execute("INSERT INTO relatorios_dia (guild_id, dia, enviado_em) VALUES (?, ?, ?)",
+                                             (guild.id, hoje, agora.isoformat()))
+                            await db.commit()
+                        await enviar_relatorio_diario(guild, hoje)
+                    except Exception as erro_rg:
+                        _log_arquivo(f"[RELATÓRIO] guild={guild.id}: {erro_rg}")
         except Exception as erro:
             _log_arquivo(f"[RELATÓRIO] erro: {erro}")
         await asyncio.sleep(300)
@@ -14970,6 +15161,7 @@ _sync_sujo = False
 _sync_ultimo = 0.0
 _sync_erro = ""
 _ultimo_gc_banco = 0.0
+_SUPABASE_BLOQUEIO_BANCO_VAZIO = False
 
 
 async def limpar_lixo_banco(forcar: bool = False) -> dict:
@@ -15090,7 +15282,7 @@ def marcar_sujo():
 
 
 async def _sb_req(metodo: str, rota: str, json_body=None, params=None, prefer=None):
-    """Chamada REST no Supabase. Devolve (ok, dados)."""
+    """Chamada REST no Supabase com pool persistente + até 3 tentativas automáticas contra oscilações de rede/502."""
     if not supabase_configurado():
         return False, "Supabase não configurado"
     cabecalho = {
@@ -15100,20 +15292,39 @@ async def _sb_req(metodo: str, rota: str, json_body=None, params=None, prefer=No
     }
     if prefer:
         cabecalho["Prefer"] = prefer
-    try:
-        timeout = aiohttp.ClientTimeout(total=25)
-        async with aiohttp.ClientSession(timeout=timeout) as sessao:
-            async with sessao.request(metodo, f"{SUPABASE_URL}{rota}",
-                                      headers=cabecalho, json=json_body, params=params) as resp:
+
+    url_completa = f"{SUPABASE_URL}{rota}"
+    timeout = aiohttp.ClientTimeout(total=28, connect=8)
+    ultimo_erro = "falha desconhecida"
+
+    for tentativa in range(3):
+        try:
+            sessao = _ff_sessao()
+            async with sessao.request(
+                metodo,
+                url_completa,
+                headers=cabecalho,
+                json=json_body,
+                params=params,
+                timeout=timeout,
+            ) as resp:
                 texto = await resp.text()
                 if resp.status >= 400:
-                    return False, f"HTTP {resp.status}: {texto[:200]}"
+                    ultimo_erro = f"HTTP {resp.status}: {texto[:200]}"
+                    if resp.status in (408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524) and tentativa < 2:
+                        await asyncio.sleep(0.8 * (2 ** tentativa))
+                        continue
+                    return False, ultimo_erro
                 try:
                     return True, (json.loads(texto) if texto else {})
                 except Exception:
                     return True, {}
-    except Exception as erro:
-        return False, f"{type(erro).__name__}: {erro}"
+        except Exception as erro:
+            ultimo_erro = f"{type(erro).__name__}: {erro}"
+            if tentativa < 2:
+                await asyncio.sleep(0.8 * (2 ** tentativa))
+                continue
+    return False, ultimo_erro
 
 
 async def _tabelas_locais() -> list:
@@ -15141,7 +15352,7 @@ async def snapshot_dump() -> dict:
 
 
 async def snapshot_aplicar(foto: dict) -> int:
-    """Restaura a fotografia no banco local. Devolve quantas linhas voltaram."""
+    """Restaura a fotografia no banco local intersepcionando colunas válidas (nunca descarta tabela inteira por coluna nova/antiga)."""
     if not isinstance(foto, dict) or "tabelas" not in foto:
         return 0
     total = 0
@@ -15150,17 +15361,25 @@ async def snapshot_aplicar(foto: dict) -> int:
         for tabela, dados in (foto.get("tabelas") or {}).items():
             colunas = dados.get("colunas") or []
             linhas = dados.get("linhas") or []
-            if not colunas:
+            if not colunas or not linhas:
                 continue
-            existentes = [x[1] for x in await (await db.execute(
-                f"PRAGMA table_info({tabela})")).fetchall()]
-            if any(c[0] != "_" and c not in existentes for c in colunas):
-                continue          # tabela local diferente: pula com segurança
-            placeholders = ", ".join("?" for _ in colunas)
-            sql = f"INSERT OR REPLACE INTO {tabela} ({', '.join(colunas)}) VALUES ({placeholders})"
+            existentes = {
+                x[1]
+                for x in await (await db.execute(f"PRAGMA table_info({tabela})")).fetchall()
+            }
+            if not existentes:
+                continue
+            pares_validos = [(idx_c, col_c) for idx_c, col_c in enumerate(colunas) if col_c in existentes]
+            if not pares_validos:
+                continue
+            indices_ok = [idx_c for idx_c, _ in pares_validos]
+            nomes_ok = [col_c for _, col_c in pares_validos]
+            placeholders = ", ".join("?" for _ in nomes_ok)
+            sql = f"INSERT OR REPLACE INTO {tabela} ({', '.join(nomes_ok)}) VALUES ({placeholders})"
             for linha in linhas:
                 try:
-                    await db.execute(sql, tuple(linha))
+                    valores_ok = tuple(linha[i] for i in indices_ok)
+                    await db.execute(sql, valores_ok)
                     total += 1
                 except Exception:
                     continue
@@ -15178,10 +15397,26 @@ def _despacotar(pacote: str) -> dict:
 
 
 async def salvar_estado(forcar: bool = False) -> str:
-    """Envia a fotografia para o Supabase (com limpeza cirúrgica + fatiamento automático em pedaços de ~1.8 MB se necessário)."""
+    """Envia a fotografia para o Supabase (com trava anti-sobrescrita de banco vazio + fatiamento automático)."""
     global _sync_sujo, _sync_ultimo, _sync_erro
     if not supabase_configurado():
         return "Supabase não configurado (defina SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY)."
+
+    if _SUPABASE_BLOQUEIO_BANCO_VAZIO:
+        _sync_erro = "bloqueado p/ proteger backup em nuvem (aguardando restauração inicial)"
+        return f"🛡️ Envio retido: {_sync_erro}"
+
+    # Proteção extra: se o banco local estiver zerado (ex.: máquina recém-ligada) e já houver backup populado na nuvem,
+    # jamais sobrescreve automaticamente sem comando explícito de restauração concluída!
+    if await _banco_vazio():
+        ok_chk, dados_chk = await _sb_req(
+            "GET",
+            f"/rest/v1/{SUPABASE_TABELA}",
+            params={"id": f"eq.{SUPABASE_ID}", "select": "dado,atualizado_em"},
+        )
+        if ok_chk and dados_chk and len(str(dados_chk[0].get("dado") or "")) > 280 and not forcar:
+            _sync_erro = "banco local vazio diante de backup populado na nuvem (protegido contra wipe)"
+            return f"🛡️ Envio retido: {_sync_erro}"
 
     await limpar_lixo_banco(forcar=forcar)
     foto = await snapshot_dump()
@@ -15660,11 +15895,12 @@ async def loop_supabase_keepalive():
 async def loop_sync():
     """Envia sozinho: a cada SYNC_SEGUNDOS quando algo mudou (ou a cada 1h para manter pulso online).
 
-    A restauração inicial acontece antes de registrar views, em _inicializar_bot;
-    não repete a carga em segundo plano após os componentes já estarem ativos.
+    Se a restauração inicial na máquina nova falhou por oscilação de rede, mantém trava anti-wipe
+    e tenta restaurar automaticamente a cada ciclo até recuperar o estado da nuvem!
     """
+    global _SUPABASE_BLOQUEIO_BANCO_VAZIO
     await bot.wait_until_ready()
-    if supabase_configurado():
+    if supabase_configurado() and not _SUPABASE_BLOQUEIO_BANCO_VAZIO:
         try:
             print(f"  🧱 {await sincronizar_estruturado(silencioso=True)}")
             await ping_supabase_keepalive(forcar=False)
@@ -15672,8 +15908,21 @@ async def loop_sync():
             print(f"  🧱 Supabase: falha ao criar as estruturas ({erro})")
     while not bot.is_closed():
         try:
+            if supabase_configurado() and _SUPABASE_BLOQUEIO_BANCO_VAZIO:
+                if not await _banco_vazio():
+                    # Usuário já configurou dados novos localmente; libera sincronização normal
+                    _SUPABASE_BLOQUEIO_BANCO_VAZIO = False
+                else:
+                    ok_rec, msg_rec = await carregar_estado()
+                    if ok_rec or "primeira execução" in str(msg_rec):
+                        _SUPABASE_BLOQUEIO_BANCO_VAZIO = False
+                        if ok_rec:
+                            await init_db()
+                            _log_arquivo(f"[SUPABASE] recuperado automaticamente em segundo plano: {msg_rec}")
+                            print(f"  ☁️ Supabase recuperado automaticamente: {msg_rec}")
+
             precisa_pulso = bool(_sync_ultimo and (time.time() - _sync_ultimo >= 3600))
-            if supabase_configurado() and (_sync_sujo or precisa_pulso):
+            if supabase_configurado() and not _SUPABASE_BLOQUEIO_BANCO_VAZIO and (_sync_sujo or precisa_pulso):
                 resultado = await salvar_estado()
                 if resultado.startswith("❌"):
                     _log_arquivo(f"[SYNC] {resultado}")
@@ -19801,19 +20050,24 @@ class RemoverParceiroView(discord.ui.View):
         super().__init__(timeout=180)
         opcoes = [
             discord.SelectOption(
-                label=str(p["nome_org"])[:100],
+                label=str(p["nome_org"] or "Parceiro")[:100],
                 value=str(p["id"]),
                 emoji="🗑️",
-                description=f"Cliques: {p.get('cliques') or 0} • {str(p.get('convite_link') or '')[:60]}",
+                description=f"Cliques: {p.get('cliques') or 0} • {str(p.get('convite_link') or '')[:60]}"[:100],
             )
             for p in parceiros[:25]
-        ]
+        ] or [discord.SelectOption(label="Nenhum parceiro cadastrado", value="0", emoji="ℹ️")]
         sel = discord.ui.Select(placeholder="🗑️ Selecione o parceiro que deseja remover...", options=opcoes)
         sel.callback = self._remover
         self.add_item(sel)
 
     async def _remover(self, interaction: discord.Interaction):
         pid = int(interaction.data["values"][0])
+        if pid <= 0:
+            return await interaction.response.send_message(
+                embed=criar_embed("ℹ️ Lista vazia", "Não há parceiro para remover.", "Cinza Escuro"),
+                ephemeral=True,
+            )
         async with aiosqlite.connect(DATABASE_FILE) as db:
             await db.execute(
                 "UPDATE parceiros SET status = 'removida' WHERE id = ? AND guild_id = ?",
@@ -20592,18 +20846,34 @@ def _iniciar_tarefas_background():
 
 
 async def _inicializar_bot():
+    global _SUPABASE_BLOQUEIO_BANCO_VAZIO
     await init_db()
 
+    # Remove flag residual de encerramento de ciclo anterior, se existir
+    try:
+        flag_antiga = os.path.join(_DIRETORIO_BOT, "_encerrar_ciclo.flag")
+        if os.path.exists(flag_antiga):
+            os.remove(flag_antiga)
+    except Exception:
+        pass
+
     # A fotografia do Supabase precisa voltar ANTES das views e dos painéis.
-    # Antes, a carga ocorria em loop_sync depois de registrar componentes, então
-    # ticket/deposito antigo podia aparecer como aberto sem os botões corretos.
+    # Se o download falhar numa máquina recém-criada (banco local vazio), ativa trava anti-wipe!
     if supabase_configurado():
         try:
+            banco_estava_vazio = await _banco_vazio()
             ok, mensagem = await carregar_estado()
             print(f"  ☁️ Supabase (antes das views): {mensagem}")
             if ok:
+                _SUPABASE_BLOQUEIO_BANCO_VAZIO = False
                 await init_db()  # aplica migrações compatíveis à fotografia restaurada
+            elif banco_estava_vazio and "primeira execução" not in str(mensagem):
+                _SUPABASE_BLOQUEIO_BANCO_VAZIO = True
+                _log_arquivo(f"[SUPABASE ANTI-WIPE] bloqueio ativado até recuperar backup: {mensagem}")
+                print("  🛡️ Supabase Anti-Wipe ativado: envio retido até recuperar o backup em nuvem!")
         except Exception as erro:
+            if await _banco_vazio():
+                _SUPABASE_BLOQUEIO_BANCO_VAZIO = True
             _log_arquivo(f"[SUPABASE] restauração inicial: {type(erro).__name__}: {erro}")
             print(f"  ☁️ Supabase: não foi possível restaurar na inicialização ({type(erro).__name__})")
 
@@ -20638,12 +20908,13 @@ async def _inicializar_bot():
                     pass
 
         horarios_com_tabela = await (await db.execute(
-            "SELECT id, guild_id FROM horarios WHERE canal_tabela IS NOT NULL AND canal_tabela > 0"
+            "SELECT id, guild_id, canal_tabela FROM horarios "
+            "WHERE (canal_tabela IS NOT NULL AND canal_tabela > 0) OR COALESCE(finalizado_aviso, 0) = 1"
         )).fetchall()
         for ht in horarios_com_tabela:
             _garantir_view_sala_registrada(int(ht["id"]))
             guild_ht = bot.get_guild(int(ht["guild_id"]))
-            if guild_ht:
+            if guild_ht and int(ht["canal_tabela"] or 0) > 0:
                 try:
                     await atualizar_tabela(guild_ht, int(ht["id"]))
                 except Exception:
@@ -20820,6 +21091,63 @@ async def on_ready():
             return
         await _inicializar_bot()
         _BOT_INICIALIZADO = True
+
+
+@bot.listen("on_interaction")
+async def _roteador_dinamico_componentes_persistentes(interaction: discord.Interaction):
+    """Rede de segurança pós-restart/auto-update: se alguém clicar num seletor dinâmico
+    persistente ainda não hidratado em `persistent_views`, hidrata e executa na hora!"""
+    if interaction.type != discord.InteractionType.component:
+        return
+    dados = interaction.data or {}
+    cid = str(dados.get("custom_id") or "")
+    if not cid.startswith("ff"):
+        return
+
+    # Verifica na ViewStore real do discord.py (tanto por message_id quanto global None)
+    # para NUNCA despachar duas vezes caso o discord.py já tenha encontrado o componente!
+    comp_type = dados.get("component_type")
+    msg_id = getattr(getattr(interaction, "message", None), "id", None)
+    vstore = getattr(getattr(bot, "_connection", None), "_view_store", None)
+    if vstore is not None and hasattr(vstore, "_views") and comp_type is not None:
+        chave_vs = (int(comp_type), cid)
+        mapa_vs = vstore._views
+        if (msg_id is not None and chave_vs in mapa_vs.get(msg_id, {})) or (chave_vs in mapa_vs.get(None, {})):
+            return
+
+    for vw in bot.persistent_views:
+        for ch in vw.children:
+            if getattr(ch, "custom_id", None) == cid:
+                return
+
+    rotas_dinamicas = (
+        ("ff_tab_sel:", lambda n: (SalaTabelaPainelView(n), "_rotear")),
+        ("ff_prem_sel:", lambda n: (ReceberPremiacaoDiarioView(n), "_abrir")),
+        ("ff_comp_sel:", lambda n: (ComprovanteAcaoView(n), "_decidir")),
+        ("ff_sqt_sel:", lambda n: (SaqueTicketView(n), "_rotear")),
+        ("ff_sqa_sel:", lambda n: (SaqueAcaoView(n), "_rotear")),
+        ("ff_tk_sel:", lambda n: (TicketView(n), "_rotear")),
+        ("ff_dep_comp_sel:", lambda n: (DepositoComprovanteView(n), "_decidir")),
+        ("ff_dep_sel:", lambda n: (DepositoCanalView(n), "_rotear")),
+        ("ff_parc_tk_", lambda n: (ParceriaTicketView(n), "_decidir")),
+        ("ff_div_tk_", lambda n: (DivulgacaoTicketView(n), "_gerenciar")),
+    )
+    for prefixo, construtor in rotas_dinamicas:
+        if cid.startswith(prefixo):
+            sufixo = cid[len(prefixo):].strip()
+            if not sufixo.isdigit():
+                return
+            num_id = int(sufixo)
+            try:
+                view_inst, nome_cb = construtor(num_id)
+                try:
+                    bot.add_view(view_inst)
+                except Exception:
+                    pass
+                await getattr(view_inst, nome_cb)(interaction)
+            except Exception as erro_dyn:
+                await _registrar_e_responder_erro_ui(interaction, erro_dyn, f"Fallback:{cid}")
+            return
 
 
 @bot.event
