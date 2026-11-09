@@ -80,20 +80,37 @@ jobs:
         run: |
           $ws = $env:GITHUB_WORKSPACE
 
-          # ---- vigia: sobe o bot e levanta de novo se ele cair ------------------
+          # ---- vigia: sobe o bot, auto-atualiza sem cair e levanta de novo se cair
           @'
           $ErrorActionPreference = "Continue"
           Set-Location -Path $PSScriptRoot
+          $env:FF_SOB_VIGIA = "1"
           $log = Join-Path $PSScriptRoot "vigia.log"
           function Escrever($t) { Add-Content -Path $log -Value "[vigia] $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss') $t" -Encoding UTF8 }
           if ((Test-Path $log) -and ((Get-Item $log).Length -gt 4MB)) { Remove-Item $log -Force }
           $q = 0
-          Escrever "vigia ligado"
+          Escrever "vigia ligado (auto-update ativo)"
           while ($true) {
+            if (Test-Path (Join-Path $PSScriptRoot ".git")) {
+              git fetch origin main --quiet 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                git checkout -f origin/main -- fireforce_bot.py 2>$null
+                git reset --mixed origin/main 2>$null
+              }
+            }
             $q++
+            $inicio = Get-Date
             Escrever "subindo o bot (tentativa $q)"
             python fireforce_bot.py *>> $log
-            Escrever "o bot saiu (codigo $LASTEXITCODE)"
+            $codigo = $LASTEXITCODE
+            if ($codigo -eq 42) {
+              $q = 0
+              Escrever "auto-update aplicado com sucesso (codigo 42) - relancando nova versao em 1s!"
+              Start-Sleep -Seconds 1
+              continue
+            }
+            if (((Get-Date) - $inicio).TotalSeconds -ge 120) { $q = 0 }
+            Escrever "o bot saiu (codigo $codigo)"
             if ($q -ge 300) { Escrever "300 quedas seguidas - parando. Rode o bot na mao e leia o erro."; break }
             Start-Sleep -Seconds 5
           }
