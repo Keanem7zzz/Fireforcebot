@@ -1807,12 +1807,17 @@ async def registrar_sequencia_vitoria(guild_id: int, user_id: int, incremento: i
     return nova_seq, novo_rec
 
 
-async def reduzir_sequencia_apos_remocao_vitoria(
-    guild_id: int, user_id: int, removidas: int, novo_total_vitorias: int
+async def ajustar_sequencia_apos_remocao_vitoria(
+    guild_id: int,
+    user_id: int,
+    novo_total_vitorias: int,
+    vitorias_seguidas_reais: Optional[int] = None,
 ) -> tuple[int, int]:
-    """Desfaz na sequência atual e no recorde (se inflado pelo lançamento acidental) as vitórias removidas."""
+    """Preserva as vitórias seguidas reais do jogador ao remover vitórias extras:
+    • Nunca apaga os diários jogados nem zera a sequência à toa;
+    • Se `vitorias_seguidas_reais` for informado, fixa exatamente essa sequência (limitada apenas ao novo total de vitórias);
+    • Se não for informado, mantém a sequência atual intacta (só limitando caso o próprio total de vitórias fique menor que ela)."""
     agora_iso = agora_brt().isoformat()
-    removidas = max(1, int(removidas))
     teto_vit = max(0, int(novo_total_vitorias))
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
@@ -1820,21 +1825,31 @@ async def reduzir_sequencia_apos_remocao_vitoria(
             "SELECT sequencia_atual, melhor_sequencia FROM estatisticas_jogador WHERE guild_id = ? AND user_id = ?",
             (int(guild_id), int(user_id)),
         )).fetchone()
-        if not atual:
-            return 0, 0
-        seq_ant = int(atual["sequencia_atual"] or 0)
-        rec_ant = int(atual["melhor_sequencia"] or 0)
+        seq_ant = int(atual["sequencia_atual"] or 0) if atual else 0
+        rec_ant = int(atual["melhor_sequencia"] or 0) if atual else 0
 
-        nova_seq = min(teto_vit, max(0, seq_ant - removidas))
-        if rec_ant == seq_ant:
-            novo_rec = min(teto_vit, max(nova_seq, rec_ant - removidas))
+        if vitorias_seguidas_reais is not None:
+            nova_seq = min(teto_vit, max(0, int(vitorias_seguidas_reais)))
+            # Se o recorde antigo era igual à sequência inflada pelo lançamento por engano, corrige junto;
+            # caso contrário, preserva o recorde histórico (limitado apenas ao total real de vitórias).
+            if rec_ant == seq_ant and nova_seq < seq_ant:
+                novo_rec = nova_seq
+            else:
+                novo_rec = min(teto_vit, max(nova_seq, rec_ant))
         else:
+            nova_seq = min(teto_vit, max(0, seq_ant))
             novo_rec = min(teto_vit, max(nova_seq, rec_ant))
 
         await db.execute(
-            "UPDATE estatisticas_jogador SET sequencia_atual = ?, melhor_sequencia = ?, atualizado_em = ? "
-            "WHERE guild_id = ? AND user_id = ?",
-            (nova_seq, novo_rec, agora_iso, int(guild_id), int(user_id)),
+            """
+            INSERT INTO estatisticas_jogador (user_id, guild_id, partidas_base, ultimo_slot_migrado, sequencia_atual, melhor_sequencia, atualizado_em)
+            VALUES (?, ?, 0, 0, ?, ?, ?)
+            ON CONFLICT(user_id, guild_id) DO UPDATE SET
+                sequencia_atual = excluded.sequencia_atual,
+                melhor_sequencia = excluded.melhor_sequencia,
+                atualizado_em = excluded.atualizado_em
+            """,
+            (int(user_id), int(guild_id), nova_seq, novo_rec, agora_iso),
         )
         await db.commit()
     marcar_sujo()
@@ -18793,39 +18808,18 @@ async def cmd_vitoria(interaction: discord.Interaction, usuario: discord.Member,
     )
 
 
-@bot.tree.command(name="removervitoria", description="📉 Remover vitórias lançadas por engano (recalcula pontos e patente)")
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_channels=True)
-@app_commands.describe(
-    usuario="Jogador que terá vitórias removidas",
-    quantidade="Quantas vitórias remover (padrão 1)",
-)
-async def cmd_remover_vitoria(interaction: discord.Interaction, usuario: discord.Member, quantidade: Optional[int] = 1):
-    if not await e_dono_ou_gerente(interaction.user):
-        return await interaction.response.send_message(
-            embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente podem remover vitórias.", "Vermelho"),
-            ephemeral=True,
-        )
-
-    qtd_pedida = max(1, int(quantidade or 1))
-    dados_antes = await obter_estatisticas_completas_jogador(interaction.guild.id, usuario.id)
+async def _executar_remocao_vitoria(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    qtd_pedida: int,
+    vitorias_seguidas_reais: Optional[int],
+    dados_antes: dict,
+):
     vit_antes = int(dados_antes["vitorias"])
     pts_antes = int(dados_antes["pontos"])
     pat_antes = dados_antes["patente"]
 
-    if vit_antes <= 0:
-        return await interaction.response.send_message(
-            embed=criar_embed(
-                "ℹ️ Nenhuma Vitória para Remover",
-                f"{usuario.mention} já está com **`0` vitórias** registradas.",
-                "Amarelo",
-            ),
-            ephemeral=True,
-        )
-
-    await interaction.response.defer(thinking=True)
-
-    removidas = min(vit_antes, qtd_pedida)
+    removidas = min(vit_antes, max(1, int(qtd_pedida)))
     novo_total = max(0, vit_antes - removidas)
 
     async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -18841,12 +18835,14 @@ async def cmd_remover_vitoria(interaction: discord.Interaction, usuario: discord
             )
         await db.commit()
 
-    streak_atual, maior_streak = await reduzir_sequencia_apos_remocao_vitoria(
-        interaction.guild.id, usuario.id, removidas, novo_total
+    streak_atual, maior_streak = await ajustar_sequencia_apos_remocao_vitoria(
+        interaction.guild.id, usuario.id, novo_total, vitorias_seguidas_reais=vitorias_seguidas_reais
     )
     dados_depois = await sincronizar_cargo_patente(interaction.guild, usuario.id)
     pat_depois = dados_depois["patente"] if dados_depois else pat_antes
     pts_depois = int(dados_depois["pontos"]) if dados_depois else max(0, pts_antes - removidas * 3)
+    winrate_depois = float(dados_depois["winrate"]) if dados_depois else 0.0
+    partidas_jogadas = int(dados_depois["partidas"]) if dados_depois else int(dados_antes["partidas"])
     pts_removidos = max(0, pts_antes - pts_depois)
     desceu_patente = pat_depois["slug"] != pat_antes["slug"]
     marcar_sujo()
@@ -18870,9 +18866,10 @@ async def cmd_remover_vitoria(interaction: discord.Interaction, usuario: discord
         embed=criar_embed(
             "📉 Vitória(s) Removida(s) e Pontos Ajustados",
             f"Ajuste aplicado em {usuario.mention}:\n\n"
-            f"• 🏆 **Vitórias:** `{vit_antes}` ➜ **`{novo_total}`** (`-{removidas}`)\n"
+            f"• 🏆 **Vitórias totais:** `{vit_antes}` ➜ **`{novo_total}`** (`-{removidas}`)\n"
             f"• 📊 **Pontos descontados:** `-{pts_removidos} pts` (`{pts_antes}` ➜ `{pts_depois} pts`)\n"
-            f"• 🔥 **Sequência ajustada:** `{streak_atual}` *(recorde: `{maior_streak}`)*"
+            f"• 🔥 **Vitórias seguidas preservadas:** `{streak_atual}` *(recorde: `{maior_streak}`)*\n"
+            f"• 🎮 **Diários jogados / Winrate:** `{partidas_jogadas}` diário(s) • `{winrate_depois:.1f}%`"
             f"{linha_patente}",
             "Amarelo",
         )
@@ -18882,9 +18879,123 @@ async def cmd_remover_vitoria(interaction: discord.Interaction, usuario: discord
         "🏆 RANKING",
         "📉 Vitória(s) removida(s)",
         f"{usuario.mention} teve `-{removidas}` vitória(s) removida(s) por {interaction.user.mention} — "
-        f"vitórias `{vit_antes}` ➜ `{novo_total}` • pontos `{pts_antes}` ➜ `{pts_depois}` • "
+        f"vitórias `{vit_antes}` ➜ `{novo_total}` • seguidas `{streak_atual}` • pontos `{pts_antes}` ➜ `{pts_depois}` • "
         f"patente `{pat_antes['nome']}` ➜ `{pat_depois['nome']}`.",
         "Amarelo",
+    )
+
+
+class RemoverVitoriaModal(discord.ui.Modal, title="📉 Remover Vitórias de Jogador"):
+    campo_remover = discord.ui.TextInput(
+        label="Quantas vitórias você quer remover?",
+        placeholder="Ex: 1",
+        min_length=1,
+        max_length=5,
+        required=True,
+    )
+    campo_seguidas = discord.ui.TextInput(
+        label="Quantas vitórias seguidas ele tinha?",
+        placeholder="Ex: 5 (mantém as seguidas dele sem apagar)",
+        min_length=1,
+        max_length=5,
+        required=True,
+    )
+
+    def __init__(self, usuario: discord.Member, dados_atuais: dict):
+        super().__init__()
+        self.usuario = usuario
+        self.dados_atuais = dados_atuais
+        vit_at = int(dados_atuais.get("vitorias") or 0)
+        seq_at = int(dados_atuais.get("sequencia_atual") or 0)
+        self.campo_remover.default = "1"
+        self.campo_remover.placeholder = f"Ele tem {vit_at} vitória(s) no total (ex: 1)"
+        self.campo_seguidas.default = str(seq_at)
+        self.campo_seguidas.placeholder = f"Atual no perfil: {seq_at} seguida(s)"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente podem remover vitórias.", "Vermelho"),
+                ephemeral=True,
+            )
+        txt_rem = (self.campo_remover.value or "").strip()
+        txt_seq = (self.campo_seguidas.value or "").strip()
+        if not txt_rem.isdigit() or int(txt_rem) <= 0:
+            return await interaction.response.send_message(
+                embed=criar_embed("⚠️ Valor inválido", "Informe um número inteiro maior que zero para remover (ex: `1`).", "Amarelo"),
+                ephemeral=True,
+            )
+        if not txt_seq.isdigit() or int(txt_seq) < 0:
+            return await interaction.response.send_message(
+                embed=criar_embed("⚠️ Valor inválido", "Informe quantas vitórias seguidas ele tinha usando apenas números (`0` ou mais).", "Amarelo"),
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(thinking=True)
+        dados_frescos = await obter_estatisticas_completas_jogador(interaction.guild.id, self.usuario.id)
+        if int(dados_frescos["vitorias"]) <= 0:
+            return await interaction.followup.send(
+                embed=criar_embed("ℹ️ Nenhuma Vitória", f"{self.usuario.mention} já está com `0` vitórias.", "Amarelo"),
+                ephemeral=True,
+            )
+        await _executar_remocao_vitoria(
+            interaction,
+            self.usuario,
+            int(txt_rem),
+            int(txt_seq),
+            dados_frescos,
+        )
+
+
+@bot.tree.command(name="removervitoria", description="📉 Remover vitórias lançadas por engano (preserva seguidas/diários e ajusta patente)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.describe(
+    usuario="Jogador que terá vitórias removidas",
+    quantidade="Quantas vitórias remover (se deixar vazio, abre janela perguntando)",
+    vitorias_seguidas="Quantas vitórias seguidas reais ele tinha (mantém as seguidas intactas)",
+)
+async def cmd_remover_vitoria(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    quantidade: Optional[int] = None,
+    vitorias_seguidas: Optional[int] = None,
+):
+    if not await e_dono_ou_gerente(interaction.user):
+        return await interaction.response.send_message(
+            embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente podem remover vitórias.", "Vermelho"),
+            ephemeral=True,
+        )
+
+    dados_antes = await obter_estatisticas_completas_jogador(interaction.guild.id, usuario.id)
+    vit_antes = int(dados_antes["vitorias"])
+
+    if vit_antes <= 0:
+        return await interaction.response.send_message(
+            embed=criar_embed(
+                "ℹ️ Nenhuma Vitória para Remover",
+                f"{usuario.mention} já está com **`0` vitórias** registradas.",
+                "Amarelo",
+            ),
+            ephemeral=True,
+        )
+
+    # Se não preencheu os dois campos na barra, abre o Modal perguntando quantas remover e quantas seguidas ele tinha!
+    if quantidade is None or vitorias_seguidas is None:
+        modal = RemoverVitoriaModal(usuario, dados_antes)
+        if quantidade is not None:
+            modal.campo_remover.default = str(max(1, int(quantidade)))
+        if vitorias_seguidas is not None:
+            modal.campo_seguidas.default = str(max(0, int(vitorias_seguidas)))
+        return await interaction.response.send_modal(modal)
+
+    await interaction.response.defer(thinking=True)
+    await _executar_remocao_vitoria(
+        interaction,
+        usuario,
+        max(1, int(quantidade)),
+        max(0, int(vitorias_seguidas)),
+        dados_antes,
     )
 
 
