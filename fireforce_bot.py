@@ -4252,9 +4252,9 @@ class DefinirSalaCanalModal(discord.ui.Modal, title="🔑 Definir ID e Senha des
         await interaction.response.defer(ephemeral=True, thinking=True)
         if not interaction.guild:
             return
-        if not await e_staff(interaction.user):
+        if not await e_dono_ou_gerente(interaction.user):
             return await interaction.followup.send(
-                embed=criar_embed("❌ Sem Permissão", "Apenas ADM, Gerente ou Dono pode definir o ID e Senha.", "Vermelho"),
+                embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente podem definir o ID e Senha.", "Vermelho"),
                 ephemeral=True,
             )
 
@@ -4731,7 +4731,7 @@ class SalaTabelaPainelView(discord.ui.View):
                     label="Definir ID e Senha desta Sala",
                     value="ish",
                     emoji="🔑",
-                    description="ADM/Gerente/Dono registra ID e Senha direto neste canal",
+                    description="Dono/Gerente: registra ID e Senha direto neste canal",
                 ),
                 discord.SelectOption(
                     label="Enviar Booyah desta Sala",
@@ -4772,9 +4772,9 @@ class SalaTabelaPainelView(discord.ui.View):
             pass
 
         if acao == "ish":
-            if not await e_staff(interaction.user):
+            if not await e_dono_ou_gerente(interaction.user):
                 return await interaction.response.send_message(
-                    embed=criar_embed("🔒 Restrito à Equipe", "Apenas ADM, Gerente ou Dono pode definir o ID e Senha da sala.", "Vermelho"),
+                    embed=criar_embed("🔒 Restrito à Gerência", "Apenas Dono ou Gerente podem definir o ID e Senha da sala.", "Vermelho"),
                     ephemeral=True,
                 )
             return await interaction.response.send_modal(DefinirSalaCanalModal(self.horario_id))
@@ -9176,7 +9176,7 @@ async def loop_salas():
                 if guild_h:
                     cfg_h = await obter_config(guild_h.id)
                     mencoes = []
-                    for ck in ("cargo_dono", "cargo_gerente", "cargo_mediador"):
+                    for ck in ("cargo_dono", "cargo_gerente"):
                         if cfg_h.get(ck):
                             rl = guild_h.get_role(int(cfg_h[ck]))
                             if rl:
@@ -9833,9 +9833,9 @@ async def cmd_pix(
     categoria=[app_commands.Choice(name="Premium 💎", value="premium"), app_commands.Choice(name="Básico 🪙", value="basico")]
 )
 async def cmd_ish(interaction: discord.Interaction, tipo: app_commands.Choice[str], categoria: app_commands.Choice[str], horario: str, sala_id: str, senha: str):
-    if not await e_staff(interaction.user):
+    if not await e_dono_ou_gerente(interaction.user):
         return await interaction.response.send_message(
-            embed=criar_embed("❌ Sem Permissão", "Apenas ADM (Mediador), Gerente ou Dono podem definir ID e Senha.", "Vermelho"),
+            embed=criar_embed("❌ Sem Permissão", "Apenas Dono ou Gerente podem definir ID e Senha.", "Vermelho"),
             ephemeral=True
         )
 
