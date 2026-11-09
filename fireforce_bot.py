@@ -22,14 +22,17 @@ from discord.ext import commands
 from discord import app_commands
 import aiosqlite
 import aiohttp
+import ast
 import base64
 import gzip
+import hashlib
 import json
 import logging
 import math
 import os
 import random
 import re
+import subprocess
 import time
 import unicodedata
 import qrcode
@@ -99,6 +102,13 @@ BLOQUEIO_COMPRA_PADRAO_MIN = 10
 FF_NIVEL_MIN_PADRAO = 20
 SUBSTITUICAO_MIN_PADRAO = 5
 SUPABASE_KEEPALIVE_SEGUNDOS = max(3600, int(os.getenv("SUPABASE_PING_HORAS", "48")) * 3600)
+AUTO_UPDATE_ATIVO = os.getenv("AUTO_UPDATE", "1").strip().lower() not in ("0", "false", "nao", "não", "off")
+AUTO_UPDATE_SEGUNDOS = max(30, int(os.getenv("AUTO_UPDATE_SEGUNDOS", "60")))
+AUTO_UPDATE_EXIT_CODE = 42
+AUTO_UPDATE_REPO_RAW = os.getenv(
+    "AUTO_UPDATE_RAW_URL",
+    "https://raw.githubusercontent.com/Keanem7zzz/Fireforcebot/main/fireforce_bot.py",
+)
 
 # O arquivo antigo é mantido intacto: a nova instalação usa ffv1.db.
 # Não renomear/migrar bancos locais antigos automaticamente. Com Supabase
@@ -14426,6 +14436,17 @@ async def cmd_saude(interaction: discord.Interaction):
                   if (_sync_erro or _sql_erro) else "")),
         inline=False)
     embed.add_field(
+        name="🔄 Auto-Update (GitHub)",
+        value=(
+            f"> {'✅ ativo' if AUTO_UPDATE_ATIVO else '⏸️ desativado'} "
+            f"(verifica `main` a cada `{AUTO_UPDATE_SEGUNDOS}s`)\n"
+            f"> Versão em execução: `v{VERSAO_BOT}` • Commit: `{_obter_commit_curto_local()}`\n"
+            f"> Última checagem: {_ha(_AUTO_UPDATE_ULTIMA_CHECAGEM)}"
+            + (f"\n> ⚠️ Aviso: `{_AUTO_UPDATE_ULTIMO_ERRO[:100]}`" if _AUTO_UPDATE_ULTIMO_ERRO else "")
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="📋 Pendências abertas",
         value=(f"> 💰 Depósitos abertos: `{pend['depositos']}` ({formatar_moeda(pend['depositos_valor'])})\n"
                f"> 🎮 Reservas aguardando pagamento: `{pend['reservas']}`\n"
@@ -20315,6 +20336,227 @@ async def cmd_divulgacao(interaction: discord.Interaction):
     )
 
 
+# ==================== AUTO-UPDATE SEM DESLIGAR A MÁQUINA ====================
+
+_ARQUIVO_BOT_PATH = os.path.abspath(__file__)
+_DIRETORIO_BOT = os.path.dirname(_ARQUIVO_BOT_PATH)
+
+
+def _calcular_sha256_arquivo(caminho: str) -> str:
+    try:
+        with open(caminho, "rb") as arq:
+            return hashlib.sha256(arq.read().replace(b"\r\n", b"\n")).hexdigest()
+    except Exception:
+        return ""
+
+
+_HASH_CODIGO_INICIAL = _calcular_sha256_arquivo(_ARQUIVO_BOT_PATH)
+_REINICIAR_APOS_AUTO_UPDATE = False
+_AUTO_UPDATE_ULTIMA_CHECAGEM: float = 0.0
+_AUTO_UPDATE_ULTIMO_ERRO: str = ""
+_lock_auto_update = asyncio.Lock()
+
+
+def _obter_commit_curto_local() -> str:
+    try:
+        if os.path.isdir(os.path.join(_DIRETORIO_BOT, ".git")):
+            res = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=_DIRETORIO_BOT,
+                capture_output=True,
+                text=True,
+                timeout=6,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()[:10]
+    except Exception:
+        pass
+    return (_HASH_CODIGO_INICIAL[:7] if _HASH_CODIGO_INICIAL else "local")
+
+
+def _buscar_codigo_remoto_git_sync() -> tuple[Optional[bytes], str, str]:
+    """Busca `origin/main:fireforce_bot.py` via git local sem bloquear o event loop."""
+    git_dir = os.path.join(_DIRETORIO_BOT, ".git")
+    if not os.path.isdir(git_dir):
+        return (None, "", "sem_git")
+    nome_arq = os.path.basename(_ARQUIVO_BOT_PATH)
+    r_fetch = subprocess.run(
+        ["git", "fetch", "origin", "main", "--quiet"],
+        cwd=_DIRETORIO_BOT,
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    if r_fetch.returncode != 0:
+        return (None, "", (r_fetch.stderr or "falha no git fetch").strip()[:120])
+
+    r_rev = subprocess.run(
+        ["git", "rev-parse", "--short", "origin/main"],
+        cwd=_DIRETORIO_BOT,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    commit_rem = r_rev.stdout.strip()[:10] if r_rev.returncode == 0 else "main"
+
+    r_show = subprocess.run(
+        ["git", "show", f"origin/main:{nome_arq}"],
+        cwd=_DIRETORIO_BOT,
+        capture_output=True,
+        timeout=15,
+    )
+    if r_show.returncode != 0 or not r_show.stdout:
+        return (None, commit_rem, "arquivo não localizado em origin/main")
+    return (r_show.stdout, commit_rem, "")
+
+
+def _aplicar_arquivos_git_sync(bytes_novos: bytes) -> None:
+    """Grava o novo código de forma atômica e alinha os arquivos rastreados sem tocar em .env, ffv1.db ou vigia."""
+    tmp_path = f"{_ARQUIVO_BOT_PATH}.upd_tmp"
+    with open(tmp_path, "wb") as f_out:
+        f_out.write(bytes_novos)
+        f_out.flush()
+    os.replace(tmp_path, _ARQUIVO_BOT_PATH)
+
+    if os.path.isdir(os.path.join(_DIRETORIO_BOT, ".git")):
+        try:
+            subprocess.run(
+                ["git", "checkout", "-f", "origin/main", "--", "."],
+                cwd=_DIRETORIO_BOT,
+                capture_output=True,
+                timeout=20,
+            )
+            subprocess.run(
+                ["git", "reset", "--mixed", "origin/main"],
+                cwd=_DIRETORIO_BOT,
+                capture_output=True,
+                timeout=15,
+            )
+        except Exception:
+            pass
+
+
+async def _checar_e_aplicar_auto_update() -> tuple[str, str]:
+    """Verifica se `fireforce_bot.py` mudou na `main`; valida sintaxe, salva estado e reinicia sozinho."""
+    global _AUTO_UPDATE_ULTIMA_CHECAGEM, _AUTO_UPDATE_ULTIMO_ERRO, _REINICIAR_APOS_AUTO_UPDATE
+    if _lock_auto_update.locked():
+        return ("ocupado", "Já existe uma checagem de atualização em andamento.")
+
+    async with _lock_auto_update:
+        bytes_remotos: Optional[bytes] = None
+        commit_remoto = "main"
+        erro_git = ""
+
+        try:
+            bytes_remotos, commit_remoto, erro_git = await asyncio.to_thread(_buscar_codigo_remoto_git_sync)
+        except Exception as exc_g:
+            erro_git = str(exc_g)[:120]
+
+        # Fallback HTTP direto caso rode sem pasta .git
+        if bytes_remotos is None and erro_git == "sem_git" and AUTO_UPDATE_REPO_RAW:
+            try:
+                sess = _ff_sessao()
+                hdrs = {}
+                gh_tok = (os.getenv("GITHUB_TOKEN") or "").strip()
+                if gh_tok:
+                    hdrs["Authorization"] = f"Bearer {gh_tok}"
+                url_raw = f"{AUTO_UPDATE_REPO_RAW}?t={int(time.time())}"
+                async with sess.get(url_raw, headers=hdrs, timeout=aiohttp.ClientTimeout(total=15)) as r_http:
+                    if r_http.status == 200:
+                        bytes_remotos = await r_http.read()
+                        commit_remoto = "github-raw"
+                        erro_git = ""
+                    else:
+                        erro_git = f"HTTP {r_http.status}"
+            except Exception as exc_h:
+                erro_git = str(exc_h)[:120]
+
+        _AUTO_UPDATE_ULTIMA_CHECAGEM = time.time()
+        if not bytes_remotos:
+            _AUTO_UPDATE_ULTIMO_ERRO = erro_git or "sem resposta remota"
+            return ("erro", f"Não foi possível consultar atualização agora (`{_AUTO_UPDATE_ULTIMO_ERRO}`).")
+
+        norm_remoto = bytes_remotos.replace(b"\r\n", b"\n")
+        hash_remoto_norm = hashlib.sha256(norm_remoto).hexdigest()
+
+        _AUTO_UPDATE_ULTIMO_ERRO = ""
+        if hash_remoto_norm == _HASH_CODIGO_INICIAL:
+            return (
+                "atualizado",
+                f"O bot já está na versão mais recente (`v{VERSAO_BOT}` • commit `{_obter_commit_curto_local()}`).",
+            )
+
+        # Valida UTF-8 + sintaxe Python ANTES de substituir o arquivo
+        try:
+            texto_novo = bytes_remotos.decode("utf-8")
+            if "VERSAO_BOT" not in texto_novo:
+                raise ValueError("assinatura VERSAO_BOT ausente")
+            await asyncio.to_thread(ast.parse, texto_novo, "fireforce_bot.py")
+        except Exception as erro_ast:
+            _AUTO_UPDATE_ULTIMO_ERRO = f"sintaxe remota inválida: {erro_ast}"
+            _log_arquivo(f"[AUTO-UPDATE] abortado ({_AUTO_UPDATE_ULTIMO_ERRO})")
+            return ("erro", f"Atualização abortada por segurança (`{_AUTO_UPDATE_ULTIMO_ERRO}`).")
+
+        m_ver = re.search(r'VERSAO_BOT\s*=\s*["\']([^"\']+)["\']', texto_novo)
+        nova_versao = m_ver.group(1) if m_ver else "?"
+
+        # Aguarda até 10s se houver aprovação/depósito exatamente em andamento
+        for _ in range(20):
+            if not _lock_aprovacao.locked() and not _lock_deposito.locked():
+                break
+            await asyncio.sleep(0.5)
+
+        if supabase_configurado() and os.path.exists(DATABASE_FILE):
+            try:
+                await salvar_estado(forcar=True)
+            except Exception as erro_sb:
+                _log_arquivo(f"[AUTO-UPDATE] aviso ao salvar Supabase antes do restart: {erro_sb}")
+
+        await asyncio.to_thread(_aplicar_arquivos_git_sync, bytes_remotos)
+
+        msg_upd = (
+            f"Nova atualização detectada na `main` (`v{VERSAO_BOT}` ➜ `v{nova_versao}` • `{commit_remoto}`).\n"
+            f"Código atualizado e estado salvo — reiniciando automaticamente em ~1s sem desligar a máquina!"
+        )
+        print(f"  🔄 [AUTO-UPDATE] v{VERSAO_BOT} -> v{nova_versao} ({commit_remoto}). Reiniciando automaticamente...")
+        _log_arquivo(f"[AUTO-UPDATE] aplicando v{VERSAO_BOT} -> v{nova_versao} ({commit_remoto})")
+
+        for g_upd in list(bot.guilds):
+            try:
+                await registrar_log(
+                    g_upd,
+                    "🔄 AUTO-UPDATE",
+                    "🔄 Bot atualizado automaticamente!",
+                    f"• **Versão:** `v{VERSAO_BOT}` ➜ `v{nova_versao}` (`{commit_remoto}`)\n"
+                    f"• **Ação:** backup salvo e reinício automático em 1s sem intervenção manual.",
+                    "Esmeralda",
+                )
+            except Exception:
+                pass
+
+        _REINICIAR_APOS_AUTO_UPDATE = True
+
+        async def _fechar_apos_resposta():
+            await asyncio.sleep(1.2)
+            await bot.close()
+
+        asyncio.create_task(_fechar_apos_resposta())
+        return ("aplicando", msg_upd)
+
+
+async def loop_auto_atualizar():
+    """Vigia silenciosamente a branch `main` e aplica novas versões sem precisar desligar nada."""
+    await bot.wait_until_ready()
+    await asyncio.sleep(20)
+    while not bot.is_closed():
+        if AUTO_UPDATE_ATIVO and not _REINICIAR_APOS_AUTO_UPDATE:
+            try:
+                await _checar_e_aplicar_auto_update()
+            except Exception as erro_loop:
+                _log_arquivo(f"[AUTO-UPDATE] erro no loop: {erro_loop}")
+        await asyncio.sleep(AUTO_UPDATE_SEGUNDOS)
+
+
 def _iniciar_tarefas_background():
     """Inicia cada loop uma única vez; reconnects não duplicam processamento."""
     fabricas = {
@@ -20327,6 +20569,7 @@ def _iniciar_tarefas_background():
         "supabase_keepalive": loop_supabase_keepalive,
         "cupons": loop_cupons,
         "fechamento_semanal": loop_fechamento_semanal,
+        "auto_update": loop_auto_atualizar,
     }
     for nome, fabrica in fabricas.items():
         existente = _TAREFAS_BACKGROUND.get(nome)
@@ -21415,6 +21658,12 @@ class AdminCentralView(discord.ui.View):
                     description="Compacta histórico antigo e salva backup limpo na nuvem",
                 ),
                 discord.SelectOption(
+                    label="Auto-Update (Verificar / Atualizar Agora)",
+                    value="auto_update",
+                    emoji="🚀",
+                    description="Checa a branch main agora e aplica se houver versão nova",
+                ),
+                discord.SelectOption(
                     label="Atualizar Painel",
                     value="atualizar",
                     emoji="🔄",
@@ -21506,6 +21755,19 @@ class AdminCentralView(discord.ui.View):
             )
             return await interaction.edit_original_response(embed=emb, view=AdminCentralView(self.autor_id))
 
+        if modulo == "auto_update":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            status_u, msg_u = await _checar_e_aplicar_auto_update()
+            cor_u = {"aplicando": "Esmeralda", "atualizado": "Cinza Escuro"}.get(status_u, "Amarelo")
+            titulo_u = {
+                "aplicando": "🚀 Atualização Detectada — Reiniciando Sozinho!",
+                "atualizado": "✅ Já Está na Última Versão",
+            }.get(status_u, "⚠️ Checagem de Auto-Update")
+            return await interaction.followup.send(
+                embed=criar_embed(titulo_u, msg_u, cor_u),
+                ephemeral=True,
+            )
+
 
 @bot.tree.command(name="admin", description="🎛️ Central executiva unificada (Patentes, Vaga VIP, Manutenção, Relatório, Blacklist e Backup)")
 @app_commands.guild_only()
@@ -21573,6 +21835,14 @@ def _run():
         print("  ➜ Confira a internet do host/PC e rode de novo.\n")
     # O backup de encerramento e o fechamento da sessão HTTP acontecem em
     # FireForceBot.close(), no mesmo event loop em que foram criados.
+
+    if _REINICIAR_APOS_AUTO_UPDATE:
+        if os.getenv("FF_SOB_VIGIA") == "1":
+            sys.exit(AUTO_UPDATE_EXIT_CODE)
+        if os.name == "nt":
+            subprocess.Popen([sys.executable, _ARQUIVO_BOT_PATH, *sys.argv[1:]], cwd=_DIRETORIO_BOT)
+            sys.exit(0)
+        os.execv(sys.executable, [sys.executable, _ARQUIVO_BOT_PATH, *sys.argv[1:]])
 
 
 if __name__ == "__main__":
