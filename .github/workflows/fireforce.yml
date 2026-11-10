@@ -317,8 +317,12 @@ jobs:
 
 
           $duracao = [int](($alvo - $agora).TotalMinutes)
-          Write-Host "Ciclo: $($agora.ToString('HH:mm')) -> $($alvo.ToString('dd/MM HH:mm')) UTC (~$duracao min)"
-          if ($duracao -lt 60) { Write-Host "AVISO: janela curta ($duracao min) - o próximo ciclo da fila assume em seguida." }
+          Write-Host "======================================================"
+          Write-Host ("  BOT NO AR ATE: {0:dd/MM HH:mm} UTC  ({1} horas e {2} min)" -f $alvo, [int][math]::Floor($duracao/60), ($duracao % 60))
+          Write-Host "======================================================"
+          if ($duracao -lt 60) {
+            Write-Host "  (Esta e a primeira maquina, ligada na mao. Ela passa o bastao para a automatica no horario acima.)"
+          }
 
           # ------------------------------------------------------------- laço -------
           while ((Get-Date).ToUniversalTime() -lt $alvo) {
