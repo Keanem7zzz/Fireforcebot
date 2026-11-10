@@ -4,19 +4,20 @@
 #  Salve como:  .github/workflows/fireforce.yml
 #
 #  Este arquivo faz TUDO sozinho dentro da máquina:
-#     - liga o RDP (usuario runneradmin + senha do segredo RDP_SENHA)
-#     - entra no Tailscale (hostname fireforce-rdp)
-#     - cria o .env com as chaves dos Segredos
-#     - sobe o bot ESCONDIDO, com vigia (se cair, levanta de novo)
-#     - cria os atalhos na area de trabalho (Ligar / Reiniciar / Status)
-#     - mantem a maquina viva e se relanca a cada 5h (cron)
+#     - PREAQUECE a máquina nova (RDP, Tailscale, Python, libs, .env, scripts)
+#       ENQUANTO a máquina antiga continua com o bot no ar atendendo os jogadores
+#     - faz a TROCA DE BASTÃO usando só a API de runs do GitHub: quando a máquina
+#       nova entra, a antiga percebe em ~2s, salva 100% no Supabase, sai do
+#       Tailscale e encerra limpo
+#     - só então a nova entra no Tailscale (hostname fireforce-rdp limpo) e sobe
+#       o bot -> janela offline de ~3 a 5 segundos, NUNCA dois bots ao mesmo tempo
+#     - vigia o bot (se cair, levanta de novo) e cria os atalhos da área de trabalho
+#     - mantém a máquina viva por ~5h50 e, se ninguém assumir, dispara a próxima
+#       sozinha (fallback aos 338 min) além do cron a cada 5h
 #
-#  Voce NAO precisa subir nenhum .ps1 ou .bat: a maquina cria os arquivos.
-#  No repositorio ficam apenas 2 arquivos:
+#  No repositório ficam apenas 2 arquivos:
 #     fireforce_bot.py
 #     .github/workflows/fireforce.yml   (este)
-#
-#  QUER 100% NO SEU TEMPO (sem relancar sozinho)? Comente o bloco "schedule:".
 # ==============================================================================
 
 name: Fire Force (RDP + Bot)
@@ -26,11 +27,17 @@ on:
   schedule:
     - cron: "0 */5 * * *"       # relanca a cada 5h -> emenda sem buraco
 
-# UMA maquina por vez: o proximo run fica na fila e entra no lugar do antigo.
-# NUNCA rode duas ao mesmo tempo (o mesmo PIX contaria 2x e brigariam pelo token).
-concurrency:
-  group: fireforce-bot
-  cancel-in-progress: false
+# ⚠️ SEM trava de concorrência: a máquina nova PRECISA rodar em paralelo com a
+# antiga para pré-aquecer. Quem garante "nunca dois bots juntos" é o bastão:
+#   • a run mais NOVA sempre tem prioridade; a mais antiga sai limpa sozinha
+#   • a nova só sobe o bot depois que a antiga sai da lista de runs em execução
+#   • se a antiga travar, é cancelada (o bot salva no Supabase a cada 30s)
+
+# A API do GitHub é usada para: passar o bastão, esperar a antiga encerrar,
+# cancelar a antiga em caso de travamento e disparar a próxima máquina (fallback).
+permissions:
+  actions: write
+  contents: read
 
 env:
   SYNC_SEGUNDOS: "30"           # a maquina morre de repente: salva no Supabase mais seguido
@@ -40,6 +47,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 360        # LIMITE DO GITHUB: 6h. O loop interno para antes (5h50).
     steps:
+      # ======================================================================
+      #  FASE 1 — PRÉ-AQUECIMENTO (a máquina antiga segue online e atendendo)
+      # ======================================================================
       - name: 📥 Baixar o código
         uses: actions/checkout@v4
 
@@ -52,18 +62,16 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 
-      - name: 🌐 Entrar no Tailscale
+      - name: 🌐 Instalar o Tailscale (MSI apenas — o 'up' é só no bastão)
         shell: pwsh
         run: |
+          # Instala o MSI só para deixar o executável pronto. O `tailscale up` fica
+          # para depois do bastão, para o hostname fireforce-rdp não virar -1.
           $msi = "$env:RUNNER_TEMP\tailscale.msi"
           Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
-          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn" -Wait
-          & 'C:\Program Files\Tailscale\tailscale.exe' up --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" --hostname=fireforce-rdp --unattended --accept-routes
-          $ip = (& 'C:\Program Files\Tailscale\tailscale.exe' ip -4) | Select-Object -First 1
-          Write-Host "------------------------------------------------------"
-          Write-Host "  Windows App -> fireforce-rdp   (ou $ip)"
-          Write-Host "  Usuario: runneradmin           Senha: RDP_SENHA"
-          Write-Host "------------------------------------------------------"
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
+          if (-not (Test-Path 'C:\Program Files\Tailscale\tailscale.exe')) { throw "Tailscale não instalou corretamente." }
+          Write-Host "Tailscale instalado (aguardando o bastão para o 'up')."
 
       # ------------------------------------------------------------- BOT ------
       - name: 🐍 Instalar o Python
@@ -75,7 +83,7 @@ jobs:
         shell: pwsh
         run: python -m pip install --quiet --disable-pip-version-check discord.py aiohttp aiosqlite "qrcode[pil]" Pillow
 
-      - name: 🛠️ Criar os controles do bot (vigia + atalhos)
+      - name: 🛠️ Criar os controles do bot (vigia + atalhos + bastão)
         shell: pwsh
         run: |
           $ws = $env:GITHUB_WORKSPACE
@@ -192,6 +200,58 @@ jobs:
           Write-Host "Controles prontos: vigia_bot.ps1, iniciar_bot.ps1, reiniciar_bot.ps1, status_bot.ps1"
           Write-Host "E 3 atalhos na area de trabalho: Ligar bot / Reiniciar bot / Status do bot"
 
+      # ---------- helpers de bastão (API do GitHub) — usados nos próximos steps
+      - name: 🔗 Criar os helpers do bastão
+        shell: pwsh
+        run: |
+          @'
+          # Ferramentas de bastão: usa SOMENTE a API de runs (permissões actions:read/write).
+          $ErrorActionPreference = "Continue"
+          $script:FFApi = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $script:FFHeaders = @{
+            Authorization          = "Bearer $env:GH_TOKEN"
+            Accept                 = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          function FF-RunsAtivas {
+            # Runs em execução DESTE workflow, sem contar a minha.
+            try {
+              $uri = "$script:FFApi/actions/workflows/fireforce.yml/runs?status=in_progress&per_page=50"
+              $r = Invoke-RestMethod -Uri $uri -Headers $script:FFHeaders -Method Get -TimeoutSec 15
+              return @($r.workflow_runs | Where-Object { "$($_.id)" -ne "$env:GITHUB_RUN_ID" })
+            } catch { return @() }
+          }
+
+          function FF-CancelarRun([long]$id) {
+            try {
+              Invoke-RestMethod -Uri "$script:FFApi/actions/runs/$id/cancel" -Headers $script:FFHeaders -Method Post -TimeoutSec 15 | Out-Null
+              return $true
+            } catch { return $false }
+          }
+
+          function FF-DispararProxima {
+            try {
+              $corpo = @{ ref = "main" } | ConvertTo-Json -Compress
+              Invoke-RestMethod -Uri "$script:FFApi/actions/workflows/fireforce.yml/dispatches" -Headers $script:FFHeaders -Method Post -Body $corpo -ContentType 'application/json' -TimeoutSec 20 | Out-Null
+              return $true
+            } catch {
+              Write-Host "aviso: falha ao disparar a próxima máquina: $($_.Exception.Message)"
+              return $false
+            }
+          }
+
+          function FF-RunMaisNova {
+            # Existe alguma run MAIS NOVA que a minha em execução? (ela tem prioridade)
+            $minha = [long]$env:GITHUB_RUN_ID
+            $outras = @(FF-RunsAtivas)
+            $novas = @($outras | Where-Object { [long]$_.id -gt $minha } | Sort-Object { [long]$_.id } -Descending)
+            if ($novas.Count -gt 0) { return $novas[0] }
+            return $null
+          }
+          '@ | Set-Content -Path "$env:GITHUB_WORKSPACE\bastao_helpers.ps1" -Encoding UTF8
+          Write-Host "bastao_helpers.ps1 criado."
+
       - name: 🔐 Criar o .env do bot (vindo dos Segredos)
         shell: pwsh
         env:
@@ -211,21 +271,152 @@ jobs:
           $linhas | Set-Content -Path "$env:GITHUB_WORKSPACE\.env" -Encoding UTF8
           Write-Host "(.env criado com $($linhas.Count) linha(s) - nenhuma chave aparece no log)"
 
-      - name: 🤖 Subir o bot
+      # ======================================================================
+      #  FASE 2 — TROCA DE BASTÃO (a antiga só sai depois que esta está pronta)
+      # ======================================================================
+      - name: 🚦 Pronto para assumir (esperar a máquina antiga sair limpa)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          . "$env:GITHUB_WORKSPACE\bastao_helpers.ps1"
+          $meu = [long]$env:GITHUB_RUN_ID
+          try {
+            $outras = @(FF-RunsAtivas)
+          } catch {
+            $outras = @()
+          }
+          Write-Host "Máquina(s) no ar antes de mim: $($outras.Count)"
+
+          # Regra de ouro: a run MAIS NOVA tem prioridade. Se já existe uma run mais
+          # nova em execução, esta aqui é descartada (nunca dois bots ao mesmo tempo).
+          $maisNova = FF-RunMaisNova
+          if ($maisNova) {
+            Write-Host "A run mais nova ($($maisNova.id)) tem prioridade. Esta run encerra sem subir o bot."
+            Write-Host "::notice title=Run dispensada::A run $($maisNova.id) assumiu a frente."
+            "FF_ASSUMIU=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            exit 0
+          }
+
+          # Espera as runs antigas saírem: elas percebem a minha presença em ~2s,
+          # salvam no Supabase, saem do Tailscale e terminam (até 180s de teto).
+          $limite = (Get-Date).AddSeconds(180)
+          $ultimoAviso = Get-Date
+          while ((Get-Date) -lt $limite) {
+            $maisNova = FF-RunMaisNova
+            if ($maisNova) {
+              Write-Host "A run mais nova ($($maisNova.id)) apareceu durante a espera. Encerrando esta run."
+              Write-Host "::notice title=Run dispensada::A run $($maisNova.id) assumiu a frente."
+              "FF_ASSUMIU=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              exit 0
+            }
+            $restantes = @(FF-RunsAtivas)
+            if ($restantes.Count -eq 0) { break }
+            if (((Get-Date) - $ultimoAviso).TotalSeconds -ge 20) {
+              Write-Host ("[{0:HH:mm:ss}] aguardando encerramento limpo: {1} run(s) antiga(s) ainda ativa(s)..." -f (Get-Date), $restantes.Count)
+              $ultimoAviso = Get-Date
+            }
+            Start-Sleep -Seconds 2
+          }
+
+          # Sobrou alguma máquina travada? Cancela (o bot salva no Supabase a cada 30s).
+          $travadas = @(FF-RunsAtivas | Where-Object { [long]$_.id -lt $meu })
+          foreach ($r in $travadas) {
+            Write-Host ("Máquina antiga não encerrou no prazo (run {0}). Cancelando para liberar o hostname." -f $r.id)
+            [void](FF-CancelarRun([long]$r.id))
+          }
+          if ($travadas.Count -gt 0) { Start-Sleep -Seconds 15 }
+
+          "FF_ASSUMIU=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Assumindo agora (janela offline de poucos segundos)."
+
+      # ======================================================================
+      #  FASE 3 — ASSUMIR: Tailscale com hostname limpo + bot no ar
+      # ======================================================================
+      - name: 🌐 Entrar no Tailscale (hostname limpo) e subir o bot
+        if: env.FF_ASSUMIU == '1'
         shell: pwsh
         run: |
+          Set-Location $env:GITHUB_WORKSPACE
+          & 'C:\Program Files\Tailscale\tailscale.exe' up --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" --hostname=fireforce-rdp --unattended --accept-routes
+          $ip = (& 'C:\Program Files\Tailscale\tailscale.exe' ip -4) | Select-Object -First 1
+          Write-Host "------------------------------------------------------"
+          Write-Host "  Windows App -> fireforce-rdp   (ou $ip)"
+          Write-Host "  Usuario: runneradmin           Senha: RDP_SENHA"
+          Write-Host "------------------------------------------------------"
           powershell -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\iniciar_bot.ps1"
           Start-Sleep -Seconds 12
           Write-Host "--- vigia.log ---"
           if (Test-Path .\vigia.log) { Get-Content .\vigia.log -Tail 20 }
 
-      # ------------------------------------------------- MANTER VIVA ----------
-      - name: 🕒 Manter a máquina viva (até o limite de 6h)
+      # ======================================================================
+      #  FASE 4 — MANTER VIVA + ENTREGAR O BASTÃO QUANDO A PRÓXIMA CHEGAR
+      # ======================================================================
+      - name: 🕒 Manter a máquina viva (e sair limpo quando a próxima chegar)
+        if: env.FF_ASSUMIU == '1'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $fim = (Get-Date).AddMinutes(350)     # 5h50: termina ANTES do corte de 6h
-          while ((Get-Date) -lt $fim) {
-            Start-Sleep -Seconds 300
+          . "$env:GITHUB_WORKSPACE\bastao_helpers.ps1"
+          $meu = [long]$env:GITHUB_RUN_ID
+          $fim = (Get-Date).AddMinutes(350)           # 5h50: termina ANTES do corte de 6h
+          $avisoFallback = (Get-Date).AddMinutes(338) # 5h38: dispara a próxima se ninguém veio
+          $fallbackFeito = $false
+          $ultimoLog = Get-Date
+          $ultimoPoll = (Get-Date).AddSeconds(-30)
+
+          function EncerrarLimpo([string]$motivo) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Encerrando de forma limpa: $motivo"
+            Write-Host "Sinalizando para o bot salvar 100% do estado no Supabase..."
+            Set-Content -Path "$env:GITHUB_WORKSPACE\_encerrar_ciclo.flag" -Value "1" -Encoding UTF8
+            for ($i = 0; $i -lt 20; $i++) {
+              $ainda = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+                       Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
+              if (-not $ainda) { break }
+              Start-Sleep -Seconds 1
+            }
+            Remove-Item "$env:GITHUB_WORKSPACE\_encerrar_ciclo.flag" -Force -ErrorAction SilentlyContinue
+            # Solta o hostname fireforce-rdp para a máquina nova entrar limpa.
+            try { & 'C:\Program Files\Tailscale\tailscale.exe' logout } catch {}
+            Write-Host "Estado salvo, Tailscale desconectado. A próxima máquina pode assumir."
+          }
+
+          while ($true) {
+            $agora = Get-Date
+
+            # (a) apareceu uma run MAIS NOVA? então é hora de sair limpo.
+            # Poll de 8s no dia a dia e de 2s nos últimos 12 minutos (perto do
+            # fallback), para o bastão ser percebido em ~2s sem estourar o
+            # limite de requisições da API do GitHub.
+            $retaFinal = ((Get-Date) -ge $avisoFallback)
+            $intervaloPoll = if ($retaFinal) { 2 } else { 8 }
+            if (($agora - $ultimoPoll).TotalSeconds -ge $intervaloPoll) {
+              $ultimoPoll = $agora
+              $maisNova = $null
+              try { $maisNova = FF-RunMaisNova } catch { $maisNova = $null }
+              if ($maisNova) {
+                EncerrarLimpo "máquina nova (run $($maisNova.id)) chegou para assumir"
+                break
+              }
+            }
+
+            # (b) fim da janela de 5h50
+            if ($agora -ge $fim) {
+              EncerrarLimpo "janela de 5h50 concluída"
+              Write-Host "Disparando a próxima máquina para não ficar sem bot..."
+              [void](FF-DispararProxima)
+              break
+            }
+
+            # (c) fallback: ninguém apareceu até 5h38 -> pede a próxima máquina agora
+            if (-not $fallbackFeito -and $agora -ge $avisoFallback) {
+              Write-Host "[$(Get-Date -Format 'HH:mm')] fallback: disparando a próxima máquina (pré-aquecimento em paralelo)."
+              [void](FF-DispararProxima)
+              $fallbackFeito = $true
+            }
+
+            # (d) vigia do bot
             $proc = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
                     Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
             if (-not $proc) {
@@ -234,19 +425,13 @@ jobs:
               $proc = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
                       Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
             }
-            $resta = [int](($fim - (Get-Date)).TotalMinutes)
-            Write-Host "[$(Get-Date -Format 'HH:mm')] bot: $(if ($proc) { 'NO AR (PID ' + ($proc.ProcessId -join ',') + ')' } else { 'PARADO' }) | faltam $resta min"
+            if (((Get-Date) - $ultimoLog).TotalSeconds -ge 60) {
+              $resta = [int](($fim - (Get-Date)).TotalMinutes)
+              Write-Host "[$(Get-Date -Format 'HH:mm')] bot: $(if ($proc) { 'NO AR (PID ' + ($proc.ProcessId -join ',') + ')' } else { 'PARADO' }) | faltam $resta min"
+              $ultimoLog = Get-Date
+            }
+            Start-Sleep -Seconds 1   # o poll acima controla o ritmo real das consultas
           }
-          Write-Host "Sinalizando encerramento limpo para o bot salvar 100% do estado no Supabase antes de desligar..."
-          Set-Content -Path "$env:GITHUB_WORKSPACE\_encerrar_ciclo.flag" -Value "1" -Encoding UTF8
-          for ($i = 0; $i -lt 20; $i++) {
-            $ainda = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
-                     Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
-            if (-not $ainda) { break }
-            Start-Sleep -Seconds 1
-          }
-          Remove-Item "$env:GITHUB_WORKSPACE\_encerrar_ciclo.flag" -Force -ErrorAction SilentlyContinue
-          Write-Host "Fim do ciclo limpo! O estado ja esta salvo no Supabase e o proximo run da fila assume."
 
       - name: 📄 Resumo e últimas linhas do log
         if: always()
