@@ -11,6 +11,17 @@
 #     - cria os atalhos na area de trabalho (Ligar / Reiniciar / Status)
 #     - mantem a maquina viva e se relanca a cada 5h (cron)
 #
+#  COMO O CICLO E FECHADO (sem buraco e sem run cancelada):
+#     - o cron cria uma run as 00h07, 05h07, 10h07, 15h07 e 20h07 (UTC).
+#       O minuto 7 foge da hora cheia, onde o GitHub mais atrasa agendamento.
+#     - cada run fica no ar ate 10 min DEPOIS do proximo horario desses, nunca
+#       "350 min depois que eu comecei". Assim o ciclo tem tamanho fixo, sempre
+#       do mesmo tamanho, e a fila nunca desalinha.
+#     - com o ciclo alinhado, a run que espera na fila e sempre a SEGUINTE -
+#       por isso o GitHub nunca cancela uma run agendada (era 15% antes).
+#     - os 10 min de margem existem para a maquina nova ja estar na fila quando
+#       esta sai: no instante em que ela larga, a proxima entra e assume.
+#
 #  Voce NAO precisa subir nenhum .ps1 ou .bat: a maquina cria os arquivos.
 #  No repositorio ficam apenas 2 arquivos:
 #     fireforce_bot.py
@@ -24,24 +35,48 @@ name: Fire Force (RDP + Bot)
 on:
   workflow_dispatch:            # seu botao de sempre: Run workflow
   schedule:
-    - cron: "0 */5 * * *"       # relanca a cada 5h -> emenda sem buraco
+    # Minuto 7 (e nao 0): o GitHub atrasa cron agendado na hora cheia, que e o
+    # horario de pico. A documentacao deles recomenda justamente fugir da hora
+    # cheia. O ciclo fica: 07min, 5h07, 10h07, 15h07, 20h07 (UTC).
+    - cron: "7 */5 * * *"       # 1 maquina sempre esperando na fila
 
 # UMA maquina por vez: o proximo run fica na fila e entra no lugar do antigo.
 # NUNCA rode duas ao mesmo tempo (o mesmo PIX contaria 2x e brigariam pelo token).
+# A fila segura 1 run pendente e a mantem ali ate a maquina atual sair - e essa
+# run pendente que garante cobertura continua entre um ciclo e o seguinte.
 concurrency:
   group: fireforce-bot
   cancel-in-progress: false
 
 env:
   SYNC_SEGUNDOS: "30"           # a maquina morre de repente: salva no Supabase mais seguido
+  # Horas em que o cron acima dispara (UTC). Se mudar o cron, mude AQUI também:
+  # é a lista que o step "Manter a máquina viva" usa para saber quando o ciclo acaba.
+  FF_HORAS_CRON: "0,5,10,15,20"
+  FF_MINUTO_CRON: "7"
+  FF_MARGEM_MIN: "10"           # a maquina antiga espera o sucessor entrar na fila
 
 jobs:
   maquina:
     runs-on: windows-latest
-    timeout-minutes: 360        # LIMITE DO GITHUB: 6h. O loop interno para antes (5h50).
+    timeout-minutes: 360        # LIMITE DO GITHUB: 6h. O loop interno sai no maximo em 5h50.
     steps:
       - name: 📥 Baixar o código
         uses: actions/checkout@v4
+
+      - name: ⏱️ Anotar o início deste ciclo
+        shell: pwsh
+        run: |
+          # Carimba o início do run. Serve para duas coisas:
+          #   1) a trava de segurança saber quanto ainda cabe nas 6h do GitHub
+          #      (o limite conta da criação do run, não de onde os steps começam);
+          #   2) ficar registrado no log quando este ciclo começou.
+          # O fim do ciclo NÃO é "X minutos depois daqui": é um horário do relógio
+          # (ver step "Manter a máquina viva").
+          $agora = (Get-Date).ToUniversalTime()
+          $agora.ToString('o') | Set-Content -Path "$env:GITHUB_WORKSPACE\ff_inicio_ciclo.txt" -Encoding UTF8
+          Write-Host "Início deste ciclo: $($agora.ToString('dd/MM/yyyy HH:mm:ss')) UTC"
+          Write-Host "Horários do ciclo (UTC): $env:FF_HORAS_CRON"
 
       # ---------------------------------------------------------------- RDP ---
       - name: 🖥️ Preparar o RDP (usuário runneradmin + senha do segredo)
@@ -219,12 +254,78 @@ jobs:
           Write-Host "--- vigia.log ---"
           if (Test-Path .\vigia.log) { Get-Content .\vigia.log -Tail 20 }
 
-      # ------------------------------------------------- MANTER VIVA ----------
-      - name: 🕒 Manter a máquina viva (até o limite de 6h)
+      # ------------------------------------------------ MANTER VIVA ------------
+      # O ciclo termina SEMPRE num horário do relógio (07min, 05h07, 10h07, 15h07
+      # ou 20h07 UTC, mais 10 min de margem) e não "X minutos depois de eu
+      # começar". É isso que mantém todo ciclo do mesmo tamanho: a fila nunca
+      # desalinha, o GitHub nunca cancela run agendada e sempre existe uma
+      # máquina pronta na fila no momento em que esta termina.
+      - name: 🕒 Manter a máquina viva (até o próximo horário do ciclo)
         shell: pwsh
         run: |
-          $fim = (Get-Date).AddMinutes(350)     # 5h50: termina ANTES do corte de 6h
-          while ((Get-Date) -lt $fim) {
+          # ------------------------------------------------------- quando termina ---
+          $agora = (Get-Date).ToUniversalTime()
+          $horas = @($env:FF_HORAS_CRON.Split(',') | ForEach-Object { [int]$_.Trim() } | Sort-Object)
+          if ($horas.Count -eq 0) { $horas = @(0,5,10,15,20) }
+          $minuto = 7
+          if ($env:FF_MINUTO_CRON) { $minuto = [int]$env:FF_MINUTO_CRON }
+
+          # Todos os disparos do cron (hoje e amanhã, para não errar de madrugada).
+          $disparos = @()
+          foreach ($dia in 0, 1) {
+            foreach ($h in $horas) {
+              $disparos += [datetime]::new($agora.Year, $agora.Month, $agora.Day, $h, $minuto, 0, [System.DateTimeKind]::Utc).AddDays($dia)
+            }
+          }
+          $disparos = @($disparos | Sort-Object)
+
+          # O fim do MEU ciclo é o próximo disparo que ainda não passou. Se eu já
+          # comecei DEPOIS dele (o GitHub atrasou o cron), ele não me serve: o
+          # alvo já existe e a fila está alinhada, então eu sigo para o seguinte.
+          $alvo = $disparos | Where-Object { $_ -gt $agora } | Select-Object -First 1
+          if (-not $alvo) { $alvo = $agora.AddHours(5) }
+
+          # Fico mais MARGEM depois do disparo. Por quê: a máquina nova é criada
+          # no horário do cron mas só pode começar quando eu sair. Segurando
+          # alguns minutos, ela já está na fila esperando - então no instante em
+          # que eu saio ela começa, em vez de o bot ficar parado até ela nascer.
+          # Isso também cobre atraso do GitHub em disparar o cron.
+          $margem = 10
+          if ($env:FF_MARGEM_MIN) { $margem = [int]$env:FF_MARGEM_MIN }
+          $alvo = $alvo.AddMinutes($margem)
+
+          # Se o próximo disparo está a menos de 1 minuto, ele já é a máquina de
+          # agora (acabei de nascer nele): o meu fim é o disparo SEGUINTE.
+          if (($alvo - $agora).TotalMinutes -lt 1) {
+            $seguinte = $disparos | Where-Object { $_ -gt $alvo } | Select-Object -First 1
+            if ($seguinte) { $alvo = $seguinte.AddMinutes($margem) }
+          }
+
+          # Trava de segurança: o limite do GitHub é 6h de run e ele conta desde
+          # a CRIAÇÃO do run - não desde este step. Por isso o teto sai do carimbo
+          # gravado logo após o checkout, não do "agora".
+          $inicioDaRun = $agora
+          $carimbo = "$env:GITHUB_WORKSPACE\ff_inicio_ciclo.txt"
+          if (Test-Path $carimbo) {
+            try { $inicioDaRun = [datetime]::Parse((Get-Content $carimbo -Raw).Trim()).ToUniversalTime() } catch { }
+          }
+          $teto = $inicioDaRun.AddMinutes(350)   # 5h50 do run: 10 min de folga p/ o corte de 6h
+          if ($alvo -gt $teto) {
+            Write-Host "AVISO: o alvo seria $($alvo.ToString('HH:mm')) UTC, além do limite seguro. Ficando até o teto de 5h50."
+            $alvo = $teto
+          }
+
+
+          $duracao = [int](($alvo - $agora).TotalMinutes)
+          Write-Host "======================================================"
+          Write-Host ("  BOT NO AR ATE: {0:dd/MM HH:mm} UTC  ({1} horas e {2} min)" -f $alvo, [int][math]::Floor($duracao/60), ($duracao % 60))
+          Write-Host "======================================================"
+          if ($duracao -lt 60) {
+            Write-Host "  (Esta e a primeira maquina, ligada na mao. Ela passa o bastao para a automatica no horario acima.)"
+          }
+
+          # ------------------------------------------------------------- laço -------
+          while ((Get-Date).ToUniversalTime() -lt $alvo) {
             Start-Sleep -Seconds 300
             $proc = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
                     Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
@@ -234,19 +335,30 @@ jobs:
               $proc = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
                       Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
             }
-            $resta = [int](($fim - (Get-Date)).TotalMinutes)
+            $resta = [int](($alvo - (Get-Date).ToUniversalTime()).TotalMinutes)
             Write-Host "[$(Get-Date -Format 'HH:mm')] bot: $(if ($proc) { 'NO AR (PID ' + ($proc.ProcessId -join ',') + ')' } else { 'PARADO' }) | faltam $resta min"
           }
+
+          # -------------------------------------------------- encerramento limpo ---
+          # O bot salva TUDO no Supabase e fecha; a próxima run já está na fila
+          # pronta para assumir. (O loop_sync salva a cada 30s o tempo todo, então
+          # o estado nunca depende só deste momento.)
           Write-Host "Sinalizando encerramento limpo para o bot salvar 100% do estado no Supabase antes de desligar..."
           Set-Content -Path "$env:GITHUB_WORKSPACE\_encerrar_ciclo.flag" -Value "1" -Encoding UTF8
+          $saiu = $false
           for ($i = 0; $i -lt 20; $i++) {
             $ainda = Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
                      Where-Object { $_.CommandLine -like "*fireforce_bot.py*" }
-            if (-not $ainda) { break }
+            if (-not $ainda) { $saiu = $true; break }
             Start-Sleep -Seconds 1
           }
           Remove-Item "$env:GITHUB_WORKSPACE\_encerrar_ciclo.flag" -Force -ErrorAction SilentlyContinue
-          Write-Host "Fim do ciclo limpo! O estado ja esta salvo no Supabase e o proximo run da fila assume."
+
+          if ($saiu) {
+            Write-Host "Fim do ciclo limpo! Estado salvo no Supabase e o próximo run da fila assume."
+          } else {
+            Write-Host "O bot demorou a fechar, mas o estado já estava salvo (sync de 30s). Liberando a máquina."
+          }
 
       - name: 📄 Resumo e últimas linhas do log
         if: always()
