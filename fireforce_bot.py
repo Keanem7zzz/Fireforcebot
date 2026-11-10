@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════
-#  🔥 FIRE FORCE — BOT PREMIUM v13.5 (BLINDADO & AUTO-UPDATE)
+#  🔥 FIRE FORCE — BOT PREMIUM v13.7 (BLINDADO & AUTO-UPDATE)
 #  Liga Oficial de Diários Free Fire
 #
 #  • Consulta de ID do Free Fire OB55 multi-provedor + cache + Avatar/Clã
