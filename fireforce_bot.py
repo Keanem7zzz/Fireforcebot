@@ -12927,12 +12927,12 @@ async def aprovar_pagamento(guild, slot_id: int, staff_id: Optional[int] = None,
     if comprador:
         try:
             await add_jogador_canal_tabela(guild, slot["horario_id"], comprador)
-        except Exception:
-            pass
+        except Exception as erro_fin:
+            _log_arquivo(f"[FINANCEIRO] {type(erro_fin).__name__}: {erro_fin}")
     try:
         await atualizar_tabela(guild, slot["horario_id"])
-    except Exception:
-        pass
+    except Exception as erro_fin:
+        _log_arquivo(f"[FINANCEIRO] {type(erro_fin).__name__}: {erro_fin}")
     await rebuild_painel(guild, horario["painel_id"])
 
     await pos_aprovacao(guild, slot, horario, staff_id=staff_id, origem=origem)
@@ -12953,8 +12953,8 @@ async def aprovar_pagamento(guild, slot_id: int, staff_id: Optional[int] = None,
                 "Esmeralda",
             )
             await canal_pag.send(content=mencao(slot["comprador_id"]), embed=embed)
-    except Exception:
-        pass
+    except Exception as erro_fin:
+        _log_arquivo(f"[FINANCEIRO] {type(erro_fin).__name__}: {erro_fin}")
 
     await _notificar_dm_e_agendar_fechamento_pag(
         guild=guild,
@@ -13438,8 +13438,8 @@ async def abrir_ticket_saque(guild, solicitante, saque_id: int):
     except Exception:
         try:
             await canal.delete()
-        except Exception:
-            pass
+        except Exception as erro_fin:
+            _log_arquivo(f"[FINANCEIRO] {type(erro_fin).__name__}: {erro_fin}")
         async with aiosqlite.connect(DATABASE_FILE) as db:
             await db.execute("UPDATE saques SET canal_ticket_id=NULL,msg_ticket_id=NULL WHERE id=?", (saque_id,))
             await db.commit()
@@ -13811,8 +13811,8 @@ async def concluir_saque(saque_id: int, staff_id: Optional[int] = None, motivo: 
                     "Esmeralda"
                 )
                 await canal.send(content=mencao(saque["user_id"]), embed=embed)
-        except Exception:
-            pass
+        except Exception as erro_fin:
+            _log_arquivo(f"[FINANCEIRO] {type(erro_fin).__name__}: {erro_fin}")
         quem = f" por {mencao(staff_id)}" if staff_id else ""
         de_trabalho = (saque["tipo"] or "jogador") == "trabalho"
         atual = (await saldo_trabalho(saque["user_id"], guild.id) if de_trabalho
@@ -16323,8 +16323,8 @@ async def anunciar_pagamento_equipe(guild, staff_id: int, titulo: str, descricao
                 extra = (f"\n\n> 🎫 Tickets avaliados hoje: **{dia['n'] or 0}**"
                          f"\n> ⭐ Média desta semana: **{float(sem['media'] or 0):.2f}/5** ({sem['n'] or 0} avaliações)"
                          f"\n> 💼 Total disponível na carteira: **{formatar_moeda(saldo)}**")
-            except Exception:
-                pass
+            except Exception as erro_fin:
+                _log_arquivo(f"[FINANCEIRO] {type(erro_fin).__name__}: {erro_fin}")
         else:
             try:
                 async with aiosqlite.connect(DATABASE_FILE) as db:
@@ -16449,8 +16449,8 @@ async def avisar_abandono_saldo(guild) -> int:
                     "considera **abandono de saldo**: o valor vira da **Org** e sai da carteira.\n\n"
                     "**Suporte ainda com saldo:**\n" + "\n".join(linhas) +
                     "\n\n> 💸 Pedir saque: painel **Carteira** → **Carteira de trabalho** → **Solicitar saque**.", "Vermelho"))
-        except Exception:
-            pass
+        except Exception as erro_fin:
+            _log_arquivo(f"[FINANCEIRO] {type(erro_fin).__name__}: {erro_fin}")
     await registrar_log(
         guild, "⏰ PRAZO", "⏰ Última chamada para sacar o salário (Suporte)",
         "Prazo: até **01:00 (Brasília)**. Depois disso o saldo vira **abandono de saldo** (fica com a Org).\n"
@@ -18788,7 +18788,8 @@ async def creditar_deposito(guild, deposito, origem: str, livepix_id: str = ""):
                 f"Seu saldo de **{formatar_moeda(valor)}** caiu na carteira.\n> 💰 Saldo agora: `{formatar_moeda(novo)}`\n> 🎮 Já pode usar pra pagar o diário! Este canal fecha em {DEPOSITO_FECHAR_SEGUNDOS}s.","Esmeralda"))
             await asyncio.sleep(DEPOSITO_FECHAR_SEGUNDOS)
             await _apagar_canal_seguro(canal, f"Depósito #{deposito['id']} confirmado")
-        except Exception:pass
+        except Exception as erro_fin:
+            _log_arquivo(f"[FINANCEIRO] {type(erro_fin).__name__}: {erro_fin}")
     return novo
 
 
@@ -23373,7 +23374,7 @@ async def publicar_caca_influenciador_vaga(
         )
 
         embed = criar_embed(
-            f"🎬 CAÇA AOS INFLUENCIADORES • LIVE CONFIRMADA",
+            "🎬 CAÇA AOS INFLUENCIADORES • LIVE CONFIRMADA",
             descricao,
             "Vermelho",
             thumb=(membro.display_avatar.url if membro else None),
@@ -23674,19 +23675,19 @@ async def _inf_aplicar_cargo(guild: discord.Guild, user_id: int) -> str:
         cfg = await obter_config(guild.id)
         cargo_id = cfg.get("cargo_influencer")
         if not cargo_id:
-            return "`cargo_influencer não configurado`"
+            return "⚠️ **Cargo não configurado** — peça a um Dono/Gerente: `/influenciador` ➜ Configurar ➜ Cargo de Influenciador"
         cargo = guild.get_role(int(cargo_id))
         if not cargo:
-            return "`cargo de influenciador não encontrado no servidor`"
+            return "⚠️ **Cargo configurado, mas não existe mais no servidor** — reconfigure em `/influenciador` ➜ Configurar"
         membro = await membro_do_guild(guild, int(user_id))
         if not membro:
-            return "`membro não encontrado no servidor`"
+            return "⚠️ **Membro não está mais no servidor**"
         if cargo not in membro.roles:
             await membro.add_roles(cargo, reason="Candidatura de Influenciador aprovada")
         return cargo.mention
     except Exception as erro:
         _log_arquivo(f"[INFLUENCER] cargo user={user_id}: {type(erro).__name__}: {erro}")
-        return "`falha ao entregar o cargo`"
+        return "⚠️ **Falha ao entregar o cargo** — a permissão do bot precisa ficar ACIMA do cargo de influenciador"
 
 
 async def aprovar_influenciador(guild: discord.Guild, user_id: int, staff_id: int) -> tuple:
@@ -24234,7 +24235,7 @@ class InfluenciadorHubListaView(discord.ui.View):
     """Lista paginada (20 por página) + ações de comissão e ajuste de taxa."""
 
     def __init__(self, pagina: int = 1, busca: str = "", autor_id: int = 0):
-        super().__init__(timeout=600)
+        super().__init__(timeout=900)
         self.pagina = max(1, int(pagina))
         self.busca = str(busca or "")
         self.autor_id = int(autor_id)
@@ -24414,7 +24415,7 @@ class InfluenciadorFichaAdminView(discord.ui.View):
     """Ações rápidas sobre UM influenciador: pagar comissão, ajustar taxa, revalidar."""
 
     def __init__(self, dados: dict, pagina: int = 1, busca: str = "", autor_id: int = 0):
-        super().__init__(timeout=600)
+        super().__init__(timeout=900)
         self.dados = dict(dados or {})
         self.pagina = int(pagina)
         self.busca = str(busca or "")
@@ -24567,7 +24568,7 @@ class InfluenciadorConfirmarComissaoView(discord.ui.View):
     """Passo 2: confirmar com taxa padrão ou abrir modal de taxa personalizada."""
 
     def __init__(self, dados: dict, convites: int, taxa: float, ciclo: str, autor_id: int):
-        super().__init__(timeout=600)
+        super().__init__(timeout=900)
         self.dados = dict(dados or {})
         self.convites = int(convites)
         self.taxa = arredondar(taxa)
@@ -24821,7 +24822,7 @@ class InfluenciadorConfigView(discord.ui.View):
     """Painel de configuração do programa (somente Dono & Gerente)."""
 
     def __init__(self, autor_id: int = 0):
-        super().__init__(timeout=600)
+        super().__init__(timeout=900)
         self.autor_id = int(autor_id)
 
         seletor = discord.ui.Select(
@@ -25068,7 +25069,6 @@ class InfluenciadorConfigValorModal(discord.ui.Modal, title="⚙️ Valor por Co
             )
         await salvar_config(interaction.guild.id, inf_valor_convite=valor)
         marcar_sujo()
-        cfg = await obter_config(interaction.guild.id)
         await interaction.response.send_message(
             embed=criar_embed(
                 "✅ Valor atualizado",
@@ -25077,10 +25077,7 @@ class InfluenciadorConfigValorModal(discord.ui.Modal, title="⚙️ Valor por Co
             ),
             ephemeral=True,
         )
-        await interaction.channel.send(
-            embed=await _montar_embed_config_influencer(interaction.guild, cfg),
-            view=InfluenciadorConfigView(interaction.user.id),
-        )
+        # painel de config é efêmero: não publica cópia no canal
 
 
 class InfluenciadorConfigRequisitosModal(discord.ui.Modal, title="⚙️ Requisitos Mínimos"):
@@ -25108,15 +25105,11 @@ class InfluenciadorConfigRequisitosModal(discord.ui.Modal, title="⚙️ Requisi
         dados["inf_req_extra"] = str(self.extra.value or "").strip()[:300]
         await salvar_config(interaction.guild.id, **dados)
         marcar_sujo()
-        cfg = await obter_config(interaction.guild.id)
         await interaction.response.send_message(
             embed=criar_embed("✅ Requisitos atualizados", "Mínimos por rede salvos com sucesso.", "Esmeralda"),
             ephemeral=True,
         )
-        await interaction.channel.send(
-            embed=await _montar_embed_config_influencer(interaction.guild, cfg),
-            view=InfluenciadorConfigView(interaction.user.id),
-        )
+        # painel de config é efêmero: não publica cópia no canal
 
 
 # ---------- autoatendimento do influenciador aprovado ----------
@@ -25276,7 +25269,7 @@ class InfluenciadorMembroView(discord.ui.View):
     """Painel do influenciador aprovado: atualizar redes e avisar live."""
 
     def __init__(self, dados: dict):
-        super().__init__(timeout=600)
+        super().__init__(timeout=900)
         self.dados = dict(dados or {})
         seletor = discord.ui.Select(
             placeholder="🎬 O que você quer fazer agora?",
