@@ -1,14 +1,16 @@
 # ══════════════════════════════════════════════════════════════
-#  🔥 FIRE FORCE — BOT PREMIUM v13.8.0 (BLINDADO & AUTO-UPDATE)
+#  🔥 FIRE FORCE — BOT PREMIUM v13.8.1 (BLINDADO & AUTO-UPDATE)
 #  Liga Oficial de Diários Free Fire
 #
 #  • Consulta de ID do Free Fire OB55 multi-provedor + cache + Avatar/Clã
 #  • Tabelas Oficiais HD, Card de Perfil HD, Card de Booyah HD (Vermelho Escuro & Preto)
 #  • Finalização de Diário em 2 Etapas (Premiação por Kill + Ticket de Recebimento)
 #  • Carteira Minimalista Privada, PIX Direto ao ADM, Vaga VIP e Carteira do Suporte
-#  • Sistema de Influenciadores: painel "Virar Influenciador" + ticket privado de avaliação,
-#    comissão por convite editável (padrão e personalizada), card HD de Live confirmada
-#    no canal de Caça aos Influenciadores e cargos entregues automaticamente na aprovação
+#  • Sistema de Influenciadores: painel público com BANNER HD "Seja um Influenciador" + ticket
+#    privado de avaliação, carteirinha HD do influenciador no autoatendimento, comissão por convite
+#    editável (padrão e personalizada), pagamento 100% transacional, card HD de Live confirmada
+#    no canal de Caça aos Influenciadores, cargo entregue automaticamente na aprovação e
+#    configuração por seletores nativos (cargo/canal) — sem IDs digitados
 #  • Auto-Update em segundo plano (60s) sem desligar a máquina + Encerramento Limpo de Ciclo
 #  • Blindagem Anti-Falhas: SQLite WAL + busy_timeout global, Escudo Global de Views/Modals,
 #    Roteador Dinâmico de Componentes Persistentes e Trava Anti-Wipe no Supabase
@@ -94,7 +96,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.8.0"
+VERSAO_BOT = "13.8.1"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -21574,7 +21576,7 @@ async def cmd_divulgacao(interaction: discord.Interaction):
 #  🎬 SISTEMA DE INFLUENCIADORES & CAÇA AOS INFLUENCIADORES (v13.8.0)
 #  • Resolução em tempo real de YouTube, Instagram e TikTok (sem Kwai)
 #  • Card HD "Dark Red & Black" com as redes na ordem YouTube ➜ Instagram ➜ TikTok
-#  • Painel público "Virar Influenciador" + ticket de avaliação privado
+#  • Painel público "Seja um Influenciador" (banner HD) + ticket de avaliação privado
 #  • /influenciador: Admin Hub (200+ em páginas de 20) e Autoatendimento
 # ══════════════════════════════════════════════════════════════
 
@@ -22774,6 +22776,484 @@ def renderizar_card_caca_influencer_png(
     return buffer.getvalue()
 
 
+def renderizar_banner_influenciador_png(
+    *,
+    valor_convite: float,
+    ciclo: str,
+    req_yt: int = 500,
+    req_ig: int = 1000,
+    req_tt: int = 1000,
+) -> bytes:
+    """Banner HD (Dark Red & Black) do painel público 'Seja um Influenciador'.
+
+    Renderizado 2x e reduzido para nitidez (mesmo padrão da Tabela/Booyah/Perfil).
+    """
+    W, H = 3360, 1650
+    ciclo_up = "PAGO TODO DIA" if str(ciclo or "").strip().lower() == "dia" else "PAGO TODA SEMANA"
+
+    card = _card_gradiente_vertical(W, H, (19, 7, 10, 255), (5, 4, 5, 255))
+    _card_glow_radial_local(card, W // 2, 250, 1750, 640, (196, 22, 38), 118)
+    _card_glow_radial_local(card, 170, H - 200, 720, 480, (128, 10, 22), 70)
+    _card_glow_radial_local(card, W - 170, H - 200, 720, 480, (128, 10, 22), 70)
+
+    camada = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(camada)
+
+    for k in range(-H, W + H, 148):
+        d.line([(k, 0), (k - H, H)], fill=(210, 32, 48, 10), width=4)
+
+    d.rounded_rectangle((44, 44, W - 45, H - 45), radius=64, outline=(146, 24, 36, 220), width=8)
+    d.rounded_rectangle((68, 68, W - 69, H - 69), radius=48, outline=(58, 18, 24, 180), width=4)
+    d.rounded_rectangle((W // 2 - 620, 40, W // 2 + 620, 58), radius=8, fill=(228, 38, 54, 255))
+
+    # Cabeçalho de marca
+    _card_chama_ff(d, 220, 208, 58)
+    f_brand = _card_carregar_fonte("black", 88)
+    f_brand_sub = _card_carregar_fonte("bold", 40)
+    d.text((312, 172), "FIRE FORCE", font=f_brand, fill=(248, 242, 244, 255))
+    w_brand = d.textlength("FIRE FORCE", font=f_brand)
+    d.text((318 + w_brand + 36, 196), "// PROGRAMA OFICIAL", font=f_brand_sub, fill=(178, 58, 66, 240))
+
+    f_kicker = _card_carregar_fonte("bold", 46)
+    d.text(
+        (W // 2, 336),
+        _card_limpar_texto("FIRE FORCE OFICIAL   •   PROGRAMA DE INFLUENCIADORES", f_kicker,
+                           fallback="FIRE FORCE OFICIAL • PROGRAMA DE INFLUENCIADORES", remover_simbolos=True),
+        font=f_kicker, fill=(228, 92, 104, 248), anchor="mm",
+    )
+
+    f_titulo = _card_carregar_fonte("black", 218)
+    titulo = _card_limpar_texto("SEJA UM INFLUENCIADOR", f_titulo, fallback="SEJA UM INFLUENCIADOR", remover_simbolos=True)
+    larg_titulo = d.textlength(titulo, font=f_titulo)
+    if larg_titulo > W - 240:
+        f_titulo = _card_carregar_fonte("black", int(218 * (W - 240) / larg_titulo))
+        titulo = _card_limpar_texto("SEJA UM INFLUENCIADOR", f_titulo, fallback="SEJA UM INFLUENCIADOR", remover_simbolos=True)
+    d.text((W // 2 + 6, 482), titulo, font=f_titulo, fill=(140, 14, 26, 220), anchor="mm")
+    d.text((W // 2, 476), titulo, font=f_titulo, fill=(250, 246, 247, 255), anchor="mm")
+
+    f_sub = _card_carregar_fonte("bold", 44)
+    d.text(
+        (W // 2, 618),
+        _card_limpar_texto("SUA AUDIÊNCIA GERA RENDA DENTRO DA ARENA", f_sub,
+                           fallback="SUA AUDIENCIA GERA RENDA DENTRO DA ARENA", remover_simbolos=True),
+        font=f_sub, fill=(206, 128, 138, 248), anchor="mm",
+    )
+
+    # Divisor com diamante
+    dy_div = 682
+    d.line([(330, dy_div), (W // 2 - 60, dy_div)], fill=(108, 10, 18, 255), width=5)
+    d.line([(W // 2 + 60, dy_div), (W - 330, dy_div)], fill=(108, 10, 18, 255), width=5)
+    d.polygon([(W // 2, dy_div - 20), (W // 2 + 20, dy_div), (W // 2, dy_div + 20), (W // 2 - 20, dy_div)],
+              fill=(192, 14, 24, 255))
+
+    # Bloco central: comissão por convite
+    f_lbl_comis = _card_carregar_fonte("bold", 37)
+    d.text((W // 2, 762), "COMISSÃO POR CONVITE VALIDADO", font=f_lbl_comis, fill=(228, 92, 104, 248), anchor="mm")
+
+    valor_txt = formatar_moeda(valor_convite)
+    f_valor = _card_carregar_fonte("black", 236)
+    d.text((W // 2 + 5, 962), valor_txt, font=f_valor, fill=(140, 14, 26, 220), anchor="mm")
+    d.text((W // 2, 956), valor_txt, font=f_valor, fill=(252, 248, 248, 255), anchor="mm")
+    larg_valor = d.textlength(valor_txt, font=f_valor)
+    d.rounded_rectangle((W // 2 - larg_valor // 2 - 30, 1086, W // 2 + larg_valor // 2 + 30, 1098),
+                        radius=6, fill=(228, 38, 54, 255))
+
+    # Pill de ciclo de pagamento
+    f_ciclo = _card_carregar_fonte("bold", 38)
+    larg_ciclo = d.textbbox((0, 0), ciclo_up, font=f_ciclo)
+    larg_ciclo = (larg_ciclo[2] - larg_ciclo[0]) + 96
+    cx1, cy1, cx2, cy2 = W // 2 - larg_ciclo // 2, 1136, W // 2 + larg_ciclo // 2, 1204
+    d.rounded_rectangle((cx1, cy1, cx2, cy2), radius=16, fill=(166, 22, 36, 238), outline=(236, 58, 74, 255), width=4)
+    d.text((W // 2, (cy1 + cy2) // 2), ciclo_up, font=f_ciclo, fill=(252, 248, 248, 255), anchor="mm")
+
+    card = Image.alpha_composite(card, camada)
+
+    # Chips de benefícios: cargo • carteira • divulgação • card HD
+    beneficios = [
+        ("cargo", "CARGO EXCLUSIVO"),
+        ("carteira", "COMISSÃO NA CARTEIRA"),
+        ("live", "LIVE DIVULGADA NO CAÇA"),
+        ("card", "CARD HD DA SUA LIVE"),
+    ]
+    f_ben = _card_carregar_fonte("bold", 36)
+    larguras = []
+    for _, texto in beneficios:
+        caixa = d.textbbox((0, 0), texto, font=f_ben)
+        larguras.append((caixa[2] - caixa[0]) + 128)
+    gap = 28
+    total = sum(larguras) + gap * (len(beneficios) - 1)
+    bx = (W - total) // 2
+    by1, by2 = 1236, 1332
+    d_main = ImageDraw.Draw(card, "RGBA")
+    for (tipo, texto), larg in zip(beneficios, larguras):
+        d_main.rounded_rectangle((bx, by1, bx + larg, by2), radius=16,
+                                 fill=(24, 11, 15, 238), outline=(126, 28, 38, 210), width=3)
+        icx, icy = bx + 62, (by1 + by2) // 2
+        if tipo == "cargo":
+            esc = [(icx, icy - 30), (icx + 26, icy - 16), (icx + 22, icy + 12), (icx, icy + 34),
+                   (icx - 22, icy + 12), (icx - 26, icy - 16)]
+            d_main.polygon(esc, outline=(236, 58, 74, 255), fill=(36, 5, 10, 240), width=4)
+            d_main.line([(icx - 11, icy - 1), (icx - 3, icy + 10), (icx + 13, icy - 11)], fill=(252, 220, 224, 255), width=4)
+        elif tipo == "carteira":
+            d_main.rounded_rectangle((icx - 28, icy - 18, icx + 28, icy + 20), radius=8,
+                                     outline=(236, 58, 74, 255), fill=(36, 5, 10, 240), width=4)
+            d_main.ellipse((icx + 6, icy - 4, icx + 20, icy + 10), outline=(252, 220, 224, 255), width=3)
+            d_main.line([(icx - 28, icy - 9), (icx + 28, icy - 9)], fill=(236, 58, 74, 255), width=3)
+        elif tipo == "live":
+            _card_chama_ff(d_main, icx, icy + 2, 26, cor_sombra=(112, 6, 14, 240),
+                           cor_principal=(228, 38, 54, 255), cor_nucleo=(252, 220, 224, 255))
+        else:
+            d_main.rounded_rectangle((icx - 28, icy - 20, icx + 28, icy + 20), radius=6,
+                                     outline=(236, 58, 74, 255), fill=(36, 5, 10, 240), width=4)
+            pts = []
+            for i in range(10):
+                ang = -math.pi / 2 + i * math.pi / 5
+                rr = 15 if i % 2 == 0 else 6.5
+                pts.append((icx + math.cos(ang) * rr, icy + math.sin(ang) * rr))
+            d_main.polygon(pts, fill=(252, 220, 224, 255))
+        d_main.text((bx + 104, (by1 + by2) // 2), texto, font=f_ben, fill=(236, 212, 216, 255), anchor="lm")
+        bx += larg + gap
+
+    # Faixa de requisitos mínimos
+    f_req_lbl = _card_carregar_fonte("bold", 30)
+    f_req = _card_carregar_fonte("bold", 37)
+    d_main = ImageDraw.Draw(card, "RGBA")
+    d_main.text((W // 2, 1410), "REQUISITOS MÍNIMOS   •   BASTA UMA REDE COM O NÚMERO PEDIDO",
+                font=f_req_lbl, fill=(176, 118, 124, 255), anchor="mm")
+
+    req_itens = [
+        ("YOUTUBE", f"{int(req_yt):,}".replace(",", ".") + " INSCRITOS", _REDE_COR["youtube"]),
+        ("INSTAGRAM", f"{int(req_ig):,}".replace(",", ".") + " SEGUIDORES", _REDE_COR["instagram"]),
+        ("TIKTOK", f"{int(req_tt):,}".replace(",", ".") + " SEGUIDORES", _REDE_COR["tiktok"]),
+    ]
+    larguras_req = []
+    for rede_nome, detalhe, _ in req_itens:
+        caixa = d.textbbox((0, 0), f"{rede_nome}   {detalhe}", font=f_req)
+        larguras_req.append((caixa[2] - caixa[0]) + 84)
+    gap_req = 30
+    total_req = sum(larguras_req) + gap_req * (len(req_itens) - 1)
+    rx = (W - total_req) // 2
+    ry1, ry2 = 1450, 1532
+    for (rede_nome, detalhe, cor), larg in zip(req_itens, larguras_req):
+        d_main.rounded_rectangle((rx, ry1, rx + larg, ry2), radius=14,
+                                 fill=(20, 10, 13, 240), outline=(*cor, 210), width=3)
+        d_main.ellipse((rx + 24, (ry1 + ry2) // 2 - 13, rx + 50, (ry1 + ry2) // 2 + 13), fill=(*cor, 255))
+        d_main.text((rx + 62, (ry1 + ry2) // 2), f"{rede_nome}  {detalhe}", font=f_req,
+                    fill=(248, 236, 238, 255), anchor="lm")
+        rx += larg + gap_req
+
+    d_fin = ImageDraw.Draw(card)
+    f_rodape = _card_carregar_fonte("bold", 26)
+    d_fin.text(
+        (W // 2, H - 48),
+        "FIRE FORCE COMPETITIVE SYSTEM   •   AVALIAÇÃO PRIVADA COM DONO & GERENTE",
+        font=f_rodape, fill=(154, 78, 86, 246), anchor="mm",
+    )
+
+    final = card.convert("RGB").resize((1680, 825), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    final.save(buffer, format="PNG", compress_level=6)
+    return buffer.getvalue()
+
+
+def renderizar_carteirinha_influenciador_png(
+    *,
+    nome_discord: str,
+    avatar_bytes: Optional[bytes],
+    redes: dict,
+    fotos: Optional[dict],
+    taxa: float,
+    ciclo: str,
+    total_convites: int,
+    total_comissao: float,
+) -> bytes:
+    """Carteirinha HD (Dark Red & Black) do influenciador: avatar com anel HUD,
+    redes verificadas e contadores de comissão. Render 2x reduzido para nitidez."""
+    fotos = fotos or {}
+    presentes = [r for r in _REDES_INFLUENCER if (redes or {}).get(r)]
+    total_seg = sum(int((redes.get(r) or {}).get("seguidores_num") or 0) for r in presentes)
+
+    W, H = 2640, 1320
+    card = _card_gradiente_vertical(W, H, (19, 7, 10, 255), (5, 4, 5, 255))
+    _card_glow_radial_local(card, 430, 400, 700, 640, (196, 22, 38), 120)
+    _card_glow_radial_local(card, W - 420, 350, 820, 560, (128, 10, 22), 78)
+
+    camada = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(camada)
+    for k in range(-H, W + H, 118):
+        d.line([(k, 0), (k - H, H)], fill=(210, 32, 48, 9), width=3)
+
+    d.rounded_rectangle((34, 34, W - 35, H - 35), radius=52, outline=(146, 24, 36, 225), width=7)
+    d.rounded_rectangle((52, 52, W - 53, H - 53), radius=40, outline=(58, 18, 24, 185), width=3)
+    d.rounded_rectangle((W // 2 - 430, 30, W // 2 + 430, 44), radius=6, fill=(228, 38, 54, 255))
+
+    # ── Painel esquerdo: identidade ─────────────────────────────
+    LX1, LY1, LX2, LY2 = 84, 130, 1000, H - 130
+    LCX = (LX1 + LX2) // 2
+    _card_painel_tatico(
+        card, (LX1, LY1, LX2, LY2),
+        c_tl=42, c_tr=16, c_br=42, c_bl=16,
+        topo_rgba=(18, 6, 8, 248),
+        base_rgba=(5, 4, 6, 252),
+        borda_rgba=(124, 12, 22, 240),
+        acento_topo=True,
+    )
+    f_wm = _card_carregar_fonte("black", 380)
+    d_main = ImageDraw.Draw(card, "RGBA")
+    d_main.text((LCX, LY2 - 155), "FF", font=f_wm, fill=(23, 6, 9, 255), anchor="mm")
+
+    _card_chama_ff(d_main, 172, 218, 40)
+    f_marca = _card_carregar_fonte("bold", 33)
+    d_main.text((226, 200), "FIRE FORCE", font=f_marca, fill=(248, 242, 244, 255))
+
+    AV_CY, AV_R = 500, 168
+    _card_glow_radial_local(card, LCX, AV_CY, 280, 262, (152, 8, 14), 138)
+    d_main = ImageDraw.Draw(card, "RGBA")
+
+    r_hud = AV_R + 32
+    for deg in range(0, 360, 12):
+        rad = math.radians(deg)
+        r_in_t = r_hud + 8
+        r_out_t = r_hud + (16 if deg % 36 == 0 else 11)
+        cor_t = (188, 14, 24, 255) if deg % 36 == 0 else (84, 9, 15, 255)
+        d_main.line(
+            [(LCX + math.cos(rad) * r_in_t, AV_CY + math.sin(rad) * r_in_t),
+             (LCX + math.cos(rad) * r_out_t, AV_CY + math.sin(rad) * r_out_t)],
+            fill=cor_t, width=3 if deg % 36 == 0 else 2,
+        )
+    d_main.ellipse((LCX - r_hud, AV_CY - r_hud, LCX + r_hud, AV_CY + r_hud), outline=(84, 8, 14, 255), width=4)
+    for ang_ini in (-38, 52, 142, 232):
+        d_main.arc((LCX - r_hud - 2, AV_CY - r_hud - 2, LCX + r_hud + 2, AV_CY + r_hud + 2),
+                   start=ang_ini, end=ang_ini + 36, fill=(196, 14, 24, 255), width=9)
+    d_main.ellipse((LCX - AV_R - 12, AV_CY - AV_R - 12, LCX + AV_R + 12, AV_CY + AV_R + 12),
+                   fill=(16, 5, 8, 255), outline=(164, 12, 20, 255), width=6)
+
+    av_img = None
+    if avatar_bytes:
+        try:
+            with Image.open(io.BytesIO(avatar_bytes)) as origem:
+                av_img = origem.convert("RGBA").resize((AV_R * 2, AV_R * 2), Image.Resampling.LANCZOS)
+        except Exception:
+            av_img = None
+    if av_img is None:
+        av_img = _card_gradiente_vertical(AV_R * 2, AV_R * 2, (72, 6, 12, 255), (10, 4, 7, 255))
+        dm = ImageDraw.Draw(av_img)
+        f_ini = _card_carregar_fonte("black", 128)
+        ini_limpo = _card_limpar_texto(nome_discord or "FF", f_ini, "FF", remover_simbolos=True)
+        iniciais = "".join(ch for ch in ini_limpo if ch.isalnum())[:2].upper() or "FF"
+        dm.text((AV_R, AV_R), iniciais, font=f_ini, fill=(248, 236, 238, 255), anchor="mm")
+    masc = Image.new("L", (AV_R * 2, AV_R * 2), 0)
+    ImageDraw.Draw(masc).ellipse((0, 0, AV_R * 2, AV_R * 2), fill=255)
+    card.paste(av_img, (LCX - AV_R, AV_CY - AV_R), masc)
+    d_main = ImageDraw.Draw(card, "RGBA")
+    d_main.ellipse((LCX - AV_R, AV_CY - AV_R, LCX + AV_R, AV_CY + AV_R), outline=(212, 42, 50, 255), width=3)
+
+    # Selo de influenciador oficial
+    f_selo = _card_carregar_fonte("bold", 26)
+    selo_txt = "★  INFLUENCIADOR OFICIAL  ★"
+    larg_selo = d_main.textlength(selo_txt, font=f_selo) + 72
+    sx1, sy1, sx2, sy2 = LCX - larg_selo // 2, AV_CY + AV_R - 20, LCX + larg_selo // 2, AV_CY + AV_R + 34
+    d_main.polygon(_card_pts_chanfro(sx1, sy1, sx2, sy2, 13, 13, 13, 13),
+                   fill=(116, 6, 12, 255), outline=(214, 46, 54, 255), width=3)
+    d_main.text((LCX, (sy1 + sy2) // 2), selo_txt, font=f_selo, fill=(255, 246, 247, 255), anchor="mm")
+
+    f_nome, nome_txt = _card_ajustar_titulo(d_main, nome_discord or "INFLUENCIADOR", "black", 66, 38, LX2 - LX1 - 120)
+    d_main.text((LCX + 3, 812), nome_txt, font=f_nome, fill=(0, 0, 0, 255), anchor="mm")
+    d_main.text((LCX, 808), nome_txt, font=f_nome, fill=(250, 244, 245, 255), anchor="mm")
+
+    f_seg_lbl = _card_carregar_fonte("bold", 26)
+    alcance_txt = formatar_numero_social(total_seg) or "0"
+    d_main.text((LCX, 884), "ALCANCE SOMADO", font=f_seg_lbl, fill=(192, 40, 50, 255), anchor="mm")
+    f_seg_val = _card_carregar_fonte("black", 74)
+    d_main.text((LCX, 946), f"{alcance_txt} seguidores", font=f_seg_val, fill=(252, 248, 248, 255), anchor="mm")
+
+    # ── Painel direito: redes verificadas + comissão ───────────
+    RX1, RY1, RX2, RY2 = 1060, 130, W - 84, H - 130
+    _card_painel_tatico(
+        card, (RX1, RY1, RX2, RY2),
+        c_tl=16, c_tr=42, c_br=16, c_bl=42,
+        topo_rgba=(16, 7, 9, 248),
+        base_rgba=(5, 4, 6, 252),
+        borda_rgba=(124, 12, 22, 240),
+        acento_topo=True,
+    )
+    d_main = ImageDraw.Draw(card, "RGBA")
+    f_redes_lbl = _card_carregar_fonte("bold", 30)
+    d_main.text((RX1 + 70, RY1 + 62), "REDES VERIFICADAS EM TEMPO REAL", font=f_redes_lbl,
+                fill=(192, 40, 50, 255), anchor="lm")
+    d_main.line([(RX1 + 70, RY1 + 96), (RX2 - 70, RY1 + 96)], fill=(84, 8, 16, 255), width=2)
+    d_main.line([(RX1 + 70, RY1 + 96), (RX1 + 330, RY1 + 96)], fill=(192, 14, 24, 255), width=5)
+
+    camada_fotos: list = []
+    f_nome_rede = _card_carregar_fonte("black", 40)
+    f_num = _card_carregar_fonte("black", 52)
+    f_lbl = _card_carregar_fonte("bold", 21)
+    linha_h, linha_gap = 168, 22
+    y = RY1 + 128
+    if not presentes:
+        f_vazio = _card_carregar_fonte("bold", 34)
+        d_main.text(((RX1 + RX2) // 2, y + 90), "NENHUMA REDE CADASTRADA", font=f_vazio,
+                    fill=(214, 152, 160, 240), anchor="mm")
+    for indice, rede in enumerate(presentes):
+        info = redes.get(rede) or {}
+        cor_rede = _REDE_COR.get(rede, (200, 30, 44))
+        x1, x2 = RX1 + 70, RX2 - 70
+        y1, y2 = y, y + linha_h
+
+        d_main.rounded_rectangle((x1, y1, x2, y2), radius=20, fill=(15, 9, 12, 240),
+                                 outline=(140, 26, 38, 228), width=3)
+        d_main.rounded_rectangle((x1, y1, x1 + 10, y2), radius=6, fill=(*cor_rede, 250))
+
+        tam_foto = 108
+        foto_x = x1 + 40
+        foto_y = y1 + (linha_h - tam_foto) // 2
+        avatar = _inf_avatar_quadrado_hd(fotos.get(rede), tam_foto, rede)
+        camada_fotos.append((avatar, foto_x, foto_y))
+        _inf_badge_vetor(d_main, rede, foto_x + tam_foto - 10, foto_y + tam_foto - 10, 24)
+
+        texto_x = foto_x + tam_foto + 36
+        nome_rede = _card_limpar_texto(str(info.get("nome") or _REDE_ROTULO[rede]), f_nome_rede,
+                                       fallback=_REDE_ROTULO[rede])
+        nome_rede = _card_truncar_px(d_main, nome_rede, f_nome_rede, int((x2 - x1) * 0.42))
+        d_main.text((texto_x, y1 + 60), nome_rede, font=f_nome_rede, fill=(248, 243, 244, 255), anchor="lm")
+        etiqueta = f"{_REDE_ROTULO[rede].upper()}   •   {_REDE_LABEL_SEG[rede]}"
+        d_main.text((texto_x, y1 + 112), etiqueta, font=f_lbl, fill=(*cor_rede, 245), anchor="lm")
+
+        valor_txt = str(info.get("seguidores") or "--").strip() or "--"
+        valor_txt = _card_limpar_texto(valor_txt, f_num, fallback="--", remover_simbolos=True)
+        caixa_num = d_main.textbbox((0, 0), valor_txt, font=f_num)
+        bloco_larg = max(250, caixa_num[2] - caixa_num[0] + 84)
+        bloco_x2 = x2 - 30
+        bloco_x1 = bloco_x2 - bloco_larg
+        d_main.rounded_rectangle((bloco_x1, y1 + 22, bloco_x2, y2 - 22), radius=15,
+                                 fill=(28, 9, 13, 245), outline=(*cor_rede, 200), width=3)
+        d_main.text(((bloco_x1 + bloco_x2) // 2, y1 + 84), valor_txt, font=f_num,
+                    fill=(252, 248, 248, 255), anchor="mm")
+        d_main.text(((bloco_x1 + bloco_x2) // 2, y1 + 124), _REDE_LABEL_SEG[rede], font=f_lbl,
+                    fill=(*cor_rede, 250), anchor="mm")
+
+        y = y2 + linha_gap
+
+    # Faixa de comissão na base do painel direito
+    f_cell_lbl = _card_carregar_fonte("bold", 24)
+    f_cell_val = _card_carregar_fonte("black", 52)
+    f_cell_sml = _card_carregar_fonte("bold", 22)
+    ciclo_txt = "SEMANAL" if str(ciclo or "").strip().lower() != "dia" else "DIÁRIO"
+    celulas = [
+        ("TAXA POR CONVITE", formatar_moeda(taxa), ciclo_txt),
+        ("CONVITES PAGOS", str(int(total_convites)), "TOTAL HISTÓRICO"),
+        ("COMISSÃO TOTAL", formatar_moeda(total_comissao), "TOTAL HISTÓRICO"),
+    ]
+    cell_w = (RX2 - RX1 - 140 - 40) // 3
+    cy1, cy2 = RY2 - 225, RY2 - 70
+    for indice, (rotulo, valor_cel, detalhe) in enumerate(celulas):
+        cx = RX1 + 70 + indice * (cell_w + 20)
+        d_main.rounded_rectangle((cx, cy1, cx + cell_w, cy2), radius=18,
+                                 fill=(20, 8, 11, 245), outline=(96, 14, 22, 235), width=3)
+        d_main.text((cx + cell_w // 2, cy1 + 36), rotulo, font=f_cell_lbl, fill=(192, 40, 50, 255), anchor="mm")
+        d_main.text((cx + cell_w // 2, cy1 + 96), valor_cel, font=f_cell_val, fill=(252, 248, 248, 255), anchor="mm")
+        d_main.text((cx + cell_w // 2, cy1 + 138), detalhe, font=f_cell_sml, fill=(176, 118, 124, 255), anchor="mm")
+
+    card = Image.alpha_composite(card, camada)
+    for avatar, ax, ay in camada_fotos:
+        card.paste(avatar, (ax, ay), avatar)
+
+    d_fin = ImageDraw.Draw(card)
+    f_rodape = _card_carregar_fonte("bold", 21)
+    d_fin.text(
+        (W // 2, H - 52),
+        f"FIRE FORCE COMPETITIVE SYSTEM   •   CARTEIRINHA OFICIAL DE INFLUENCIADOR   •   ATUALIZADA EM {agora_brt().strftime('%d/%m/%Y %H:%M')}",
+        font=f_rodape, fill=(154, 78, 86, 246), anchor="mm",
+    )
+
+    final = card.convert("RGB").resize((1320, 660), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    final.save(buffer, format="PNG", compress_level=6)
+    return buffer.getvalue()
+
+
+# ---------- banner do painel público (Seja um Influenciador) ----------
+
+async def _montar_banner_influenciador_msg(cfg: Optional[dict] = None):
+    """Monta (File | None, Embed) do banner de recrutamento.
+
+    Usado tanto na publicação pública do painel quanto na resposta efêmera do
+    `/influenciador` para quem ainda não se candidatou. Nunca levanta exceção.
+    """
+    cfg = cfg or {}
+    try:
+        valor = arredondar(float(cfg.get("inf_valor_convite") or 0.25))
+    except Exception:
+        valor = 0.25
+    ciclo = "semana" if str(cfg.get("inf_ciclo_comissao") or "semana").lower() != "dia" else "dia"
+    req_yt = int(cfg.get("inf_req_yt_min") or 500)
+    req_ig = int(cfg.get("inf_req_ig_min") or 1000)
+    req_tt = int(cfg.get("inf_req_tt_min") or 1000)
+
+    arquivo = None
+    if _PIL_DISPONIVEL:
+        try:
+            png = await asyncio.to_thread(
+                renderizar_banner_influenciador_png,
+                valor_convite=valor,
+                ciclo=ciclo,
+                req_yt=req_yt,
+                req_ig=req_ig,
+                req_tt=req_tt,
+            )
+            arquivo = discord.File(io.BytesIO(png), filename="banner_influenciador.png")
+        except Exception as erro:
+            _log_arquivo(f"[INFLUENCER] banner do painel falhou: {type(erro).__name__}: {erro}")
+            arquivo = None
+
+    extra = str(cfg.get("inf_req_extra") or "").strip()
+    texto_embed = (
+        "**Candidate-se pelo botão abaixo** — envie seu **YouTube**, **Instagram** ou **TikTok** "
+        "(qualquer um basta, desde que tenha o mínimo).\n\n"
+        "> ✅ **Cargo exclusivo** de Influenciador\n"
+        f"> 💸 **`{formatar_moeda(valor)}` por convite validado** (pago de forma **{'diária' if ciclo == 'dia' else 'semanal'}**, direto no `/carteira`)\n"
+        "> 🔴 **Lives divulgadas automaticamente** no canal de Caça aos Influenciadores\n"
+        "> 🖼️ **Seu card HD** com redes e números reais em cada live\n\n"
+        + (f"**Regras extras:** {extra}\n\n" if extra else "")
+        + "-# 🔒 Avaliação privada com **Dono** e **Gerente** • números lidos em tempo real"
+    )
+    embed = criar_embed(
+        "🎬 Seja um Influenciador Fire Force",
+        texto_embed,
+        "Vermelho",
+        image="attachment://banner_influenciador.png" if arquivo else None,
+        footer="Fire Force • Programa de Influenciadores",
+    )
+    if not arquivo:
+        # Fallback limpo: sem PIL, o embed carrega também os requisitos mínimos
+        embed.description += "\n\n**Requisitos mínimos**\n" + descrever_requisitos_influencer(cfg)
+    return arquivo, embed
+
+
+async def publicar_painel_influenciador(canal, cfg: Optional[dict] = None) -> tuple:
+    """Publica o painel público 'Seja um Influenciador' no `canal` com card HD.
+
+    Retorna (ok, mensagem). Nunca levanta exceção: se o PIL/card falhar, publica
+    o painel em embed limpo (mesmo padrão de fallback das demais imagens do bot).
+    """
+    try:
+        if not canal:
+            return (False, "Canal inválido.")
+        if cfg is None:
+            cfg = await obter_config(canal.guild.id)
+        arquivo, embed = await _montar_banner_influenciador_msg(cfg)
+        kwargs = {"embed": embed, "view": InfluenciadorPainelPublicoView()}
+        if arquivo:
+            kwargs["file"] = arquivo
+        await canal.send(**kwargs)
+        if arquivo:
+            return (True, "Painel **Seja um Influenciador** publicado com o card HD.")
+        return (True, "Painel publicado (sem o card HD — PIL indisponível).")
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] publicar painel: {type(erro).__name__}: {erro}")
+        return (False, f"Falha ao publicar o painel: `{type(erro).__name__}`.")
+
+
 # ---------- publicação do alerta de LIVE no canal de Caça aos Influenciadores ----------
 
 async def publicar_caca_influenciador_vaga(
@@ -22965,36 +23445,8 @@ async def anunciar_caca_influencer_do_slot(guild: discord.Guild, slot_id: int) -
 
 
 # ══════════════════════════════════════════════════════════════
-#  PAINEL PÚBLICO • VIRAR INFLUENCIADOR
+#  PAINEL PÚBLICO • SEJA UM INFLUENCIADOR
 # ══════════════════════════════════════════════════════════════
-
-def embed_painel_influenciador(cfg: Optional[dict] = None) -> discord.Embed:
-    cfg = cfg or {}
-    try:
-        valor = arredondar(float(cfg.get("inf_valor_convite") or 0.25))
-    except Exception:
-        valor = 0.25
-    ciclo = "semana" if str(cfg.get("inf_ciclo_comissao") or "semana").lower() != "dia" else "dia"
-    texto = (
-        "Quer transformar sua audiência em renda dentro da **Fire Force**?\n"
-        "Cadastre seu **YouTube**, **Instagram** ou **TikTok** e receba comissão por cada convite "
-        f"que trouxer para os diários: **`{formatar_moeda(valor)}` por convite** "
-        f"(pago por **{ciclo}**).\n\n"
-        "**Benefícios aprovados**\n"
-        "> **Cargo exclusivo** de Influenciador no servidor\n"
-        "> **Comissão por convite** direto na sua carteira\n"
-        "> **Divulgação automática** quando você entrar em live nos diários\n"
-        "> **Card HD** com suas redes e números reais\n\n"
-        "**Requisitos mínimos**\n" + descrever_requisitos_influencer(cfg) + "\n\n"
-        "-# 🔒 Avaliação privada apenas com **Dono** e **Gerente**"
-    )
-    return criar_embed(
-        "🎬 Seja um Influenciador Fire Force",
-        texto,
-        "Vermelho",
-        footer="Fire Force • Programa de Influenciadores",
-    )
-
 
 class InfluenciadorPainelPublicoView(discord.ui.View):
     """Painel público do programa: só Dono/Gerente publicam, qualquer um se candidata."""
@@ -23751,8 +24203,8 @@ def _montar_embed_lista_influenciadores(linhas: list, total: int, pagina: int, p
 
 class InfluenciadorBuscaModal(discord.ui.Modal, title="🔎 Buscar Influenciador"):
     termo = discord.ui.TextInput(
-        label="Nome, @, ID do Discord ou rede",
-        placeholder="Ex: kaique, @nickff, 123456789012345678",
+        label="Nome ou @ do influenciador",
+        placeholder="Ex: kaique, @nickff",
         required=False,
         max_length=90,
     )
@@ -23865,7 +24317,7 @@ class InfluenciadorHubListaView(discord.ui.View):
                 or str(dados.get("yt_nome") or "").strip()
                 or str(dados.get("ig_nome") or "").strip()
                 or str(dados.get("tt_nome") or "").strip()
-                or f"ID {int(dados.get('user_id') or 0)}"
+                or f"Jogador {int(dados.get('user_id') or 0) % 10000:04d}"
             )
             opcoes.append(
                 discord.SelectOption(
@@ -23941,8 +24393,7 @@ async def _montar_embed_ficha_influencer(guild: discord.Guild, dados: dict) -> d
     ciclo_cfg = _inf_ciclo_texto(cfg)
     embed = criar_embed(
         f"🎬 Ficha do Influenciador • {mencao(dados.get('user_id'))}",
-        f"**Status:** {marca}\n"
-        f"**ID do registro:** `{int(dados.get('id') or 0)}`\n\n"
+        f"**Status:** {marca}\n\n"
         f"**Redes verificadas (tempo real):**\n{descrever_redes_embed(dados)}\n\n"
         f"**Comissionamento**\n"
         f"> **Taxa por convite:** `{formatar_moeda(taxa)}`"
@@ -24402,9 +24853,27 @@ class InfluenciadorConfigView(discord.ui.View):
         cfg = await obter_config(interaction.guild.id)
 
         if acao == "cargo":
-            return await interaction.response.send_modal(InfluenciadorConfigCargoModal(cfg))
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "🎬 Cargo de Influenciador",
+                    "Selecione na lista o cargo que será entregue automaticamente a quem for aprovado:\n\n"
+                    "-# Vazio? Use o botão **Remover Cargo** abaixo.",
+                    "Cinza Escuro",
+                ),
+                view=InfluenciadorConfigCargoView(),
+                ephemeral=True,
+            )
         if acao == "canal":
-            return await interaction.response.send_modal(InfluenciadorConfigCanalModal(cfg))
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "📺 Canal de Caça aos Influenciadores",
+                    "Selecione na lista o canal de texto onde os cards HD das lives confirmadas serão publicados:\n\n"
+                    "-# Vazio? Use o botão **Remover Canal** abaixo.",
+                    "Cinza Escuro",
+                ),
+                view=InfluenciadorConfigCanalView(),
+                ephemeral=True,
+            )
         if acao == "valor":
             return await interaction.response.send_modal(InfluenciadorConfigValorModal(cfg))
         if acao == "requisitos":
@@ -24425,95 +24894,149 @@ class InfluenciadorConfigView(discord.ui.View):
             )
         if acao == "publicar":
             canal = interaction.channel
-            try:
-                await canal.send(
-                    embed=embed_painel_influenciador(cfg),
-                    view=InfluenciadorPainelPublicoView(),
-                )
-            except Exception as erro:
-                return await interaction.response.send_message(
-                    embed=criar_embed("❌ Falha ao publicar", f"`{type(erro).__name__}`", "Vermelho"),
-                    ephemeral=True,
-                )
+            ok, mensagem = await publicar_painel_influenciador(canal, cfg)
             return await interaction.response.send_message(
-                embed=criar_embed("✅ Painel publicado", f"Painel público enviado em {canal.mention}.", "Esmeralda"),
+                embed=criar_embed(
+                    "✅ Painel publicado" if ok else "❌ Falha ao publicar",
+                    f"{mensagem}",
+                    "Esmeralda" if ok else "Vermelho",
+                ),
                 ephemeral=True,
             )
 
 
-class InfluenciadorConfigCargoModal(discord.ui.Modal, title="⚙️ Cargo de Influenciador"):
-    cargo_id = discord.ui.TextInput(
-        label="ID do cargo (vazio = remover)",
-        placeholder="Ex: 1234567890123456789",
-        required=False,
-        max_length=25,
-    )
+class InfluenciadorConfigCargoView(discord.ui.View):
+    """Seleção nativa de cargo (RoleSelect) — sem precisar digitar IDs à mão."""
 
-    def __init__(self, cfg: dict):
-        super().__init__()
-        self.cfg = cfg or {}
+    def __init__(self):
+        super().__init__(timeout=180)
+        seletor = discord.ui.RoleSelect(
+            placeholder="🎬 Selecione o cargo de Influenciador...",
+            max_values=1,
+            custom_id="ff_inf_cfg_cargo_sel",
+        )
+        seletor.callback = self._escolher
+        self.add_item(seletor)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        bruto = re.sub(r"\D", "", str(self.cargo_id.value or ""))
-        if bruto:
-            cargo = interaction.guild.get_role(int(bruto))
-            if not cargo:
-                return await interaction.response.send_message(
-                    embed=criar_embed("❌ Cargo não encontrado", "Copie o **ID** do cargo (Modo Desenvolvedor).", "Vermelho"),
-                    ephemeral=True,
-                )
-            await salvar_config(interaction.guild.id, cargo_influencer=int(bruto))
-            texto = f"Cargo definido como {cargo.mention}."
-        else:
-            await salvar_config(interaction.guild.id, cargo_influencer=None)
-            texto = "Cargo de influenciador **removido**."
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await e_dono_ou_gerente(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente Dono e Gerente configuram o programa.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _escolher(self, interaction: discord.Interaction):
+        role = None
+        if interaction.guild:
+            values = (interaction.data or {}).get("values") or []
+            if values:
+                role = interaction.guild.get_role(int(values[0]))
+        if not role:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Cargo não encontrado", "Selecione um cargo válido do servidor.", "Vermelho"),
+                ephemeral=True,
+            )
+        await salvar_config(interaction.guild.id, cargo_influencer=role.id)
         marcar_sujo()
-        cfg = await obter_config(interaction.guild.id)
+        await registrar_log(
+            interaction.guild, "🎬 INFLUENCIADOR", "⚙️ Cargo de influenciador definido",
+            f"{interaction.user.mention} definiu o cargo de influenciador como {role.mention}.",
+            "Cinza Escuro",
+        )
         await interaction.response.send_message(
-            embed=criar_embed("✅ Cargo atualizado", texto, "Esmeralda"),
+            embed=criar_embed(
+                "✅ Cargo vinculado",
+                f"{role.mention} agora é entregue automaticamente a quem for **aprovado** como influenciador.",
+                "Esmeralda",
+            ),
             ephemeral=True,
         )
-        await interaction.channel.send(
-            embed=await _montar_embed_config_influencer(interaction.guild, cfg),
-            view=InfluenciadorConfigView(interaction.user.id),
-        )
 
-
-class InfluenciadorConfigCanalModal(discord.ui.Modal, title="⚙️ Canal de Caça aos Influenciadores"):
-    canal_id = discord.ui.TextInput(
-        label="ID do canal (vazio = remover)",
-        placeholder="Ex: 1234567890123456789",
-        required=False,
-        max_length=25,
+    @discord.ui.button(
+        label="Remover Cargo", emoji="🗑️", style=discord.ButtonStyle.secondary,
+        custom_id="ff_inf_cfg_cargo_remover",
     )
-
-    def __init__(self, cfg: dict):
-        super().__init__()
-        self.cfg = cfg or {}
-
-    async def on_submit(self, interaction: discord.Interaction):
-        bruto = re.sub(r"\D", "", str(self.canal_id.value or ""))
-        if bruto:
-            canal = interaction.guild.get_channel(int(bruto))
-            if not canal:
-                return await interaction.response.send_message(
-                    embed=criar_embed("❌ Canal não encontrado", "Copie o **ID** do canal (Modo Desenvolvedor).", "Vermelho"),
-                    ephemeral=True,
-                )
-            await salvar_config(interaction.guild.id, canal_caca_influencer=int(bruto))
-            texto = f"Canal definido como {canal.mention}."
-        else:
-            await salvar_config(interaction.guild.id, canal_caca_influencer=None)
-            texto = "Canal de Caça **removido**."
+    async def remover(self, interaction: discord.Interaction, botao: discord.ui.Button):
+        await salvar_config(interaction.guild.id, cargo_influencer=None)
         marcar_sujo()
-        cfg = await obter_config(interaction.guild.id)
+        await registrar_log(
+            interaction.guild, "🎬 INFLUENCIADOR", "⚙️ Cargo de influenciador removido",
+            f"{interaction.user.mention} desvinculou o cargo de influenciador.",
+            "Cinza Escuro",
+        )
         await interaction.response.send_message(
-            embed=criar_embed("✅ Canal atualizado", texto, "Esmeralda"),
+            embed=criar_embed("✅ Cargo desvinculado", "Nenhum cargo será entregue automaticamente nas próximas aprovações.", "Esmeralda"),
             ephemeral=True,
         )
-        await interaction.channel.send(
-            embed=await _montar_embed_config_influencer(interaction.guild, cfg),
-            view=InfluenciadorConfigView(interaction.user.id),
+
+
+class InfluenciadorConfigCanalView(discord.ui.View):
+    """Seleção nativa de canal de texto (ChannelSelect) — sem precisar digitar IDs à mão."""
+
+    def __init__(self):
+        super().__init__(timeout=180)
+        seletor = discord.ui.ChannelSelect(
+            placeholder="📺 Selecione o canal de Caça aos Influenciadores...",
+            channel_types=[discord.ChannelType.text],
+            max_values=1,
+            custom_id="ff_inf_cfg_canal_sel",
+        )
+        seletor.callback = self._escolher
+        self.add_item(seletor)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await e_dono_ou_gerente(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente Dono e Gerente configuram o programa.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _escolher(self, interaction: discord.Interaction):
+        canal = None
+        if interaction.guild:
+            values = (interaction.data or {}).get("values") or []
+            if values:
+                canal = interaction.guild.get_channel(int(values[0]))
+        if not canal:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Canal não encontrado", "Selecione um canal de texto válido do servidor.", "Vermelho"),
+                ephemeral=True,
+            )
+        await salvar_config(interaction.guild.id, canal_caca_influencer=canal.id)
+        marcar_sujo()
+        await registrar_log(
+            interaction.guild, "🎬 INFLUENCIADOR", "⚙️ Canal de Caça definido",
+            f"{interaction.user.mention} definiu {canal.mention} como o canal de Caça aos Influenciadores.",
+            "Cinza Escuro",
+        )
+        await interaction.response.send_message(
+            embed=criar_embed(
+                "✅ Canal vinculado",
+                f"{canal.mention} passa a receber os **cards HD** das lives confirmadas dos influenciadores.",
+                "Esmeralda",
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Remover Canal", emoji="🗑️", style=discord.ButtonStyle.secondary,
+        custom_id="ff_inf_cfg_canal_remover",
+    )
+    async def remover(self, interaction: discord.Interaction, botao: discord.ui.Button):
+        await salvar_config(interaction.guild.id, canal_caca_influencer=None)
+        marcar_sujo()
+        await registrar_log(
+            interaction.guild, "🎬 INFLUENCIADOR", "⚙️ Canal de Caça removido",
+            f"{interaction.user.mention} desvinculou o canal de Caça aos Influenciadores.",
+            "Cinza Escuro",
+        )
+        await interaction.response.send_message(
+            embed=criar_embed("✅ Canal desvinculado", "Os cards HD de live não serão publicados até você vincular um canal.", "Esmeralda"),
+            ephemeral=True,
         )
 
 
@@ -24923,10 +25446,12 @@ async def cmd_influenciador(interaction: discord.Interaction):
     dados = await obter_influenciador(guild.id, interaction.user.id)
     if not dados:
         cfg = await obter_config(guild.id)
+        arquivo_pub, embed_pub = await _montar_banner_influenciador_msg(cfg)
         return await interaction.response.send_message(
-            embed=embed_painel_influenciador(cfg),
+            embed=embed_pub,
             view=InfluenciadorPainelPublicoView(),
             ephemeral=True,
+            **({"file": arquivo_pub} if arquivo_pub else {}),
         )
     if str(dados.get("status") or "") != "aprovado":
         return await interaction.response.send_message(
@@ -24938,10 +25463,56 @@ async def cmd_influenciador(interaction: discord.Interaction):
             ),
             ephemeral=True,
         )
-    embed = await _montar_embed_influencer_membro(guild, dados)
-    await interaction.response.send_message(
-        embed=embed, view=InfluenciadorMembroView(dados), ephemeral=True
-    )
+    embed = None
+    arquivo = None
+    if _PIL_DISPONIVEL:
+        try:
+            redes = redes_do_influenciador(dados)
+            fotos = {}
+            if redes:
+                baixadas = await asyncio.gather(
+                    *(_inf_baixar_foto((redes.get(r) or {}).get("foto")) for r in _REDES_INFLUENCER if redes.get(r)),
+                    return_exceptions=True,
+                )
+                for rede, bruto in zip([r for r in _REDES_INFLUENCER if redes.get(r)], baixadas):
+                    if isinstance(bruto, (bytes, bytearray)) and len(bruto) > 300:
+                        fotos[rede] = bytes(bruto)
+            cfg = await obter_config(guild.id)
+            taxa = await obter_taxa_influenciador(dados, cfg)
+            avatar_bytes = await _obter_avatar_bytes_membro(interaction.user)
+            nome_discord = str(getattr(interaction.user, "display_name", "") or getattr(interaction.user, "name", "") or "INFLUENCIADOR")
+            png = await asyncio.to_thread(
+                renderizar_carteirinha_influenciador_png,
+                nome_discord=nome_discord,
+                avatar_bytes=avatar_bytes,
+                redes=redes,
+                fotos=fotos,
+                taxa=taxa,
+                ciclo=str(cfg.get("inf_ciclo_comissao") or "semana"),
+                total_convites=int(dados.get("total_convites_pagos") or 0),
+                total_comissao=arredondar(dados.get("total_comissao_recebida") or 0),
+            )
+            arquivo = discord.File(io.BytesIO(png), filename="carteirinha_influenciador.png")
+        except Exception as erro:
+            _log_arquivo(f"[INFLUENCER] carteirinha falhou: {type(erro).__name__}: {erro}")
+            arquivo = None
+    if arquivo:
+        embed = criar_embed(
+            "🎬 Painel do Influenciador",
+            f"Bem-vindo de volta, {interaction.user.mention}!\n\n"
+            "Escolha uma ação no menu abaixo — **atualizar redes**, **avisar que está em LIVE** ou "
+            "**ver suas comissões**.\n"
+            "-# Usou um **novo @**? Atualize aqui que os números e a foto são lidos em tempo real.",
+            "Vermelho",
+            image="attachment://carteirinha_influenciador.png",
+            footer="Fire Force • Programa de Influenciadores",
+        )
+    else:
+        embed = await _montar_embed_influencer_membro(guild, dados)
+    kwargs_msg: dict = {"view": InfluenciadorMembroView(dados), "ephemeral": True}
+    if arquivo:
+        kwargs_msg["file"] = arquivo
+    await interaction.response.send_message(embed=embed, **kwargs_msg)
 
 
 @bot.tree.command(name="painel_influenciador", description="🎬 Publicar o painel público 'Quero ser Influenciador' neste canal")
@@ -24959,16 +25530,12 @@ async def cmd_painel_influenciador(interaction: discord.Interaction):
             ephemeral=True,
         )
     cfg = await obter_config(interaction.guild.id)
-    await interaction.channel.send(
-        embed=embed_painel_influenciador(cfg),
-        view=InfluenciadorPainelPublicoView(),
-    )
+    ok, mensagem = await publicar_painel_influenciador(interaction.channel, cfg)
     await interaction.response.send_message(
         embed=criar_embed(
-            "✅ Painel Publicado",
-            "Painel **Virar Influenciador** enviado neste canal.\n"
-            "-# Configure cargo, canal e comissão em `/influenciador`.",
-            "Esmeralda",
+            "✅ Painel Publicado" if ok else "❌ Falha ao publicar",
+            f"{mensagem}\n-# Configure cargo, canal e comissão em `/influenciador` → ⚙️ Configurações.",
+            "Esmeralda" if ok else "Vermelho",
         ),
         ephemeral=True,
     )
