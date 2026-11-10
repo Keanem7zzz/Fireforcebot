@@ -294,12 +294,11 @@ jobs:
           if ($env:FF_MARGEM_MIN) { $margem = [int]$env:FF_MARGEM_MIN }
           $alvo = $alvo.AddMinutes($margem)
 
-          # Se eu já nasci muito perto do próximo disparo (run manual/atrasada),
-          # 10 min de máquina não servem para nada: espero o disparo seguinte.
-          if (($alvo - $agora).TotalMinutes -lt 60) {
+          # Se o próximo disparo está a menos de 1 minuto, ele já é a máquina de
+          # agora (acabei de nascer nele): o meu fim é o disparo SEGUINTE.
+          if (($alvo - $agora).TotalMinutes -lt 1) {
             $seguinte = $disparos | Where-Object { $_ -gt $alvo } | Select-Object -First 1
             if ($seguinte) { $alvo = $seguinte.AddMinutes($margem) }
-            Write-Host "Run criada fora do horário normal - este ciclo vai até o disparo seguinte."
           }
 
           # Trava de segurança: o limite do GitHub é 6h de run e ele conta desde
