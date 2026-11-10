@@ -15171,14 +15171,14 @@ async def loop_pulso():
         except Exception as erro:
             _log_arquivo(f"[PULSO] erro no loop: {erro}")
 
-        # Checa o sinal de fim de ciclo a cada 1s para handoff ultra-rápido (~3s) entre máquinas
-        passos = max(1, int(PULSO_INTERVALO))
+        # Checa o sinal de fim de ciclo a cada 5s (totalizando PULSO_INTERVALO)
+        passos = max(1, int(PULSO_INTERVALO // 5))
         for _ in range(passos):
             if bot.is_closed():
                 return
             if os.path.exists(os.path.join(_DIRETORIO_BOT, "_encerrar_ciclo.flag")):
                 break
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
 
 
 async def loop_relatorio():
