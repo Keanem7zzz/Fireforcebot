@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════
-#  🔥 FIRE FORCE — BOT PREMIUM v13.5 (BLINDADO & AUTO-UPDATE)
+#  🔥 FIRE FORCE — BOT PREMIUM v13.7.2 (BLINDADO & AUTO-UPDATE)
 #  Liga Oficial de Diários Free Fire
 #
 #  • Consulta de ID do Free Fire OB55 multi-provedor + cache + Avatar/Clã
@@ -33,7 +33,7 @@ import qrcode
 import io
 import asyncio
 import datetime
-from typing import Optional, List, Dict
+from typing import Optional, Dict
 
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -89,7 +89,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.7"
+VERSAO_BOT = "13.7.2"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -241,6 +241,30 @@ _ON_READY_LOCK = asyncio.Lock()
 _BOT_INICIALIZADO = False
 _COMANDOS_SINCRONIZADOS = False
 _TAREFAS_BACKGROUND: Dict[str, asyncio.Task] = {}
+
+# Tarefas "fire-and-forget" (curtas, de fundo). O event loop só guarda referência
+# fraca a uma Task: sem este conjunto elas podem ser coletadas pelo GC antes de
+# terminarem. Mantemos referência forte até terminarem e registramos falhas no log.
+_TAREFAS_SOLTAS: set = set()
+
+
+def _disparar_tarefa_rastreada(coro) -> asyncio.Task:
+    tarefa = asyncio.create_task(coro)
+    _TAREFAS_SOLTAS.add(tarefa)
+
+    def _ao_terminar(finalizada: asyncio.Task):
+        _TAREFAS_SOLTAS.discard(finalizada)
+        if finalizada.cancelled():
+            return
+        try:
+            erro = finalizada.exception()
+        except Exception as erro_interno:
+            erro = erro_interno
+        if erro:
+            _log_arquivo(f"[TAREFA] tarefa de fundo falhou: {type(erro).__name__}: {erro}")
+
+    tarefa.add_done_callback(_ao_terminar)
+    return tarefa
 
 # O discord.py avisa "Privileged message content intent is missing" em qualquer
 # bot sem comando de prefixo ("!"). O Fire Force é 100% slash (/), então o aviso
@@ -3778,7 +3802,6 @@ def renderizar_card_booyah_png(
     # Sub-cards dos jogadores (1 p/ Solo, 2 p/ Duo, 3 p/ Trio, 4 p/ Squad)
     area_top = 352
     area_bot = H - 96
-    card_h = area_bot - area_top  # 712px em 2x
 
     if qtd == 1:
         col_w, gap_col, av_sz = 680, 0, 340
@@ -7007,7 +7030,7 @@ async def _notificar_dm_e_agendar_fechamento_pag(
     # 3. Agenda arquivamento nos logs + exclusão automática do canal de pagamento em 15s
     cid_pag = int(getattr(canal_pag, "id", 0) or slot_dict.get("canal_pag") or 0)
     if cid_pag > 0:
-        asyncio.create_task(
+        _disparar_tarefa_rastreada(
             _tarefa_apagar_canal_pag_aprovado(
                 guild=guild,
                 slot_id=int(slot_dict["id"]),
@@ -9050,7 +9073,7 @@ async def processar_repeticao_diaria() -> list[tuple[int, int]]:
         await estornar_moedas_reserva_se_necessario(guild_e, p_dict, "virada do ciclo diário sem aprovação")
 
     for canal, titulo, msg in avisos_fechar:
-        asyncio.create_task(_fechar_canal_reserva(canal, msg, titulo))
+        _disparar_tarefa_rastreada(_fechar_canal_reserva(canal, msg, titulo))
 
     return list(paineis_atualizar)
 
@@ -9105,8 +9128,8 @@ async def loop_expirar():
                             avisos.append((
                                 canal,
                                 "⌛ Reserva Expirada",
-                                f"A reserva ficou sem confirmação de pagamento dentro do prazo e foi cancelada.\n"
-                                f"Sem problema: é só fazer a inscrição novamente quando quiser."
+                                "A reserva ficou sem confirmação de pagamento dentro do prazo e foi cancelada.\n"
+                                "Sem problema: é só fazer a inscrição novamente quando quiser."
                             ))
                     if pendentes_antigas:
                         await db.commit()
@@ -9196,7 +9219,7 @@ async def loop_expirar():
                         pass
 
             for canal, titulo, mensagem in avisos:
-                asyncio.create_task(_fechar_canal_reserva(canal, mensagem, titulo))
+                _disparar_tarefa_rastreada(_fechar_canal_reserva(canal, mensagem, titulo))
 
         except Exception as e:
             print("Erro no loop de expiração:", e)
@@ -10027,7 +10050,10 @@ def _embed_jogador_ff(dados: dict, local: Optional[dict] = None, blacklist: Opti
     descricao = f"> 📡 Fonte: `{origem}`"
     if dados.get("cache") and dados.get("atualizado"):
         try:
-            quando = datetime.datetime.fromisoformat(dados["atualizado"]).astimezone(TZ_BRASILIA)
+            _quando_cache = datetime.datetime.fromisoformat(dados["atualizado"])
+            if _quando_cache.tzinfo is None:
+                _quando_cache = _quando_cache.replace(tzinfo=TZ_BRASILIA)
+            quando = _quando_cache.astimezone(TZ_BRASILIA)
             descricao += f" • `{quando.strftime('%d/%m às %H:%M')}`"
         except Exception:
             pass
@@ -12460,6 +12486,7 @@ async def movimentar_saldo(user_id: int, guild_id: int, valor: float, tipo: str,
         atual = arredondar(linha["saldo"] if linha else 0)
         novo = arredondar(atual + valor)
         if novo < 0 and not permitir_negativo:
+            await db.rollback()
             return None
         await db.execute(
             "UPDATE carteira SET saldo = ?, atualizado_em = ? WHERE user_id = ? AND guild_id = ?",
@@ -13198,7 +13225,7 @@ class SaqueModal(discord.ui.Modal, title="💸 Sacar — PIX"):
             f"carteira.\n> 🔖 Protocolo: `#{saque_id}`\n"
             f"> 📋 Status: **{'liberado para pagar ✅' if liberado else 'na fila de pagamento 🤝'}**\n"
             f"> 🏦 Chave: `{mascarar_chave(chave)}`"
-            + (f"\n> ⏱️ O pagamento sai pelo **dono/gerente** — de minutos até 24h ou mais."
+            + ("\n> ⏱️ O pagamento sai pelo **dono/gerente** — de minutos até 24h ou mais."
                if liberado else "\n> ⏳ Entra na fila de pagamento assim que o caixa liberar."),
             "Amarelo", marcar=None)
         await notificar_saque(interaction.guild, saque_id)
@@ -14547,7 +14574,7 @@ async def cmd_logs(interaction: discord.Interaction, acao: app_commands.Choice[s
             embed=criar_embed("✅ Canal configurado",
                               f"Os anúncios de **{rotulo}** vão sair em {canal.mention}.\n\n"
                               + dica_canal +
-                              f"> 💛 Use `/logs acao:Testar` pra ver como fica.", "Esmeralda"), ephemeral=True)
+                              "> 💛 Use `/logs acao:Testar` pra ver como fica.", "Esmeralda"), ephemeral=True)
         await registrar_log(interaction.guild, "⚙️ CONFIG", "📢 Canal público configurado",
                             f"{acao.name} → {canal.mention}", "Azul")
         return
@@ -16257,6 +16284,7 @@ async def movimentar_trabalho(user_id: int, guild_id: int, valor: float, tipo: s
         atual = arredondar(linha["saldo"] if linha else 0)
         novo = arredondar(atual + valor)
         if novo < 0 and not permitir_negativo:
+            await db.rollback()
             return None
         await db.execute("UPDATE carteira_trabalho SET saldo = ?, atualizado_em = ? WHERE user_id = ? AND guild_id = ?",
                          (novo, agora_brt().isoformat(), user_id, guild_id))
@@ -18174,7 +18202,7 @@ async def registrar_log_suporte(guild, tipo: str, titulo: str, descricao: str, c
     if not canal:
         return
     try:
-        await canal.send(embed=criar_embed(titulo, descricao, cor, footer=f"🔥 Fire Force • atendimento"))
+        await canal.send(embed=criar_embed(titulo, descricao, cor, footer="🔥 Fire Force • atendimento"))
     except Exception:
         pass
 
@@ -18762,7 +18790,9 @@ async def loop_cupons():
                 expirado = False
                 if cupom["expira_em"]:
                     try:
-                        expirado = agora_brt() > datetime.datetime.fromisoformat(str(cupom["expira_em"]))
+                        # expira_em é digitado como DD/MM/AAAA (validado na criação)
+                        expirado = agora_brt().replace(tzinfo=None) > datetime.datetime.strptime(
+                            str(cupom["expira_em"]).strip(), "%d/%m/%Y")
                     except Exception:
                         expirado = False
                 if esgotado:
@@ -18778,7 +18808,6 @@ async def loop_cupons():
 
 async def evento_ativo(guild_id: int, valor: float = None, tipo: str = None, categoria: str = None):
     """Evento rolando agora (e compatível com o diário, se informado)."""
-    agora = agora_brt().isoformat()
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         eventos = await (await db.execute(
@@ -18787,7 +18816,10 @@ async def evento_ativo(guild_id: int, valor: float = None, tipo: str = None, cat
     for evento in eventos:
         if evento["fim_em"]:
             try:
-                if agora_brt() > datetime.datetime.fromisoformat(str(evento["fim_em"])):
+                _fim = datetime.datetime.fromisoformat(str(evento["fim_em"]))
+                if _fim.tzinfo is None:
+                    _fim = _fim.replace(tzinfo=TZ_BRASILIA)
+                if agora_brt() > _fim:
                     continue
             except Exception:
                 pass
@@ -21645,7 +21677,7 @@ async def _checar_e_aplicar_auto_update() -> tuple[str, str]:
             await asyncio.sleep(1.2)
             await bot.close()
 
-        asyncio.create_task(_fechar_apos_resposta())
+        _disparar_tarefa_rastreada(_fechar_apos_resposta())
         return ("aplicando", msg_upd)
 
 
@@ -22090,7 +22122,6 @@ class PatenteCargoRoleView(discord.ui.View):
         return True
 
     async def _salvar_cargo(self, interaction: discord.Interaction):
-        cargo = interaction.data.get("resolved", {}).get("roles", {})
         rid = int(interaction.data["values"][0])
         role_obj = interaction.guild.get_role(rid)
         if not role_obj or role_obj.is_default() or role_obj.managed:
