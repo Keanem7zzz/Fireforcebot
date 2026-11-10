@@ -1,11 +1,14 @@
 # ══════════════════════════════════════════════════════════════
-#  🔥 FIRE FORCE — BOT PREMIUM v13.7.2 (BLINDADO & AUTO-UPDATE)
+#  🔥 FIRE FORCE — BOT PREMIUM v13.8.0 (BLINDADO & AUTO-UPDATE)
 #  Liga Oficial de Diários Free Fire
 #
 #  • Consulta de ID do Free Fire OB55 multi-provedor + cache + Avatar/Clã
-#  • Tabelas Oficiais HD, Card de Perfil HD e Card de Booyah HD (Vermelho Escuro & Preto)
+#  • Tabelas Oficiais HD, Card de Perfil HD, Card de Booyah HD (Vermelho Escuro & Preto)
 #  • Finalização de Diário em 2 Etapas (Premiação por Kill + Ticket de Recebimento)
 #  • Carteira Minimalista Privada, PIX Direto ao ADM, Vaga VIP e Carteira do Suporte
+#  • Sistema de Influenciadores: painel "Virar Influenciador" + ticket privado de avaliação,
+#    comissão por convite editável (padrão e personalizada), card HD de Live confirmada
+#    no canal de Caça aos Influenciadores e cargos entregues automaticamente na aprovação
 #  • Auto-Update em segundo plano (60s) sem desligar a máquina + Encerramento Limpo de Ciclo
 #  • Blindagem Anti-Falhas: SQLite WAL + busy_timeout global, Escudo Global de Views/Modals,
 #    Roteador Dinâmico de Componentes Persistentes e Trava Anti-Wipe no Supabase
@@ -20,7 +23,9 @@ import ast
 import base64
 import gzip
 import hashlib
+import html as _html_mod
 import json
+import urllib.parse as _urlparse
 import logging
 import math
 import os
@@ -89,7 +94,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.7.2"
+VERSAO_BOT = "13.8.0"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -99,6 +104,10 @@ SUPABASE_KEEPALIVE_SEGUNDOS = max(3600, int(os.getenv("SUPABASE_PING_HORAS", "48
 AUTO_UPDATE_ATIVO = os.getenv("AUTO_UPDATE", "1").strip().lower() not in ("0", "false", "nao", "não", "off")
 AUTO_UPDATE_SEGUNDOS = max(30, int(os.getenv("AUTO_UPDATE_SEGUNDOS", "60")))
 AUTO_UPDATE_EXIT_CODE = 42
+# Interruptor geral do programa de influenciadores. FF_INFLUENCIADORES=0 desliga tudo
+# (painel público, candidatura, live no diário, anúncio de Caça, comissão e comandos)
+# sem precisar de revert de código. Padrão: ligado.
+INFLUENCIADORES_ATIVO = os.getenv("FF_INFLUENCIADORES", "1").strip().lower() not in ("0", "false", "nao", "não", "off")
 AUTO_UPDATE_REPO_RAW = os.getenv(
     "AUTO_UPDATE_RAW_URL",
     "https://raw.githubusercontent.com/Keanem7zzz/Fireforcebot/main/fireforce_bot.py",
@@ -870,6 +879,57 @@ async def init_db():
             aprovado_em TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS influenciadores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            ff_uid TEXT DEFAULT '',
+            ff_nome TEXT DEFAULT '',
+            yt_url TEXT DEFAULT '',
+            yt_nome TEXT DEFAULT '',
+            yt_seguidores TEXT DEFAULT '',
+            yt_foto TEXT DEFAULT '',
+            ig_url TEXT DEFAULT '',
+            ig_nome TEXT DEFAULT '',
+            ig_seguidores TEXT DEFAULT '',
+            ig_foto TEXT DEFAULT '',
+            tt_url TEXT DEFAULT '',
+            tt_nome TEXT DEFAULT '',
+            tt_seguidores TEXT DEFAULT '',
+            tt_foto TEXT DEFAULT '',
+            frequencia_info TEXT DEFAULT '',
+            status TEXT DEFAULT 'pendente',
+            taxa_convite_custom REAL DEFAULT 0,
+            total_convites_pagos INTEGER DEFAULT 0,
+            total_comissao_recebida REAL DEFAULT 0,
+            canal_ticket_id INTEGER,
+            msg_ticket_id INTEGER,
+            assumido_por INTEGER,
+            aprovado_por INTEGER,
+            criado_em TEXT,
+            aprovado_em TEXT,
+            atualizado_em TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_influenciadores_guild_status
+            ON influenciadores (guild_id, status);
+        CREATE INDEX IF NOT EXISTS idx_influenciadores_guild_user
+            ON influenciadores (guild_id, user_id);
+
+        CREATE TABLE IF NOT EXISTS influenciador_comissoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            influencer_user_id INTEGER NOT NULL,
+            ciclo TEXT NOT NULL,
+            convites INTEGER NOT NULL,
+            valor_unitario REAL NOT NULL,
+            valor_total REAL NOT NULL,
+            pago_por INTEGER,
+            criado_em TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_influenciador_comissoes_user
+            ON influenciador_comissoes (guild_id, influencer_user_id);
+
         CREATE TABLE IF NOT EXISTS divulgacoes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER NOT NULL,
@@ -918,6 +978,8 @@ async def init_db():
             ("slots", "valor_moedas", "REAL DEFAULT 0"),
             ("slots", "taxa_adm_pix", "REAL DEFAULT 0"),
             ("slots", "usou_vaga_vip", "INTEGER DEFAULT 0"),
+            ("slots", "influencer_em_live", "INTEGER DEFAULT 0"),
+            ("slots", "influencer_anunciado", "INTEGER DEFAULT 0"),
             ("paineis", "repetir_diario", "INTEGER DEFAULT 0"),
             ("horarios", "data_ciclo", "TEXT"),
             ("horarios", "encerrado_hoje", "INTEGER DEFAULT 0"),
@@ -928,6 +990,14 @@ async def init_db():
             ("config", "manutencao_ativa", "INTEGER DEFAULT 0"),
             ("config", "manutencao_motivo", "TEXT"),
             ("config", "canal_booyah", "INTEGER"),
+            ("config", "cargo_influencer", "INTEGER"),
+            ("config", "canal_caca_influencer", "INTEGER"),
+            ("config", "inf_valor_convite", "REAL DEFAULT 0.25"),
+            ("config", "inf_req_yt_min", "INTEGER DEFAULT 500"),
+            ("config", "inf_req_ig_min", "INTEGER DEFAULT 1000"),
+            ("config", "inf_req_tt_min", "INTEGER DEFAULT 1000"),
+            ("config", "inf_req_extra", "TEXT"),
+            ("config", "inf_ciclo_comissao", "TEXT DEFAULT 'semana'"),
             ("ff_cache", "avatar_id", "TEXT"),
             ("ff_cache", "avatar_url", "TEXT"),
             ("horarios", "finalizado_aviso", "INTEGER DEFAULT 0"),
@@ -6552,6 +6622,19 @@ async def _executar_reserva_slot(
         ephemeral=True,
     )
     await rebuild_painel(interaction.guild, horario["painel_id"])
+
+    # 🎬 Influenciador aprovado? Pergunta se está em LIVE para o Caça aos Influenciadores
+    try:
+        if INFLUENCIADORES_ATIVO and await usuario_eh_influenciador(interaction.guild.id, interaction.user.id):
+            await enviar_pergunta_live_influencer(
+                interaction.guild,
+                canal_pagamento,
+                int(slot_id),
+                interaction.user.id,
+                formatar_rotulo_diario(tipo_h, categoria_h),
+            )
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] pergunta de live pós-reserva: {type(erro).__name__}: {erro}")
 
 
 # ==================== MODAL DE COMPRA DE SLOT ====================
@@ -12790,6 +12873,19 @@ async def pos_aprovacao(guild, slot, horario, staff_id: Optional[int] = None, or
         except Exception as erro:
             _log_arquivo(f"[PATENTE] pós-aprovação user={comprador}: {erro}")
 
+    # 🎬 Influenciador em LIVE confirmou a reserva? Publica o card de Caça aos Influenciadores
+    try:
+        if (
+            INFLUENCIADORES_ATIVO
+            and guild
+            and comprador
+            and int(slot_dict.get("influencer_em_live") or 0) == 1
+            and int(slot_dict.get("influencer_anunciado") or 0) == 0
+        ):
+            await anunciar_caca_influencer_do_slot(guild, int(slot_id))
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] anúncio pós-aprovação slot={slot_id}: {type(erro).__name__}: {erro}")
+
 
 async def aprovar_pagamento(guild, slot_id: int, staff_id: Optional[int] = None,
                             origem: str = "carteira"):
@@ -15249,6 +15345,7 @@ SYNC_LIMITE_TABELAS = {
     "transacoes": 4000, "livro_caixa": 4000, "comissoes": 2000,
     "ganhos_trabalho": 2000, "avaliacoes": 1000, "livepix_vistos": 800,
     "ff_cache": 1500, "eventos": 300,
+    "influenciadores": 1000, "influenciador_comissoes": 3000,
 }
 SUPABASE_CHUNK_MAX_CHARS = 1_800_000
 _sync_sujo = False
@@ -21473,6 +21570,3410 @@ async def cmd_divulgacao(interaction: discord.Interaction):
     )
 
 
+# ══════════════════════════════════════════════════════════════
+#  🎬 SISTEMA DE INFLUENCIADORES & CAÇA AOS INFLUENCIADORES (v13.8.0)
+#  • Resolução em tempo real de YouTube, Instagram e TikTok (sem Kwai)
+#  • Card HD "Dark Red & Black" com as redes na ordem YouTube ➜ Instagram ➜ TikTok
+#  • Painel público "Virar Influenciador" + ticket de avaliação privado
+#  • /influenciador: Admin Hub (200+ em páginas de 20) e Autoatendimento
+# ══════════════════════════════════════════════════════════════
+
+_REDES_INFLUENCER = ("youtube", "instagram", "tiktok")
+_REDE_ROTULO = {"youtube": "YouTube", "instagram": "Instagram", "tiktok": "TikTok"}
+_REDE_LABEL_SEG = {"youtube": "INSCRITOS", "instagram": "SEGUIDORES", "tiktok": "SEGUIDORES"}
+_REDE_COR = {
+    "youtube": (232, 32, 48),
+    "instagram": (214, 42, 128),
+    "tiktok": (52, 214, 208),
+}
+_INF_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_INF_SESSAO = None
+_INF_CACHE_RESOLVE: dict = {}
+_INF_CACHE_MAX = 260
+
+
+def _inf_sessao():
+    """Sessão HTTP dedicada à leitura pública de perfis sociais (UA de navegador real)."""
+    global _INF_SESSAO
+    if _INF_SESSAO is None or _INF_SESSAO.closed:
+        conector = aiohttp.TCPConnector(limit=24, ttl_dns_cache=900)
+        _INF_SESSAO = aiohttp.ClientSession(
+            connector=conector,
+            timeout=aiohttp.ClientTimeout(total=12, connect=5),
+            headers={"User-Agent": _INF_UA, "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
+        )
+    return _INF_SESSAO
+
+
+def formatar_numero_social(valor, maiusculo: bool = False) -> str:
+    """1200 ➜ '1,2 mil' | 1450000 ➜ '1,4 mi' | 950 ➜ '950' (padrão brasileiro)."""
+    try:
+        numero = int(float(valor or 0))
+    except Exception:
+        return ""
+    if numero <= 0:
+        return ""
+    if numero >= 1_000_000_000:
+        base, sufixo = numero / 1_000_000_000, " bi"
+    elif numero >= 1_000_000:
+        base, sufixo = numero / 1_000_000, " mi"
+    elif numero >= 1_000:
+        base, sufixo = numero / 1_000, " mil"
+    else:
+        return str(numero)
+    texto = f"{base:.1f}".replace(".", ",")
+    if texto.endswith(",0"):
+        texto = texto[:-2]
+    final = texto + sufixo
+    return final.upper() if maiusculo else final
+
+
+def _parse_numero_social(texto) -> int:
+    """Lê '1,2 mil inscritos', '12.3K followers' ou '1.234' e devolve o inteiro."""
+    if texto is None:
+        return 0
+    bruto = str(texto).strip().lower().replace("\xa0", " ")
+    if not bruto:
+        return 0
+    achado = re.search(r"(\d[\d.,\s]*)\s*(mil|mi|bi|k|m|b)?", bruto)
+    if not achado:
+        return 0
+    numero_txt = (achado.group(1) or "").strip().replace(" ", "")
+    sufixo = (achado.group(2) or "").strip()
+    multiplicador = {
+        "mil": 1_000, "k": 1_000,
+        "mi": 1_000_000, "m": 1_000_000,
+        "bi": 1_000_000_000, "b": 1_000_000_000,
+    }.get(sufixo, 1)
+    if multiplicador > 1:
+        # Com sufixo (mil/K/mi): o separador decimal é o ÚLTIMO ponto/vírgula da string
+        if "," in numero_txt and "." in numero_txt:
+            if numero_txt.rfind(",") > numero_txt.rfind("."):
+                numero_txt = numero_txt.replace(".", "").replace(",", ".")
+            else:
+                numero_txt = numero_txt.replace(",", "")
+        elif "," in numero_txt:
+            numero_txt = numero_txt.replace(",", ".")
+    else:
+        # Sem sufixo: ponto = milhar (pt-BR), vírgula = decimal
+        numero_txt = numero_txt.replace(".", "").replace(",", ".")
+    try:
+        valor = float(numero_txt)
+    except Exception:
+        return 0
+    if valor < 0:
+        return 0
+    return int(valor * multiplicador)
+
+
+def _inf_limpar_entrada(valor: str) -> str:
+    """Aceita '@nick', 'nick', 'youtube.com/@nick', '.../@nick?si=xx' e devolve só o miolo."""
+    bruto = str(valor or "").strip()
+    if not bruto:
+        return ""
+    bruto = bruto.replace(" ", "")
+    if bruto.lower().startswith(("http://", "https://")):
+        try:
+            partes = _urlparse.urlsplit(bruto)
+            bruto = partes.path or ""
+        except Exception:
+            bruto = bruto.split("//", 1)[-1]
+    bruto = bruto.split("?", 1)[0].split("#", 1)[0]
+    bruto = bruto.strip().strip("/")
+    return bruto
+
+
+def _inf_extrair_youtube(valor: str) -> tuple:
+    """Devolve ('handle', 'nome') ou ('canal', 'UC...') a partir de qualquer formato do YouTube."""
+    bruto = str(valor or "").strip()
+    if not bruto:
+        return ("", "")
+    baixo = bruto.lower()
+    if "youtube.com/channel/" in baixo or "youtube.com/c/" in baixo or "youtube.com/user/" in baixo:
+        caminho = _inf_limpar_entrada(bruto)
+        for marca in ("channel/", "c/", "user/"):
+            if f"/{marca}" in f"/{caminho}":
+                resto = caminho.split(marca, 1)[1].strip().strip("/")
+                if resto:
+                    tipo = "canal" if marca == "channel/" else "handle"
+                    return (tipo, resto)
+    limpo = _inf_limpar_entrada(bruto)
+    if limpo.lower().startswith("youtube.com") or limpo.lower().startswith("www.youtube.com") or limpo.lower().startswith("m.youtube.com"):
+        limpo = limpo.split("/", 1)[-1] if "/" in limpo else limpo
+    limpo = limpo.strip().lstrip("@")
+    if "/" in limpo:
+        limpo = limpo.split("/", 1)[0]
+    return ("handle", limpo.strip())
+
+
+def _inf_extrair_instagram(valor: str) -> str:
+    bruto = str(valor or "").strip()
+    if not bruto:
+        return ""
+    limpo = _inf_limpar_entrada(bruto)
+    baixo = limpo.lower()
+    for prefixo in ("www.instagram.com/", "instagram.com/", "m.instagram.com/", "instagr.am/"):
+        if baixo.startswith(prefixo):
+            limpo = limpo[len(prefixo):]
+            baixo = limpo.lower()
+            break
+    if "/" in limpo:
+        limpo = limpo.split("/", 1)[0]
+    if limpo.lower() in ("p", "reel", "reels", "stories", "explore", "tv"):
+        return ""
+    return limpo.strip().lstrip("@").strip(".")
+
+
+def _inf_extrair_tiktok(valor: str) -> str:
+    bruto = str(valor or "").strip()
+    if not bruto:
+        return ""
+    limpo = _inf_limpar_entrada(bruto)
+    baixo = limpo.lower()
+    if "tiktok.com/" in baixo:
+        resto = limpo[baixo.index("tiktok.com/") + len("tiktok.com/"):]
+        if "/" in resto:
+            resto = resto.split("/", 1)[0]
+        limpo = resto
+    if limpo.lower().startswith("@"):
+        limpo = limpo[1:]
+    if "/" in limpo:
+        limpo = limpo.split("/", 1)[0]
+    return limpo.strip().strip(".")
+
+
+def _inf_normalizar_url(rede: str, tipo: str, valor: str) -> str:
+    if not valor:
+        return ""
+    if rede == "youtube":
+        if tipo == "canal":
+            return f"https://www.youtube.com/channel/{valor}"
+        return f"https://www.youtube.com/@{valor}"
+    if rede == "instagram":
+        return f"https://www.instagram.com/{valor}/"
+    if rede == "tiktok":
+        return f"https://www.tiktok.com/@{valor}"
+    return ""
+
+
+def _inf_url_absoluta(url: str) -> str:
+    texto = str(url or "").strip()
+    if not texto:
+        return ""
+    if texto.startswith("//"):
+        return "https:" + texto
+    if texto.startswith("http://"):
+        return "https://" + texto[len("http://"):]
+    return texto
+
+
+async def _inf_http_texto(url: str, headers: Optional[dict] = None, limite: float = 9.0) -> Optional[str]:
+    """GET simples devolvendo o HTML/JSON como texto (nunca levanta exceção)."""
+    if not url:
+        return None
+    cabecalhos = {
+        "User-Agent": _INF_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    }
+    if headers:
+        cabecalhos.update(headers)
+    try:
+        sessao = _inf_sessao()
+        async with sessao.get(
+            url, headers=cabecalhos, allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=limite, connect=4.5),
+        ) as resposta:
+            if resposta.status != 200:
+                return None
+            bruto = await resposta.read()
+            if not bruto:
+                return None
+            if len(bruto) > 6_000_000:
+                bruto = bruto[:6_000_000]
+            return bruto.decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+async def _inf_http_json(url: str, headers: Optional[dict] = None, limite: float = 8.0) -> Optional[dict]:
+    texto = await _inf_http_texto(url, headers=headers, limite=limite)
+    if not texto:
+        return None
+    try:
+        dados = json.loads(texto)
+    except Exception:
+        return None
+    return dados if isinstance(dados, dict) else None
+
+
+def _inf_primeira_foto(*urls) -> str:
+    for url in urls:
+        texto = _inf_url_absoluta(url or "")
+        if texto:
+            return texto
+    return ""
+
+
+async def resolver_youtube(valor: str) -> dict:
+    """Lê nome, @ e inscritos reais do YouTube (HTML público + fallback unavatar.io)."""
+    tipo, chave = _inf_extrair_youtube(valor)
+    resultado = {
+        "rede": "youtube", "ok": False, "url": "", "nome": "", "arroba": "",
+        "seguidores": "", "seguidores_num": 0, "foto": "", "fonte": "",
+    }
+    if not chave:
+        return resultado
+    url = _inf_normalizar_url("youtube", tipo, chave)
+    resultado["url"] = url
+    cabecalhos = {
+        "Cookie": "SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+000; PREF=hl=pt&gl=BR",
+        "Referer": "https://www.youtube.com/",
+    }
+    paginas = [url]
+    if tipo == "handle":
+        paginas.append(f"{url}/about")
+    html_principal = ""
+    for indice, pagina in enumerate(paginas):
+        html = await _inf_http_texto(pagina, headers=cabecalhos, limite=10.0)
+        if not html:
+            continue
+        if indice == 0:
+            html_principal = html
+
+        if not resultado["nome"]:
+            for padrao in (
+                r'"pageHeaderViewModel":\{"title":\{"dynamicTextViewModel":\{"text":\{"content":"(.*?)"',
+                r'"channelMetadataRenderer":\{"title":"(.*?)"',
+                r'"metadataParts":\[\{"text":\{"content":"(.*?)"',
+                r'<meta property="og:title" content="(.*?)"',
+            ):
+                achado = re.search(padrao, html, re.S)
+                if achado:
+                    nome = _html_mod.unescape(achado.group(1)).strip()
+                    nome = re.sub(r"\s*-\s*YouTube$", "", nome).strip()
+                    if nome and not nome.lower().startswith("before you continue"):
+                        resultado["nome"] = nome
+                        break
+
+        if not resultado["seguidores"]:
+            for padrao in (
+                r'"subscriberCountText":\{"accessibility":\{"accessibilityData":\{"label":"(.*?)"',
+                r'"subscriberCountText":\{"simpleText":"(.*?)"',
+                r'"content":"([\d.,]+\s*(?:mil|mi|milh(?:ão|ões)|[KMB]))\s*inscritos?"',
+                r'([\d.,]+\s*(?:mil|mi|[KMB]))\s*inscritos',
+            ):
+                achado = re.search(padrao, html, re.S | re.I)
+                if achado:
+                    bruto = _html_mod.unescape(achado.group(1)).strip()
+                    numero = _parse_numero_social(bruto)
+                    if numero > 0:
+                        resultado["seguidores_num"] = numero
+                        resultado["seguidores"] = formatar_numero_social(numero)
+                        break
+
+        if not resultado["foto"]:
+            # O ytInitialData muda de formato com frequência: pega qualquer CDN de avatar
+            # (yt3/ggpht) priorizando as versões que servem a foto do canal.
+            candidatos_avatar = re.findall(
+                r'https://(?:yt3\.googleusercontent\.com|yt3\.ggpht\.com)/[^"\\\s]+', html
+            )
+            melhor = ""
+            for candidato in candidatos_avatar:
+                if any(marca in candidato for marca in ("-no-rj", "s176", "s240", "s800", "s900")):
+                    melhor = candidato
+                    break
+            if not melhor and candidatos_avatar:
+                melhor = candidatos_avatar[0]
+            if melhor:
+                resultado["foto"] = _inf_url_absoluta(
+                    melhor.replace("\\u0026", "&").replace("\\/", "/")
+                )
+
+        if resultado["nome"] and resultado["seguidores"] and resultado["foto"]:
+            break
+
+    if not resultado["arroba"]:
+        if tipo == "handle":
+            resultado["arroba"] = f"@{chave}"
+        else:
+            achado = re.search(r'"canonicalBaseUrl":"/(@[^"]+)"', html_principal or "")
+            resultado["arroba"] = achado.group(1) if achado else ""
+
+    if not resultado["foto"] and tipo == "handle":
+        resultado["foto"] = f"https://unavatar.io/youtube/@{chave}?fallback=false"
+
+    if not resultado["nome"]:
+        resultado["nome"] = chave
+    resultado["ok"] = bool(resultado["seguidores_num"] > 0)
+    resultado["fonte"] = "youtube-html"
+    return resultado
+
+
+async def resolver_instagram(valor: str) -> dict:
+    """Lê nome, @ e seguidores reais do Instagram (API web + OG meta + embed)."""
+    usuario = _inf_extrair_instagram(valor)
+    resultado = {
+        "rede": "instagram", "ok": False, "url": "", "nome": "", "arroba": "",
+        "seguidores": "", "seguidores_num": 0, "foto": "", "fonte": "",
+    }
+    if not usuario:
+        return resultado
+    url = _inf_normalizar_url("instagram", "handle", usuario)
+    resultado["url"] = url
+    resultado["arroba"] = f"@{usuario}"
+
+    cabecalhos_api = {
+        "x-ig-app-id": "936619743392459",
+        "Accept": "*/*",
+        "Referer": f"https://www.instagram.com/{usuario}/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    dados = await _inf_http_json(
+        f"https://www.instagram.com/api/v1/users/web_profile_info/?username={_urlparse.quote(usuario)}",
+        headers=cabecalhos_api, limite=8.0,
+    )
+    try:
+        no = ((dados or {}).get("data") or {}).get("user") or {}
+        if no:
+            resultado["nome"] = str(no.get("full_name") or "").strip()
+            resultado["seguidores_num"] = int(((no.get("edge_followed_by") or {}).get("count")) or 0)
+            resultado["foto"] = _inf_url_absoluta(no.get("profile_pic_url_hd") or no.get("profile_pic_url") or "")
+            if no.get("username"):
+                resultado["arroba"] = f"@{no['username']}"
+            resultado["fonte"] = "instagram-api"
+    except Exception:
+        pass
+
+    if not (resultado["nome"] and resultado["seguidores_num"] > 0):
+        html = await _inf_http_texto(
+            f"{url}?hl=pt-br",
+            headers={"Referer": "https://www.instagram.com/", "Accept-Language": "pt-BR,pt;q=0.9"},
+            limite=10.0,
+        )
+        if html:
+            titulo = re.search(r'<meta property="og:title" content="(.*?)"', html, re.S)
+            if titulo and not resultado["nome"]:
+                limpo = _html_mod.unescape(titulo.group(1))
+                limpo = re.split(r"\s*\(@", limpo)[0]
+                limpo = re.sub(r"\s*(•|no Instagram|on Instagram|\(@).*$", "", limpo, flags=re.I).strip()
+                if limpo and limpo.lower() not in ("instagram", "login • instagram"):
+                    resultado["nome"] = limpo
+            descricao = re.search(r'<meta property="og:description" content="(.*?)"', html, re.S)
+            if descricao and resultado["seguidores_num"] <= 0:
+                texto_desc = _html_mod.unescape(descricao.group(1))
+                achado = re.search(
+                    r"([\d.,]+\s*(?:mil|mi|[KMB])?)\s*(?:Followers|seguidores)", texto_desc, re.I
+                )
+                if achado:
+                    resultado["seguidores_num"] = _parse_numero_social(achado.group(1))
+            imagem = re.search(r'<meta property="og:image" content="(.*?)"', html, re.S)
+            if imagem and not resultado["foto"]:
+                resultado["foto"] = _inf_url_absoluta(_html_mod.unescape(imagem.group(1)))
+            if resultado["seguidores_num"] > 0:
+                resultado["fonte"] = resultado["fonte"] or "instagram-og"
+
+    if resultado["seguidores_num"] <= 0:
+        html_embed = await _inf_http_texto(
+            f"https://www.instagram.com/{usuario}/embed/captioned/",
+            headers={"Referer": "https://www.instagram.com/"}, limite=9.0,
+        )
+        if html_embed:
+            achado = re.search(r'"edge_followed_by":\{"count":(\d+)\}', html_embed)
+            if achado:
+                resultado["seguidores_num"] = int(achado.group(1))
+            if not resultado["nome"]:
+                achado_nome = re.search(r'"full_name":"(.*?)"', html_embed)
+                if achado_nome:
+                    resultado["nome"] = _html_mod.unescape(achado_nome.group(1)).strip()
+            if not resultado["foto"]:
+                achado_foto = re.search(r'"profile_pic_url":"(.*?)"', html_embed)
+                if achado_foto:
+                    resultado["foto"] = _inf_url_absoluta(achado_foto.group(1).replace("\\u0026", "&").replace("\\/", "/"))
+            if resultado["seguidores_num"] > 0:
+                resultado["fonte"] = resultado["fonte"] or "instagram-embed"
+
+    if resultado["seguidores_num"] > 0:
+        resultado["seguidores"] = formatar_numero_social(resultado["seguidores_num"])
+    if not resultado["foto"]:
+        resultado["foto"] = f"https://unavatar.io/instagram/{usuario}?fallback=false"
+    if not resultado["nome"]:
+        resultado["nome"] = usuario
+    resultado["ok"] = bool(resultado["seguidores_num"] > 0 or resultado["foto"])
+    return resultado
+
+
+async def resolver_tiktok(valor: str) -> dict:
+    """Lê nome, @ e seguidores reais do TikTok (tikwm + rehydration HTML + unavatar)."""
+    usuario = _inf_extrair_tiktok(valor)
+    resultado = {
+        "rede": "tiktok", "ok": False, "url": "", "nome": "", "arroba": "",
+        "seguidores": "", "seguidores_num": 0, "foto": "", "fonte": "",
+    }
+    if not usuario:
+        return resultado
+    url = _inf_normalizar_url("tiktok", "handle", usuario)
+    resultado["url"] = url
+    resultado["arroba"] = f"@{usuario}"
+
+    dados = await _inf_http_json(
+        f"https://www.tikwm.com/api/user/info?unique_id={_urlparse.quote(usuario)}",
+        headers={"Referer": "https://www.tikwm.com/"}, limite=9.0,
+    )
+    try:
+        info = (dados or {}).get("data") or {}
+        no = info.get("user") or {}
+        if no:
+            resultado["nome"] = str(no.get("nickname") or "").strip()
+            resultado["foto"] = _inf_url_absoluta(no.get("avatarLarger") or no.get("avatarMedium") or no.get("avatarThumb") or "")
+            if no.get("uniqueId"):
+                resultado["arroba"] = f"@{no['uniqueId']}"
+        stats = info.get("stats") or {}
+        if stats.get("followerCount"):
+            resultado["seguidores_num"] = int(stats["followerCount"])
+            resultado["fonte"] = "tikwm"
+    except Exception:
+        pass
+
+    if not resultado["nome"] or resultado["seguidores_num"] <= 0:
+        html = await _inf_http_texto(
+            f"{url}?lang=pt-BR",
+            headers={"Referer": "https://www.tiktok.com/", "Accept-Language": "pt-BR,pt;q=0.9"},
+            limite=10.0,
+        )
+        if html:
+            bloco = re.search(
+                r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">(.*?)</script>',
+                html, re.S,
+            )
+            if bloco:
+                try:
+                    dados_html = json.loads(bloco.group(1))
+                    escopo = dados_html.get("__DEFAULT_SCOPE__") or {}
+                    detalhe = escopo.get("webapp.user-detail") or {}
+                    usuario_json = (detalhe.get("userInfo") or {}).get("user") or {}
+                    if usuario_json:
+                        if not resultado["nome"]:
+                            resultado["nome"] = str(usuario_json.get("nickname") or "").strip()
+                        if not resultado["foto"]:
+                            resultado["foto"] = _inf_url_absoluta(usuario_json.get("avatarLarger") or avatar_ou_vazio(usuario_json))
+                        if usuario_json.get("uniqueId") and not resultado["arroba"]:
+                            resultado["arroba"] = f"@{usuario_json['uniqueId']}"
+                    if resultado["seguidores_num"] <= 0:
+                        stats = (detalhe.get("userInfo") or {}).get("stats") or {}
+                        if stats.get("followerCount"):
+                            resultado["seguidores_num"] = int(stats["followerCount"])
+                            resultado["fonte"] = resultado["fonte"] or "tiktok-html"
+                except Exception:
+                    pass
+            if resultado["seguidores_num"] <= 0:
+                achado = re.search(r'"followerCount":(\d+)', html)
+                if achado:
+                    resultado["seguidores_num"] = int(achado.group(1))
+                    resultado["fonte"] = resultado["fonte"] or "tiktok-html"
+            if not resultado["nome"]:
+                achado_nome = re.search(r'<meta property="og:title" content="(.*?)"', html, re.S)
+                if achado_nome:
+                    limpo = _html_mod.unescape(achado_nome.group(1))
+                    limpo = re.sub(r"\s*\(@.*$", "", limpo).strip()
+                    if limpo:
+                        resultado["nome"] = limpo
+            if not resultado["foto"]:
+                achado_foto = re.search(r'<meta property="og:image" content="(.*?)"', html, re.S)
+                if achado_foto:
+                    resultado["foto"] = _inf_url_absoluta(_html_mod.unescape(achado_foto.group(1)))
+
+    if resultado["seguidores_num"] > 0:
+        resultado["seguidores"] = formatar_numero_social(resultado["seguidores_num"])
+    if not resultado["foto"]:
+        resultado["foto"] = f"https://unavatar.io/tiktok/{usuario}?fallback=false"
+    if not resultado["nome"]:
+        resultado["nome"] = usuario
+    resultado["ok"] = bool(resultado["seguidores_num"] > 0 or resultado["foto"])
+    return resultado
+
+
+def avatar_ou_vazio(dados: dict) -> str:
+    """Aceita 'avatarLarger'/'avatarMedium'/'avatarThumb' e devolve o primeiro disponível."""
+    for chave in ("avatarLarger", "avatarMedium", "avatarThumb", "avatar"):
+        valor = (dados or {}).get(chave)
+        if valor:
+            return str(valor)
+    return ""
+
+
+async def resolver_rede_influencer(rede: str, valor: str) -> dict:
+    """Resolve UMA rede com cache curto em memória (evita repetir leitura em 1 clique)."""
+    chave = f"{rede}:{str(valor or '').strip().lower()}"
+    agora = time.time()
+    em_cache = _INF_CACHE_RESOLVE.get(chave)
+    if em_cache and (agora - em_cache[0]) < 900:
+        return dict(em_cache[1])
+    try:
+        if rede == "youtube":
+            dados = await resolver_youtube(valor)
+        elif rede == "instagram":
+            dados = await resolver_instagram(valor)
+        elif rede == "tiktok":
+            dados = await resolver_tiktok(valor)
+        else:
+            dados = {"rede": rede, "ok": False, "url": "", "nome": "", "arroba": "",
+                     "seguidores": "", "seguidores_num": 0, "foto": "", "fonte": ""}
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] falha ao resolver {rede} '{valor}': {type(erro).__name__}: {erro}")
+        dados = {"rede": rede, "ok": False, "url": "", "nome": "", "arroba": "",
+                 "seguidores": "", "seguidores_num": 0, "foto": "", "fonte": ""}
+    if len(_INF_CACHE_RESOLVE) >= _INF_CACHE_MAX:
+        _INF_CACHE_RESOLVE.clear()
+    _INF_CACHE_RESOLVE[chave] = (agora, dict(dados))
+    return dados
+
+
+async def resolver_redes_influencer(entradas: dict) -> dict:
+    """Resolve {rede: link} em paralelo e devolve só as redes que realmente existem."""
+    tarefas = []
+    nomes = []
+    for rede in _REDES_INFLUENCER:
+        valor = str((entradas or {}).get(rede) or "").strip()
+        if not valor:
+            continue
+        nomes.append(rede)
+        tarefas.append(resolver_rede_influencer(rede, valor))
+    resolvidos = {}
+    if not tarefas:
+        return resolvidos
+    for rede, dados in zip(nomes, await asyncio.gather(*tarefas, return_exceptions=True)):
+        if isinstance(dados, dict) and dados.get("url"):
+            resolvidos[rede] = dados
+    return resolvidos
+
+
+async def _inf_baixar_foto(url: str) -> Optional[bytes]:
+    """Baixa a foto de perfil de verdade para o card (com validação de imagem)."""
+    texto = _inf_url_absoluta(url or "")
+    if not texto:
+        return None
+    try:
+        sessao = _inf_sessao()
+        async with sessao.get(
+            texto, headers={"User-Agent": _INF_UA, "Accept": "image/*,*/*;q=0.8"},
+            timeout=aiohttp.ClientTimeout(total=7.5, connect=3.5),
+        ) as resposta:
+            if resposta.status != 200:
+                return None
+            bruto = await resposta.read()
+    except Exception:
+        return None
+    if not bruto or len(bruto) < 300 or len(bruto) > 5_000_000:
+        return None
+    if _PIL_DISPONIVEL:
+        try:
+            with Image.open(io.BytesIO(bruto)) as teste:
+                teste.verify()
+        except Exception:
+            return None
+    return bruto
+
+
+# ---------- leitura/gravação do cadastro de influenciadores ----------
+
+_INF_COLUNAS_REDE = {
+    "youtube": ("yt_url", "yt_nome", "yt_seguidores", "yt_foto"),
+    "instagram": ("ig_url", "ig_nome", "ig_seguidores", "ig_foto"),
+    "tiktok": ("tt_url", "tt_nome", "tt_seguidores", "tt_foto"),
+}
+
+
+async def obter_influenciador(guild_id: int, user_id: int) -> Optional[dict]:
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            linha = await (await db.execute(
+                "SELECT * FROM influenciadores WHERE guild_id = ? AND user_id = ? "
+                "ORDER BY CASE status WHEN 'aprovado' THEN 0 ELSE 1 END, id DESC LIMIT 1",
+                (guild_id, user_id),
+            )).fetchone()
+        return dict(linha) if linha else None
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] obter guild={guild_id} user={user_id}: {erro}")
+        return None
+
+
+async def usuario_eh_influenciador(guild_id: int, user_id: int) -> bool:
+    """Só considera influenciador quem já foi APROVADO pela equipe."""
+    dados = await obter_influenciador(guild_id, user_id)
+    return bool(dados and str(dados.get("status") or "") == "aprovado")
+
+
+def _inf_filtro_busca(busca: str) -> tuple:
+    """Cláusula SQL + valores da busca por nome/@/ID (aceita 'canal219', '@kaique' ou 123456)."""
+    termo = str(busca or "").strip().lstrip("@")
+    if not termo:
+        return ("", [])
+    alvo = f"%{termo}%"
+    clausula = (
+        " AND (COALESCE(ff_nome, '') LIKE ? OR COALESCE(yt_nome, '') LIKE ? "
+        "OR COALESCE(ig_nome, '') LIKE ? OR COALESCE(tt_nome, '') LIKE ? "
+        "OR COALESCE(yt_url, '') LIKE ? OR COALESCE(ig_url, '') LIKE ? "
+        "OR COALESCE(tt_url, '') LIKE ? OR CAST(user_id AS TEXT) LIKE ?)"
+    )
+    return (clausula, [alvo] * 7 + [f"%{termo}%"])
+
+
+async def listar_influenciadores(guild_id: int, status: Optional[str] = None,
+                                 busca: str = "", limite: int = 0,
+                                 offset: int = 0) -> list:
+    consulta = "SELECT * FROM influenciadores WHERE guild_id = ?"
+    valores: list = [guild_id]
+    if status:
+        consulta += " AND status = ?"
+        valores.append(status)
+    clausula, valores_busca = _inf_filtro_busca(busca)
+    if clausula:
+        consulta += clausula
+        valores.extend(valores_busca)
+    consulta += " ORDER BY CASE status WHEN 'aprovado' THEN 0 WHEN 'pendente' THEN 1 ELSE 2 END, id DESC"
+    if limite and int(limite) > 0:
+        consulta += " LIMIT ? OFFSET ?"
+        valores.extend([int(limite), int(offset)])
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            linhas = await (await db.execute(consulta, tuple(valores))).fetchall()
+        return [dict(l) for l in linhas]
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] listar guild={guild_id}: {erro}")
+        return []
+
+
+async def contar_influenciadores(guild_id: int, status: Optional[str] = None, busca: str = "") -> int:
+    consulta = "SELECT COUNT(*) FROM influenciadores WHERE guild_id = ?"
+    valores: list = [guild_id]
+    if status:
+        consulta += " AND status = ?"
+        valores.append(status)
+    clausula, valores_busca = _inf_filtro_busca(busca)
+    if clausula:
+        consulta += clausula
+        valores.extend(valores_busca)
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            return int((await (await db.execute(consulta, tuple(valores))).fetchone())[0] or 0)
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] contar guild={guild_id}: {erro}")
+        return 0
+
+
+def montar_registros_redes(redes: dict) -> dict:
+    """Converte o resultado do resolvedor em colunas prontas da tabela."""
+    colunas = {}
+    for rede, campos in _INF_COLUNAS_REDE.items():
+        dados = (redes or {}).get(rede) or {}
+        colunas[campos[0]] = str(dados.get("url") or "")
+        colunas[campos[1]] = str(dados.get("nome") or "")
+        colunas[campos[2]] = str(dados.get("seguidores") or "")
+        colunas[campos[3]] = str(dados.get("foto") or "")
+    return colunas
+
+
+def redes_do_influenciador(dados: dict) -> dict:
+    """Reconstrói {rede: {url,nome,seguidores,foto}} a partir de uma linha do banco."""
+    resultado = {}
+    for rede, campos in _INF_COLUNAS_REDE.items():
+        url = str((dados or {}).get(campos[0]) or "").strip()
+        if not url:
+            continue
+        resultado[rede] = {
+            "rede": rede,
+            "url": url,
+            "nome": str((dados or {}).get(campos[1]) or "").strip(),
+            "seguidores": str((dados or {}).get(campos[2]) or "").strip(),
+            "seguidores_num": _parse_numero_social((dados or {}).get(campos[2])),
+            "foto": str((dados or {}).get(campos[3]) or "").strip(),
+        }
+    return resultado
+
+
+def total_seguidores_influenciador(dados: dict) -> int:
+    redes = redes_do_influenciador(dados)
+    return sum(int(r.get("seguidores_num") or 0) for r in redes.values())
+
+
+async def salvar_redes_influenciador(guild_id: int, user_id: int, redes: dict) -> bool:
+    """Atualiza links/nome/seguidores/fotos de um influenciador já cadastrado."""
+    colunas = montar_registros_redes(redes)
+    if not colunas:
+        return False
+    campos = ", ".join(f"{c} = ?" for c in colunas.keys())
+    valores = list(colunas.values()) + [agora_brt().isoformat(), guild_id, user_id]
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            await db.execute(
+                f"UPDATE influenciadores SET {campos}, atualizado_em = ? WHERE guild_id = ? AND user_id = ?",
+                tuple(valores),
+            )
+            await db.commit()
+        marcar_sujo()
+        return True
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] salvar redes user={user_id}: {erro}")
+        return False
+
+
+async def obter_taxa_influenciador(dados: dict, cfg: Optional[dict] = None) -> float:
+    """Taxa por convite: custom do influenciador (se > 0) ou o padrão da guild (R$ 0,25)."""
+    try:
+        custom = float((dados or {}).get("taxa_convite_custom") or 0)
+    except Exception:
+        custom = 0.0
+    if custom > 0:
+        return arredondar(custom)
+    if cfg is None:
+        try:
+            cfg = await obter_config(int((dados or {}).get("guild_id") or 0))
+        except Exception:
+            cfg = {}
+    try:
+        padrao = float((cfg or {}).get("inf_valor_convite") or 0.25)
+    except Exception:
+        padrao = 0.25
+    return arredondar(padrao if padrao > 0 else 0.25)
+
+
+async def pagar_comissao_influenciador(guild_id: int, user_id: int, ciclo: str,
+                                       convites: int, valor_unitario: float,
+                                       pago_por: int, descricao: str, ref: str = "") -> Optional[tuple]:
+    """Comissão de influenciador atômica: credita a carteira, grava a transação,
+    insere em influenciador_comissoes e atualiza os totais do cadastro — tudo em
+    UMA única transação SQLite (BEGIN IMMEDIATE). Qualquer falha reverte tudo:
+    nunca fica carteira creditada sem registro, nem registro sem dinheiro movido.
+    Devolve (comissao_id, valor_total) ou None em erro."""
+    try:
+        convites = int(convites)
+        valor_unitario = float(valor_unitario)
+        pago_por = int(pago_por)
+    except (TypeError, ValueError):
+        return None
+    if convites <= 0 or not math.isfinite(valor_unitario) or valor_unitario < 0:
+        return None
+    valor_unitario = arredondar(valor_unitario)
+    total = arredondar(valor_unitario * convites)
+    if total <= 0:
+        return None
+    agora = agora_brt().isoformat()
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            await _garantir_carteira(db, user_id, guild_id)
+            linha = await (await db.execute(
+                "SELECT saldo FROM carteira WHERE user_id = ? AND guild_id = ?", (user_id, guild_id)
+            )).fetchone()
+            atual = arredondar(linha["saldo"] if linha else 0)
+            novo = arredondar(atual + total)
+            await db.execute(
+                "UPDATE carteira SET saldo = ?, atualizado_em = ? WHERE user_id = ? AND guild_id = ?",
+                (novo, agora, user_id, guild_id)
+            )
+            await db.execute(
+                "INSERT INTO transacoes (guild_id, user_id, tipo, valor, saldo_apos, descricao, ref, criado_em) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (guild_id, user_id, "comissao_influencer", total, novo, str(descricao), str(ref), agora)
+            )
+            cursor = await db.execute(
+                "INSERT INTO influenciador_comissoes (guild_id, influencer_user_id, ciclo, convites, "
+                "valor_unitario, valor_total, pago_por, criado_em) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (guild_id, user_id, str(ciclo), convites, valor_unitario, total, pago_por, agora)
+            )
+            await db.execute(
+                "UPDATE influenciadores SET total_convites_pagos = COALESCE(total_convites_pagos, 0) + ?, "
+                "total_comissao_recebida = COALESCE(total_comissao_recebida, 0) + ?, atualizado_em = ? "
+                "WHERE guild_id = ? AND user_id = ?",
+                (convites, total, agora, guild_id, user_id)
+            )
+            await db.commit()
+            novo_id = int(cursor.lastrowid or 0)
+        marcar_sujo()
+        return novo_id, total
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] pagamento de comissão user={user_id}: {type(erro).__name__}: {erro}")
+        return None
+
+
+async def resumo_comissoes_influenciador(guild_id: int, user_id: int) -> dict:
+    """Totais pagos nos últimos 7 dias e no mês corrente para o painel do influenciador."""
+    resumo = {"semana_convites": 0, "semana_valor": 0.0, "mes_convites": 0, "mes_valor": 0.0}
+    agora = agora_brt()
+    inicio_semana = (agora - datetime.timedelta(days=7)).isoformat()
+    inicio_mes = agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            for chave, corte in (("semana", inicio_semana), ("mes", inicio_mes)):
+                linha = await (await db.execute(
+                    "SELECT COALESCE(SUM(convites), 0), COALESCE(SUM(valor_total), 0) "
+                    "FROM influenciador_comissoes WHERE guild_id = ? AND influencer_user_id = ? AND criado_em >= ?",
+                    (guild_id, user_id, corte),
+                )).fetchone()
+                resumo[f"{chave}_convites"] = int(linha[0] or 0)
+                resumo[f"{chave}_valor"] = arredondar(linha[1] or 0)
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] resumo comissões user={user_id}: {erro}")
+    return resumo
+
+
+def descrever_redes_embed(dados: dict) -> str:
+    """Lista compacta das redes (ordem fixa YouTube ➜ Instagram ➜ TikTok) para embeds."""
+    redes = redes_do_influenciador(dados)
+    if not redes:
+        return "`Nenhuma rede cadastrada`"
+    linhas = []
+    for rede in _REDES_INFLUENCER:
+        info = redes.get(rede)
+        if not info:
+            continue
+        seg = info.get("seguidores") or "sem dado"
+        nome = info.get("nome") or info.get("url")
+        linhas.append(f"> **{_REDE_ROTULO[rede]}** — [{nome}]({info['url']}) • `{seg}`")
+    return "\n".join(linhas) if linhas else "`Nenhuma rede cadastrada`"
+
+
+def descrever_requisitos_influencer(cfg: dict) -> str:
+    cfg = cfg or {}
+    minimo_yt = int(cfg.get("inf_req_yt_min") or 500)
+    minimo_ig = int(cfg.get("inf_req_ig_min") or 1000)
+    minimo_tt = int(cfg.get("inf_req_tt_min") or 1000)
+    extra = str(cfg.get("inf_req_extra") or "").strip()
+    texto = (
+        f"> **YouTube:** `{minimo_yt}` inscritos ou mais\n"
+        f"> **Instagram:** `{minimo_ig}` seguidores ou mais\n"
+        f"> **TikTok:** `{minimo_tt}` seguidores ou mais\n"
+        "-# Basta atingir o requisito em **uma** das redes para ser aprovado."
+    )
+    if extra:
+        texto += f"\n> **Regras extras:** {extra}"
+    return texto
+
+
+# ══════════════════════════════════════════════════════════════
+#  CARD HD • CAÇA AOS INFLUENCIADORES (Dark Red & Black)
+# ══════════════════════════════════════════════════════════════
+
+def _inf_avatar_quadrado_hd(foto_bytes: Optional[bytes], tamanho: int, rede: str) -> "Image.Image":
+    """Retrato quadrado arredondado da foto REAL do perfil, com moldura na cor da rede."""
+    box = Image.new("RGBA", (tamanho, tamanho), (0, 0, 0, 0))
+    mask = Image.new("L", (tamanho, tamanho), 0)
+    raio = max(14, int(tamanho * 0.16))
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, tamanho - 1, tamanho - 1), radius=raio, fill=255)
+
+    colou = False
+    if foto_bytes:
+        try:
+            with Image.open(io.BytesIO(foto_bytes)) as origem:
+                imagem = origem.convert("RGBA")
+                larg, alt = imagem.size
+                lado = min(larg, alt)
+                esq = max(0, (larg - lado) // 2)
+                topo = max(0, (alt - lado) // 2)
+                recorte = imagem.crop((esq, topo, esq + lado, topo + lado)).resize(
+                    (tamanho, tamanho), Image.Resampling.LANCZOS
+                )
+                fundo = _card_gradiente_vertical(tamanho, tamanho, (30, 10, 14, 255), (10, 6, 8, 255))
+                fundo = Image.alpha_composite(fundo, recorte)
+                box.paste(fundo, (0, 0), mask)
+                colou = True
+        except Exception:
+            colou = False
+
+    if not colou:
+        fundo = _card_gradiente_vertical(tamanho, tamanho, (44, 10, 16, 255), (11, 6, 8, 255))
+        db = ImageDraw.Draw(fundo)
+        cor_rede = _REDE_COR.get(rede, (200, 30, 44))
+        r_ext = int(tamanho * 0.34)
+        db.ellipse(
+            (tamanho // 2 - r_ext, tamanho // 2 - r_ext, tamanho // 2 + r_ext, tamanho // 2 + r_ext),
+            fill=(20, 7, 10, 245), outline=(*cor_rede, 60), width=2,
+        )
+        _inf_badge_vetor(db, rede, tamanho // 2, tamanho // 2, max(18, int(tamanho * 0.27)))
+        box.paste(fundo, (0, 0), mask)
+
+    d_borda = ImageDraw.Draw(box)
+    cor_rede = _REDE_COR.get(rede, (200, 30, 44))
+    d_borda.rounded_rectangle(
+        (1, 1, tamanho - 2, tamanho - 2), radius=raio, outline=(*cor_rede, 235), width=5
+    )
+    d_borda.rounded_rectangle(
+        (8, 8, tamanho - 9, tamanho - 9), radius=max(8, raio - 6), outline=(255, 255, 255, 38), width=2
+    )
+    return box
+
+
+def _inf_badge_vetor(d, rede: str, cx: int, cy: int, r: int) -> None:
+    """Selo vetorial da rede (sem emoji Unicode) desenhado dentro de um círculo escuro."""
+    cor = _REDE_COR.get(rede, (200, 30, 44))
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(16, 8, 11, 245), outline=(*cor, 245), width=4)
+    interno = int(r * 0.62)
+    if rede == "youtube":
+        d.rounded_rectangle(
+            (cx - interno, cy - int(interno * 0.72), cx + interno, cy + int(interno * 0.72)),
+            radius=max(4, int(interno * 0.28)), fill=(*cor, 255),
+        )
+        tri = [
+            (cx - int(interno * 0.30), cy - int(interno * 0.44)),
+            (cx - int(interno * 0.30), cy + int(interno * 0.44)),
+            (cx + int(interno * 0.44), cy),
+        ]
+        d.polygon(tri, fill=(252, 248, 248, 255))
+    elif rede == "instagram":
+        lado = int(interno * 0.92)
+        d.rounded_rectangle(
+            (cx - lado, cy - lado, cx + lado, cy + lado),
+            radius=max(6, int(lado * 0.36)), outline=(*cor, 255), width=max(4, int(r * 0.16)),
+        )
+        raio_anel = int(lado * 0.44)
+        d.ellipse(
+            (cx - raio_anel, cy - raio_anel, cx + raio_anel, cy + raio_anel),
+            outline=(*cor, 255), width=max(4, int(r * 0.15)),
+        )
+        pto = max(3, int(lado * 0.14))
+        d.ellipse(
+            (cx + int(lado * 0.52) - pto, cy - int(lado * 0.52) - pto,
+             cx + int(lado * 0.52) + pto, cy - int(lado * 0.52) + pto),
+            fill=(*cor, 255),
+        )
+    else:  # tiktok — nota musical vetorial
+        haste_x = cx + int(interno * 0.12)
+        d.rounded_rectangle(
+            (haste_x, cy - interno, haste_x + max(3, int(interno * 0.15)), cy + int(interno * 0.42)),
+            radius=2, fill=(*cor, 255),
+        )
+        d.polygon(
+            [
+                (haste_x + max(3, int(interno * 0.15)), cy - interno),
+                (cx + int(interno * 0.86), cy - int(interno * 0.74)),
+                (cx + int(interno * 0.86), cy - int(interno * 0.30)),
+                (haste_x + max(3, int(interno * 0.15)), cy - int(interno * 0.48)),
+            ],
+            fill=(*cor, 255),
+        )
+        raio_nota = int(interno * 0.40)
+        d.ellipse(
+            (haste_x - raio_nota, cy + int(interno * 0.42) - raio_nota,
+             haste_x + raio_nota, cy + int(interno * 0.42) + raio_nota),
+            fill=(*cor, 255),
+        )
+
+
+def _inf_sombra_texto(d, pos, texto: str, fonte, cor, sombra=(0, 0, 0, 190)) -> None:
+    x, y = pos
+    d.text((x + 3, y + 3), texto, font=fonte, fill=sombra, anchor="lm")
+    d.text((x, y), texto, font=fonte, fill=cor, anchor="lm")
+
+
+def renderizar_card_caca_influencer_png(
+    nome_discord: str,
+    modo: str,
+    categoria: str,
+    horario_str: str,
+    redes: dict,
+    fotos: Optional[dict] = None,
+    slot_numero: Optional[int] = None,
+) -> bytes:
+    """Card HD (Dark Red & Black) do Caça aos Influenciadores.
+
+    `redes` vem de `redes_do_influenciador()`/`resolver_redes_influencer()` e as linhas
+    aparecem SEMPRE na ordem fixa: 1) YouTube ➜ 2) Instagram ➜ 3) TikTok.
+    `fotos` é {rede: bytes} com as fotos reais baixadas (opcional, cai no emblema).
+    """
+    fotos = fotos or {}
+    presentes = [r for r in _REDES_INFLUENCER if (redes or {}).get(r)]
+    if not presentes:
+        presentes = []
+    qtd = len(presentes)
+
+    W = 1680
+    altura_topo = 336
+    altura_linha = 192
+    espaco_linha = 22
+    altura_rodape = 104
+    altura_lista = qtd * altura_linha + max(0, qtd - 1) * espaco_linha
+    H = altura_topo + altura_lista + altura_rodape
+
+    card = _card_gradiente_vertical(W, H, (19, 7, 10, 255), (5, 4, 5, 255))
+    _card_glow_radial_local(card, W // 2, 150, 940, 300, (196, 22, 38), 118)
+    _card_glow_radial_local(card, 200, H - 150, 500, 300, (128, 10, 22), 66)
+    _card_glow_radial_local(card, W - 200, H - 150, 500, 300, (128, 10, 22), 66)
+
+    camada = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(camada)
+
+    for k in range(-H, W + H, 74):
+        d.line([(k, 0), (k - H, H)], fill=(210, 32, 48, 11), width=2)
+
+    d.rounded_rectangle((22, 22, W - 23, H - 23), radius=30, outline=(146, 24, 36, 220), width=4)
+    d.rounded_rectangle((34, 34, W - 35, H - 35), radius=24, outline=(58, 18, 24, 180), width=2)
+    d.rounded_rectangle((300, 20, W - 300, 29), radius=4, fill=(228, 38, 54, 255))
+
+    f_kicker = _card_carregar_fonte("bold", 25)
+    f_titulo = _card_carregar_fonte("black", 74)
+    f_chip = _card_carregar_fonte("bold", 25)
+
+    d.text(
+        (W // 2, 74),
+        _card_limpar_texto("FIRE FORCE OFICIAL   •   CAÇA AOS INFLUENCIADORES", f_kicker, fallback="FIRE FORCE OFICIAL", remover_simbolos=True),
+        font=f_kicker, fill=(228, 92, 104, 248), anchor="mm",
+    )
+    titulo_card = _card_limpar_texto("CAÇA AOS INFLUENCIADORES", f_titulo, fallback="CACA AOS INFLUENCIADORES", remover_simbolos=True)
+    d.text((W // 2 + 4, 158), titulo_card, font=f_titulo, fill=(140, 14, 26, 220), anchor="mm")
+    d.text((W // 2, 154), titulo_card, font=f_titulo, fill=(250, 246, 247, 255), anchor="mm")
+
+    # Nome do influenciador (Discord) em destaque
+    f_nome_inf = _card_carregar_fonte("black", 44)
+    nome_limpo = _card_limpar_texto(str(nome_discord or "INFLUENCIADOR"), f_nome_inf, fallback="INFLUENCIADOR")
+    nome_limpo = _card_truncar_px(d, nome_limpo, f_nome_inf, W - 640)
+    d.text((W // 2, 216), nome_limpo, font=f_nome_inf, fill=(234, 200, 206, 252), anchor="mm")
+
+    # Chips confirmados do diário: MODO • CATEGORIA • HORÁRIO (+ vaga)
+    modo_up = {"solo": "SOLO", "duo": "DUO", "trio": "TRIO", "squad": "SQUAD"}.get(
+        str(modo or "squad").strip().lower(), str(modo or "SQUAD").upper()
+    )
+    cat_up = str(categoria or "premium").strip().upper()
+    hora_up = str(horario_str or "--:--").strip()
+    chips = [f"MODO: {modo_up}", f"CATEGORIA: {cat_up}", f"HORARIO: {hora_up}"]
+    if slot_numero and int(slot_numero) > 0:
+        chips.append(f"VAGA: #{int(slot_numero):02d}")
+    larguras = []
+    for texto_chip in chips:
+        caixa = d.textbbox((0, 0), texto_chip, font=f_chip)
+        larguras.append((caixa[2] - caixa[0]) + 62)
+    gap = 20
+    total_chips = sum(larguras) + gap * (len(chips) - 1)
+    cursor_x = (W - total_chips) // 2
+    for indice, (texto_chip, largura) in enumerate(zip(chips, larguras)):
+        destaque = indice == 0
+        d.rounded_rectangle(
+            (cursor_x, 262, cursor_x + largura, 312),
+            radius=13,
+            fill=(166, 22, 36, 238) if destaque else (24, 11, 15, 238),
+            outline=(236, 58, 74, 255) if destaque else (126, 28, 38, 210),
+            width=3,
+        )
+        d.text(
+            (cursor_x + largura // 2, 287), texto_chip, font=f_chip,
+            fill=(252, 248, 248, 255) if destaque else (236, 212, 216, 255), anchor="mm",
+        )
+        cursor_x += largura + gap
+
+    d.line([(90, 330), (W - 90, 330)], fill=(126, 24, 34, 150), width=2)
+
+    f_ordem = _card_carregar_fonte("black", 30)
+    f_nome_rede = _card_carregar_fonte("black", 46)
+    f_arroba = _card_carregar_fonte("bold", 30)
+    f_num = _card_carregar_fonte("black", 58)
+    f_lbl = _card_carregar_fonte("bold", 23)
+
+    # Linhas: 1) YouTube ➜ 2) Instagram ➜ 3) TikTok (ordem fixa, sem Kwai)
+    camada_fotos: list = []
+    y = altura_topo + 8
+    for indice, rede in enumerate(presentes):
+        info = redes.get(rede) or {}
+        cor_rede = _REDE_COR.get(rede, (200, 30, 44))
+        x1, x2 = 86, W - 86
+        y1, y2 = y, y + altura_linha
+
+        d.rounded_rectangle((x1, y1, x2, y2), radius=24, fill=(15, 9, 12, 240), outline=(140, 26, 38, 228), width=3)
+        d.rounded_rectangle((x1, y1, x1 + 12, y2), radius=8, fill=(*cor_rede, 250))
+        d.rounded_rectangle((x1 + 44, y1, x1 + 300, y1 + 8), radius=4, fill=(*cor_rede, 238))
+
+        # Numeração grande da ordem (1, 2, 3)
+        d.text((x1 + 78, y1 + 62), f"{indice + 1}", font=f_ordem, fill=(198, 62, 74, 250), anchor="mm")
+
+        tam_foto = 120
+        foto_x = x1 + 118
+        foto_y = y1 + (altura_linha - tam_foto) // 2
+        avatar = _inf_avatar_quadrado_hd(fotos.get(rede), tam_foto, rede)
+        camada_fotos.append((avatar, foto_x, foto_y))
+
+        _inf_badge_vetor(d, rede, foto_x + tam_foto - 12, foto_y + tam_foto - 12, 27)
+
+        texto_x = foto_x + tam_foto + 42
+        nome_rede = _card_limpar_texto(
+            str(info.get("nome") or _REDE_ROTULO[rede]), f_nome_rede, fallback=_REDE_ROTULO[rede]
+        )
+        largura_max_nome = int(W * 0.40)
+        nome_rede = _card_truncar_px(d, nome_rede, f_nome_rede, largura_max_nome)
+        d.text((texto_x, y1 + 54), nome_rede, font=f_nome_rede, fill=(248, 243, 244, 255), anchor="lm")
+
+        arroba = str(info.get("arroba") or "").strip()
+        if not arroba and info.get("url"):
+            pedaco = str(info["url"]).rstrip("/").split("/")[-1]
+            arroba = pedaco if pedaco.startswith("@") else info.get("nome") or ""
+        arroba = _card_truncar_px(d, arroba or info.get("url", ""), f_arroba, largura_max_nome)
+        d.text((texto_x, y1 + 100), arroba, font=f_arroba, fill=(206, 128, 138, 248), anchor="lm")
+
+        etiqueta = f"{_REDE_ROTULO[rede].upper()}   •   {_REDE_LABEL_SEG[rede]}"
+        d.text((texto_x, y1 + 148), etiqueta, font=f_lbl, fill=(*cor_rede, 245), anchor="lm")
+
+        # Bloco direito: número de seguidores/inscritos
+        valor_txt = str(info.get("seguidores") or "").strip()
+        if valor_txt:
+            valor_txt = _card_limpar_texto(valor_txt, f_num, fallback="--", remover_simbolos=True)
+        else:
+            valor_txt = "--"
+        caixa_num = d.textbbox((0, 0), valor_txt, font=f_num)
+        largura_num = caixa_num[2] - caixa_num[0]
+        bloco_larg = max(280, largura_num + 100)
+        bloco_x2 = x2 - 40
+        bloco_x1 = bloco_x2 - bloco_larg
+        d.rounded_rectangle(
+            (bloco_x1, y1 + 26, bloco_x2, y2 - 26),
+            radius=18, fill=(28, 9, 13, 245), outline=(*cor_rede, 200), width=3,
+        )
+        d.text(((bloco_x1 + bloco_x2) // 2, y1 + 82), valor_txt, font=f_num, fill=(252, 248, 248, 255), anchor="mm")
+        d.rounded_rectangle(
+            (bloco_x1 + 22, y1 + 122, bloco_x2 - 22, y1 + 160),
+            radius=10, fill=(*cor_rede, 38), outline=(*cor_rede, 120), width=1,
+        )
+        d.text(
+            ((bloco_x1 + bloco_x2) // 2, y1 + 141), _REDE_LABEL_SEG[rede],
+            font=f_lbl, fill=(*cor_rede, 250), anchor="mm",
+        )
+
+        y = y2 + espaco_linha
+
+    if not presentes:
+        caixa_y1 = altura_topo + 8
+        caixa_y2 = caixa_y1 + 150
+        d.rounded_rectangle(
+            (86, caixa_y1, W - 86, caixa_y2), radius=24,
+            fill=(15, 9, 12, 238), outline=(140, 26, 38, 220), width=3,
+        )
+        f_vazio = _card_carregar_fonte("bold", 34)
+        d.text(
+            (W // 2, (caixa_y1 + caixa_y2) // 2),
+            "NENHUMA REDE APROVADA AINDA", font=f_vazio, fill=(214, 152, 160, 240), anchor="mm",
+        )
+
+    card = Image.alpha_composite(card, camada)
+    for avatar, ax, ay in camada_fotos:
+        card.paste(avatar, (ax, ay), avatar)
+
+    d_fin = ImageDraw.Draw(card)
+    f_rodape = _card_carregar_fonte("bold", 21)
+    d_fin.text(
+        (W // 2, H - 52),
+        f"FIRE FORCE COMPETITIVE SYSTEM   •   CACA AOS INFLUENCIADORES   •   {modo_up} {cat_up} {hora_up}",
+        font=f_rodape, fill=(154, 78, 86, 246), anchor="mm",
+    )
+
+    final = card.convert("RGB").resize((W // 2, H // 2), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    final.save(buffer, format="PNG", compress_level=6)
+    return buffer.getvalue()
+
+
+# ---------- publicação do alerta de LIVE no canal de Caça aos Influenciadores ----------
+
+async def publicar_caca_influenciador_vaga(
+    guild: discord.Guild,
+    slot_id: int,
+    influencer_user_id: Optional[int] = None,
+    horario: Optional[dict] = None,
+    slot: Optional[dict] = None,
+) -> tuple:
+    """Publica o card HD + alerta limpo no canal de Caça aos Influenciadores.
+
+    Retorna (ok, mensagem). Nunca levanta exceção: falha aqui não pode travar a
+    confirmação de pagamento de um diário.
+    """
+    try:
+        if not guild:
+            return (False, "Servidor inválido.")
+        cfg = await obter_config(guild.id)
+        canal_id = cfg.get("canal_caca_influencer")
+        canal = guild.get_channel(int(canal_id)) if canal_id else None
+        if not canal:
+            return (False, "O **Canal de Caça aos Influenciadores** ainda não foi configurado. Use `/influenciador` ➜ Configurações.")
+
+        if slot is None or horario is None:
+            async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                db.row_factory = aiosqlite.Row
+                linha_slot = await (await db.execute(
+                    "SELECT * FROM slots WHERE id = ?", (int(slot_id),)
+                )).fetchone()
+                if not linha_slot:
+                    return (False, "Reserva não encontrada.")
+                slot = dict(linha_slot)
+                if horario is None:
+                    linha_h = await (await db.execute(
+                        "SELECT * FROM horarios WHERE id = ?", (int(slot["horario_id"]),)
+                    )).fetchone()
+                    if not linha_h:
+                        return (False, "Diário não encontrado.")
+                    horario = dict(linha_h)
+        slot = dict(slot)
+        horario = dict(horario)
+
+        inf_user = int(influencer_user_id or slot.get("comprador_id") or 0)
+        if not inf_user:
+            return (False, "Influenciador não identificado.")
+        dados_inf = await obter_influenciador(guild.id, inf_user)
+        if not dados_inf:
+            return (False, "Influenciador não cadastrado.")
+
+        redes = redes_do_influenciador(dados_inf)
+        fotos = {}
+        if _PIL_DISPONIVEL and redes:
+            baixadas = await asyncio.gather(
+                *(_inf_baixar_foto((redes.get(r) or {}).get("foto")) for r in _REDES_INFLUENCER if redes.get(r)),
+                return_exceptions=True,
+            )
+            for rede, bruto in zip([r for r in _REDES_INFLUENCER if redes.get(r)], baixadas):
+                if isinstance(bruto, (bytes, bytearray)) and len(bruto) > 300:
+                    fotos[rede] = bytes(bruto)
+
+        membro = await membro_do_guild(guild, inf_user)
+        nome_discord = (
+            (membro.display_name if membro else "")
+            or dados_inf.get("ff_nome")
+            or (dados_inf.get("yt_nome") or dados_inf.get("ig_nome") or dados_inf.get("tt_nome"))
+            or "INFLUENCIADOR"
+        )
+
+        modo_l = str(horario.get("tipo") or "squad")
+        categoria = str(horario.get("categoria") or "premium")
+        hora = str(horario.get("horario") or "--:--")
+        rotulo = formatar_rotulo_diario(modo_l, categoria)
+
+        arquivo = None
+        if _PIL_DISPONIVEL:
+            try:
+                png = await asyncio.to_thread(
+                    renderizar_card_caca_influencer_png,
+                    nome_discord,
+                    modo_l,
+                    categoria,
+                    hora,
+                    redes,
+                    fotos,
+                    int(slot.get("numero") or 0),
+                )
+                arquivo = discord.File(io.BytesIO(png), filename="caca_influenciador.png")
+            except Exception as erro:
+                _log_arquivo(f"[INFLUENCER] card HD falhou slot={slot_id}: {type(erro).__name__}: {erro}")
+                arquivo = None
+
+        total_seg = sum(int((redes.get(r) or {}).get("seguidores_num") or 0) for r in _REDES_INFLUENCER)
+        linhas_redes = []
+        for rede in _REDES_INFLUENCER:
+            info = redes.get(rede)
+            if not info:
+                continue
+            seg = info.get("seguidores") or "sem dado"
+            linhas_redes.append(
+                f"> **{_REDE_ROTULO[rede]}:** [{info.get('nome') or _REDE_ROTULO[rede]}]({info['url']}) "
+                f"• `{seg}` {'inscritos' if rede == 'youtube' else 'seguidores'}"
+            )
+
+        descricao = (
+            f"{membro.mention if membro else mencao(inf_user)} **está ao vivo** e vai "
+            f"jogar o **{rotulo}** com a galera!\n\n"
+            f"> **Diário confirmado:** `{rotulo}`\n"
+            f"> **Horário:** `{hora}`\n"
+            f"> **Vaga:** `#{int(slot.get('numero') or 0):02d}`\n"
+        )
+        if linhas_redes:
+            descricao += "\n" + "\n".join(linhas_redes) + "\n"
+        if total_seg > 0:
+            descricao += f"\n> **Alcance somado:** `{formatar_numero_social(total_seg)}` seguidores/inscritos\n"
+        descricao += (
+            "\n-# 🔴 Entre na live, acompanhe o diário e prestigie quem movimenta a cena Free Fire!"
+        )
+
+        embed = criar_embed(
+            f"🎬 CAÇA AOS INFLUENCIADORES • LIVE CONFIRMADA",
+            descricao,
+            "Vermelho",
+            thumb=(membro.display_avatar.url if membro else None),
+            footer="Fire Force • Caça aos Influenciadores",
+        )
+
+        botoes = []
+        for rede in _REDES_INFLUENCER:
+            info = redes.get(rede)
+            if not info or not info.get("url"):
+                continue
+            botoes.append(
+                discord.ui.Button(
+                    style=discord.ButtonStyle.link,
+                    label=f"Seguir no {_REDE_ROTULO[rede]}",
+                    url=info["url"],
+                )
+            )
+        view = discord.ui.View(timeout=None)
+        for botao in botoes[:5]:
+            view.add_item(botao)
+
+        await canal.send(
+            content=membro.mention if membro else mencao(inf_user),
+            embed=embed,
+            file=arquivo,
+            view=view if botoes else None,
+        )
+        return (True, f"Card publicado em {canal.mention}.")
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] publicar caça slot={slot_id}: {type(erro).__name__}: {erro}")
+        return (False, f"Falha ao publicar: `{type(erro).__name__}`")
+
+
+async def _marcar_slot_influencer_anunciado(slot_id: int) -> bool:
+    """Marca influencer_anunciado=1 de forma atômica (só quem chegar primeiro publica)."""
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            cursor = await db.execute(
+                "UPDATE slots SET influencer_anunciado = 1 WHERE id = ? AND COALESCE(influencer_anunciado, 0) = 0",
+                (int(slot_id),),
+            )
+            await db.commit()
+            return bool(cursor.rowcount and cursor.rowcount > 0)
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] marcar anunciado slot={slot_id}: {erro}")
+        return False
+
+
+async def anunciar_caca_influencer_do_slot(guild: discord.Guild, slot_id: int) -> tuple:
+    """Ponto único de anúncio: exige influencer_em_live=1, dispara card e marca anunciado."""
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            linha = await (await db.execute("SELECT * FROM slots WHERE id = ?", (int(slot_id),))).fetchone()
+        if not linha:
+            return (False, "Reserva não encontrada.")
+        dados_slot = dict(linha)
+        if int(dados_slot.get("confirmado") or 0) != 1:
+            return (False, "A reserva ainda não foi confirmada.")
+        if int(dados_slot.get("influencer_em_live") or 0) != 1:
+            return (False, "A live ainda não foi marcada para esta reserva.")
+        if not await _marcar_slot_influencer_anunciado(slot_id):
+            return (False, "O anúncio desta reserva já foi publicado.")
+        return await publicar_caca_influenciador_vaga(guild, int(slot_id), slot=dados_slot)
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] anunciar do slot {slot_id}: {type(erro).__name__}: {erro}")
+        return (False, "Falha inesperada ao publicar o anúncio.")
+
+
+# ══════════════════════════════════════════════════════════════
+#  PAINEL PÚBLICO • VIRAR INFLUENCIADOR
+# ══════════════════════════════════════════════════════════════
+
+def embed_painel_influenciador(cfg: Optional[dict] = None) -> discord.Embed:
+    cfg = cfg or {}
+    try:
+        valor = arredondar(float(cfg.get("inf_valor_convite") or 0.25))
+    except Exception:
+        valor = 0.25
+    ciclo = "semana" if str(cfg.get("inf_ciclo_comissao") or "semana").lower() != "dia" else "dia"
+    texto = (
+        "Quer transformar sua audiência em renda dentro da **Fire Force**?\n"
+        "Cadastre seu **YouTube**, **Instagram** ou **TikTok** e receba comissão por cada convite "
+        f"que trouxer para os diários: **`{formatar_moeda(valor)}` por convite** "
+        f"(pago por **{ciclo}**).\n\n"
+        "**Benefícios aprovados**\n"
+        "> **Cargo exclusivo** de Influenciador no servidor\n"
+        "> **Comissão por convite** direto na sua carteira\n"
+        "> **Divulgação automática** quando você entrar em live nos diários\n"
+        "> **Card HD** com suas redes e números reais\n\n"
+        "**Requisitos mínimos**\n" + descrever_requisitos_influencer(cfg) + "\n\n"
+        "-# 🔒 Avaliação privada apenas com **Dono** e **Gerente**"
+    )
+    return criar_embed(
+        "🎬 Seja um Influenciador Fire Force",
+        texto,
+        "Vermelho",
+        footer="Fire Force • Programa de Influenciadores",
+    )
+
+
+class InfluenciadorPainelPublicoView(discord.ui.View):
+    """Painel público do programa: só Dono/Gerente publicam, qualquer um se candidata."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Quero ser Influenciador",
+        emoji="🎬",
+        style=discord.ButtonStyle.danger,
+        custom_id="ff_inf_quero",
+    )
+    async def candidatar(self, interaction: discord.Interaction, botao: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Use no servidor", "Este painel só funciona dentro do servidor.", "Vermelho"),
+                ephemeral=True,
+            )
+        await interaction.response.send_modal(InfluenciadorCandidaturaModal())
+
+
+class InfluenciadorCandidaturaModal(discord.ui.Modal, title="🎬 Candidatura de Influenciador"):
+    link_youtube = discord.ui.TextInput(
+        label="Link do YouTube (opcional)",
+        placeholder="https://www.youtube.com/@seucanal",
+        required=False,
+        max_length=200,
+    )
+    link_instagram = discord.ui.TextInput(
+        label="Link do Instagram (opcional)",
+        placeholder="https://www.instagram.com/seuperfil",
+        required=False,
+        max_length=200,
+    )
+    link_tiktok = discord.ui.TextInput(
+        label="Link do TikTok (opcional)",
+        placeholder="https://www.tiktok.com/@seuperfil",
+        required=False,
+        max_length=200,
+    )
+    conteudo = discord.ui.TextInput(
+        label="Fale sobre seu conteúdo Free Fire",
+        style=discord.TextStyle.paragraph,
+        placeholder="Que tipo de conteúdo você faz? Quantas lives por semana? Qual seu público?",
+        required=False,
+        max_length=700,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not INFLUENCIADORES_ATIVO:
+            return await interaction.response.send_message(
+                embed=criar_embed("⏸️ Programa desativado", "O programa de influenciadores está desativado neste servidor.", "Cinza Escuro"),
+                ephemeral=True,
+            )
+        if not interaction.guild:
+            return await interaction.response.send_message("❌ Use dentro do servidor.", ephemeral=True)
+        entradas = {
+            "youtube": str(self.link_youtube.value or "").strip(),
+            "instagram": str(self.link_instagram.value or "").strip(),
+            "tiktok": str(self.link_tiktok.value or "").strip(),
+        }
+        if not any(entradas.values()):
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "❌ Informe pelo menos uma rede",
+                    "Preencha o link do **YouTube**, **Instagram** ou **TikTok** para continuar.",
+                    "Vermelho",
+                ),
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        existente = await obter_influenciador(interaction.guild.id, interaction.user.id)
+        if existente and str(existente.get("status") or "") == "aprovado":
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "✅ Você já é Influenciador",
+                    "Seu cadastro já está aprovado. Use `/influenciador` para atualizar suas redes.",
+                    "Esmeralda",
+                ),
+                ephemeral=True,
+            )
+
+        redes = await resolver_redes_influencer(entradas)
+        if not redes:
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "❌ Não consegui ler seus perfis",
+                    "Confira se os links estão corretos e se os perfis são **públicos**, depois envie novamente.",
+                    "Vermelho",
+                ),
+                ephemeral=True,
+            )
+
+        cfg = await obter_config(interaction.guild.id)
+        aprovado_auto, motivo_auto = _avaliar_requisitos_influencer(redes, cfg)
+
+        categoria_ticket = interaction.guild.get_channel(cfg.get("cat_tickets")) if cfg.get("cat_tickets") else None
+        overwrites = await _overwrites_dono_gerente(interaction.guild, interaction.user)
+        canal = None
+        try:
+            canal = await interaction.guild.create_text_channel(
+                f"🎬│influenciador-{_slug_canal(interaction.user.display_name, 'inf')}"[:100],
+                category=categoria_ticket,
+                overwrites=overwrites,
+            )
+        except Exception as erro:
+            return await interaction.followup.send(
+                embed=criar_embed("❌ Não consegui abrir o ticket", f"`{type(erro).__name__}`", "Vermelho"),
+                ephemeral=True,
+            )
+
+        colunas = montar_registros_redes(redes)
+        agora_iso = agora_brt().isoformat()
+        try:
+            async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                if existente:
+                    campos = ", ".join(f"{c} = ?" for c in colunas.keys())
+                    await db.execute(
+                        f"UPDATE influenciadores SET {campos}, frequencia_info = ?, status = 'pendente', "
+                        f"canal_ticket_id = ?, criado_em = COALESCE(criado_em, ?), atualizado_em = ? "
+                        f"WHERE guild_id = ? AND user_id = ?",
+                        tuple(list(colunas.values()) + [
+                            str(self.conteudo.value or "").strip(), canal.id, agora_iso, agora_iso,
+                            interaction.guild.id, interaction.user.id,
+                        ]),
+                    )
+                else:
+                    campos = ", ".join(colunas.keys())
+                    marcadores = ", ".join("?" for _ in colunas)
+                    await db.execute(
+                        f"INSERT INTO influenciadores (guild_id, user_id, {campos}, frequencia_info, status, "
+                        f"canal_ticket_id, criado_em, atualizado_em) "
+                        f"VALUES (?, ?, {marcadores}, ?, 'pendente', ?, ?, ?)",
+                        tuple([
+                            interaction.guild.id, interaction.user.id, *colunas.values(),
+                            str(self.conteudo.value or "").strip(), canal.id, agora_iso, agora_iso,
+                        ]),
+                    )
+                await db.commit()
+        except Exception as erro:
+            try:
+                await canal.delete(reason="Rollback candidatura influenciador")
+            except Exception:
+                pass
+            return await interaction.followup.send(
+                embed=criar_embed("❌ Erro ao salvar candidatura", f"`{type(erro).__name__}`", "Vermelho"),
+                ephemeral=True,
+            )
+
+        marcar_sujo()
+        dados_linha = await obter_influenciador(interaction.guild.id, interaction.user.id) or {}
+        resumo_redes = descrever_redes_embed(dados_linha)
+        mencoes_vip = " ".join(
+            f"<@&{cfg[k]}>" for k in ("cargo_dono", "cargo_gerente") if cfg.get(k)
+        )
+        embed_ficha = criar_embed(
+            "🎬 Candidatura de Influenciador",
+            f"👤 **Candidato:** {interaction.user.mention}\n"
+            f"📊 **Redes verificadas em tempo real:**\n{resumo_redes}\n\n"
+            f"**🎯 Avaliação automática dos requisitos:** {motivo_auto}\n\n"
+            f"**📝 Conteúdo declarado:**\n```\n{str(self.conteudo.value or 'Não informado')[:900]}\n```\n"
+            "-# Aprove para liberar o cargo de Influenciador automaticamente.",
+            "Vermelho",
+        )
+        embed_ficha.set_thumbnail(url=interaction.user.display_avatar.url)
+        await canal.send(
+            content=f"{interaction.user.mention} {mencoes_vip}".strip(),
+            embed=embed_ficha,
+            view=InfluenciadorTicketView(0, aprovado_auto=aprovado_auto),
+        )
+        await interaction.followup.send(
+            embed=criar_embed(
+                "✅ Candidatura enviada!",
+                f"Seu atendimento privado foi aberto em {canal.mention}. "
+                "O **Dono** ou **Gerente** vai avaliar suas redes em tempo real e te responder por lá.",
+                "Esmeralda",
+            ),
+            ephemeral=True,
+        )
+
+
+def _avaliar_requisitos_influencer(redes: dict, cfg: dict) -> tuple:
+    """Compara os números reais com o mínimo configurado e devolve (aprovado_auto, texto)."""
+    cfg = cfg or {}
+    minimos = {
+        "youtube": int(cfg.get("inf_req_yt_min") or 500),
+        "instagram": int(cfg.get("inf_req_ig_min") or 1000),
+        "tiktok": int(cfg.get("inf_req_tt_min") or 1000),
+    }
+    partes = []
+    bateu = False
+    for rede in _REDES_INFLUENCER:
+        info = (redes or {}).get(rede)
+        if not info:
+            continue
+        numero = int(info.get("seguidores_num") or 0)
+        minimo = minimos.get(rede, 0)
+        if minimo <= 0:
+            bateu = True
+            partes.append(f"{_REDE_ROTULO[rede]} `{formatar_numero_social(numero) or '0'}` (sem mínimo)")
+        elif numero >= minimo:
+            bateu = True
+            partes.append(f"{_REDE_ROTULO[rede]} ✅ `{formatar_numero_social(numero)}` ≥ `{formatar_numero_social(minimo)}`")
+        else:
+            faltam = minimo - numero
+            partes.append(
+                f"{_REDE_ROTULO[rede]} ⚠️ `{formatar_numero_social(numero) or '0'}` "
+                f"(faltam `{formatar_numero_social(faltam)}`)"
+            )
+    if not partes:
+        return (False, "`Nenhuma rede pública encontrada`")
+    resumo = " • ".join(partes)
+    if bateu:
+        return (True, f"`APTO` — {resumo}")
+    return (False, f"`ABAIXO DO MÍNIMO` — {resumo}")
+
+
+# ---------- ticket privado de avaliação do influenciador ----------
+
+async def _inf_aplicar_cargo(guild: discord.Guild, user_id: int) -> str:
+    """Entrega o cargo de Influenciador configurado (se existir) e devolve um texto de status."""
+    try:
+        cfg = await obter_config(guild.id)
+        cargo_id = cfg.get("cargo_influencer")
+        if not cargo_id:
+            return "`cargo_influencer não configurado`"
+        cargo = guild.get_role(int(cargo_id))
+        if not cargo:
+            return "`cargo de influenciador não encontrado no servidor`"
+        membro = await membro_do_guild(guild, int(user_id))
+        if not membro:
+            return "`membro não encontrado no servidor`"
+        if cargo not in membro.roles:
+            await membro.add_roles(cargo, reason="Candidatura de Influenciador aprovada")
+        return cargo.mention
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] cargo user={user_id}: {type(erro).__name__}: {erro}")
+        return "`falha ao entregar o cargo`"
+
+
+async def aprovar_influenciador(guild: discord.Guild, user_id: int, staff_id: int) -> tuple:
+    """Aprova o cadastro, entrega o cargo de Influenciador e avisa o candidato por DM."""
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            await db.execute(
+                "UPDATE influenciadores SET status = 'aprovado', aprovado_por = ?, aprovado_em = ?, "
+                "atualizado_em = ? WHERE guild_id = ? AND user_id = ?",
+                (int(staff_id), agora_brt().isoformat(), agora_brt().isoformat(), guild.id, int(user_id)),
+            )
+            await db.commit()
+        marcar_sujo()
+        cargo_txt = await _inf_aplicar_cargo(guild, int(user_id))
+        dados = await obter_influenciador(guild.id, int(user_id)) or {}
+
+        await avisar_jogador(
+            guild, int(user_id),
+            criar_embed(
+                "🎬 Você agora é Influenciador Fire Force!",
+                "Sua candidatura foi **aprovada** pela equipe.\n\n"
+                f"> **Cargo entregue:** {cargo_txt}\n"
+                f"> **Redes aprovadas:**\n{descrever_redes_embed(dados)}\n\n"
+                "Use `/influenciador` a qualquer momento para atualizar seus links ou avisar que "
+                "está **em live** num diário confirmado.",
+                "Esmeralda",
+                footer="Fire Force • Programa de Influenciadores",
+            ),
+        )
+        await registrar_log(
+            guild, "🎬 INFLUENCIADOR", "🎬 Influenciador aprovado",
+            f"{mencao(user_id)} aprovado por {mencao(staff_id)}.\n"
+            f"> Cargo: {cargo_txt}\n{descrever_redes_embed(dados)}",
+            "Esmeralda",
+        )
+        return (True, cargo_txt)
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] aprovar user={user_id}: {type(erro).__name__}: {erro}")
+        return (False, "`erro ao aprovar`")
+
+
+async def recusar_influenciador(guild: discord.Guild, user_id: int, staff_id: int, motivo: str) -> bool:
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            await db.execute(
+                "UPDATE influenciadores SET status = 'recusado', aprovado_por = ?, atualizado_em = ? "
+                "WHERE guild_id = ? AND user_id = ?",
+                (int(staff_id), agora_brt().isoformat(), guild.id, int(user_id)),
+            )
+            await db.commit()
+        marcar_sujo()
+        await avisar_jogador(
+            guild, int(user_id),
+            criar_embed(
+                "🎬 Candidatura não aprovada",
+                "Sua candidatura de Influenciador não foi aprovada desta vez.\n\n"
+                f"> **Motivo:** {motivo or 'requisitos não atingidos'}\n\n"
+                "Você pode crescer e tentar novamente quando quiser.",
+                "Vermelho",
+                footer="Fire Force • Programa de Influenciadores",
+            ),
+        )
+        await registrar_log(
+            guild, "🎬 INFLUENCIADOR", "🎬 Candidatura recusada",
+            f"{mencao(user_id)} recusado por {mencao(staff_id)}. Motivo: `{motivo or 'não informado'}`",
+            "Vermelho",
+        )
+        return True
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] recusar user={user_id}: {type(erro).__name__}: {erro}")
+        return False
+
+
+class InfluenciadorRecusarModal(discord.ui.Modal, title="🎬 Recusar Candidatura"):
+    motivo = discord.ui.TextInput(
+        label="Motivo da recusa",
+        placeholder="Ex: seguidores abaixo do mínimo exigido",
+        required=False,
+        max_length=250,
+    )
+
+    def __init__(self, user_id: int, canal_id: int = 0):
+        super().__init__()
+        self.user_id = int(user_id)
+        self.canal_id = int(canal_id or 0)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        ok = await recusar_influenciador(
+            interaction.guild, self.user_id, interaction.user.id, str(self.motivo.value or "").strip()
+        )
+        if ok:
+            await interaction.followup.send(
+                embed=criar_embed("✅ Candidatura recusada", "O candidato foi avisado por DM.", "Esmeralda"),
+                ephemeral=True,
+            )
+            _disparar_tarefa_rastreada(_inf_agendar_fechamento_ticket(interaction.channel, "Candidatura recusada"))
+        else:
+            await interaction.followup.send(
+                embed=criar_embed("❌ Falha ao recusar", "Tente novamente em instantes.", "Vermelho"),
+                ephemeral=True,
+            )
+
+
+async def _inf_agendar_fechamento_ticket(canal, motivo: str, segundos: int = 12):
+    try:
+        await asyncio.sleep(segundos)
+        if canal:
+            await canal.delete(reason=f"Ticket de influenciador encerrado: {motivo}"[:120])
+    except Exception:
+        pass
+
+
+class InfluenciadorTicketView(discord.ui.View):
+    """Menu privado do ticket de candidatura (visível só ao candidato + Dono/Gerente)."""
+
+    def __init__(self, user_id: int = 0, aprovado_auto: bool = False, encerrado: bool = False):
+        super().__init__(timeout=None)
+        self.user_id = int(user_id or 0)
+        self.aprovado_auto = bool(aprovado_auto)
+        self.encerrado = bool(encerrado)
+
+        if self.encerrado:
+            # Ticket de candidatura já recusada: só permite encerrar (sem re-aprovar por engano).
+            opcoes = [
+                discord.SelectOption(
+                    label="Encerrar Ticket",
+                    value="fechar",
+                    description="Apaga este canal privado",
+                ),
+            ]
+        else:
+            opcoes = [
+                discord.SelectOption(
+                    label="Aprovar Influenciador",
+                    value="aprovar",
+                    description="Aprova, entrega o cargo e libera o autoatendimento",
+                ),
+                discord.SelectOption(
+                    label="Recusar Candidatura",
+                    value="recusar",
+                    description="Recusa com motivo e avisa o candidato por DM",
+                ),
+                discord.SelectOption(
+                    label="Revalidar Redes em Tempo Real",
+                    value="revalidar",
+                    description="Lê novamente YouTube/Instagram/TikTok e atualiza os números",
+                ),
+                discord.SelectOption(
+                    label="Encerrar Ticket",
+                    value="fechar",
+                    description="Apaga este canal privado",
+                ),
+            ]
+
+        seletor = discord.ui.Select(
+            custom_id=f"ff_inf_tk_{self.user_id}",
+            placeholder="🎬 Avaliar candidatura de influenciador...",
+            options=opcoes,
+        )
+        seletor.callback = self._rotar
+        self.add_item(seletor)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) == self.user_id:
+            return True
+        if await e_dono_ou_gerente(interaction.user):
+            return True
+        await interaction.response.send_message(
+            embed=criar_embed("🔒 Ticket privado", "Este atendimento é exclusivo do candidato com Dono e Gerente.", "Vermelho"),
+            ephemeral=True,
+        )
+        return False
+
+    async def _rotar(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return await interaction.response.send_message("❌ Use no servidor.", ephemeral=True)
+        acao = str((interaction.data or {}).get("values", ["aprovar"])[0])
+        candidato_id = await self._resolver_candidato(interaction)
+        if not candidato_id:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Candidato não identificado", "Reabra o ticket pela candidatura.", "Vermelho"),
+                ephemeral=True,
+            )
+
+        if acao == "fechar":
+            if int(interaction.user.id) != candidato_id and not await e_dono_ou_gerente(interaction.user):
+                return await interaction.response.send_message("❌ Sem permissão.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Encerrando ticket", "Este canal será apagado em instantes.", "Cinza Escuro"),
+                ephemeral=True,
+            )
+            _disparar_tarefa_rastreada(_inf_agendar_fechamento_ticket(interaction.channel, "fechado manualmente", 6))
+            return
+
+        if not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente Dono e Gerente avaliam candidaturas.", "Vermelho"),
+                ephemeral=True,
+            )
+
+        if acao == "aprovar":
+            await interaction.response.defer(ephemeral=True)
+            ok, cargo_txt = await aprovar_influenciador(interaction.guild, candidato_id, interaction.user.id)
+            if not ok:
+                return await interaction.followup.send(
+                    embed=criar_embed("❌ Falha ao aprovar", "Tente novamente.", "Vermelho"), ephemeral=True
+                )
+            await interaction.channel.send(
+                embed=criar_embed(
+                    "✅ Influenciador Aprovado",
+                    f"{mencao(candidato_id)} agora é **Influenciador oficial**!\n"
+                    f"> **Cargo:** {cargo_txt}\n"
+                    f"> **Aprovado por:** {interaction.user.mention}\n\n"
+                    "-# Este ticket será encerrado em alguns segundos.",
+                    "Esmeralda",
+                )
+            )
+            await interaction.followup.send(
+                embed=criar_embed("✅ Aprovado", f"Cargo entregue: {cargo_txt}", "Esmeralda"), ephemeral=True
+            )
+            _disparar_tarefa_rastreada(_inf_agendar_fechamento_ticket(interaction.channel, "aprovado", 10))
+            return
+
+        if acao == "recusar":
+            return await interaction.response.send_modal(
+                InfluenciadorRecusarModal(candidato_id, getattr(interaction.channel, "id", 0))
+            )
+
+        if acao == "revalidar":
+            await interaction.response.defer(ephemeral=True)
+            dados = await obter_influenciador(interaction.guild.id, candidato_id) or {}
+            redes_atuais = redes_do_influenciador(dados)
+            entradas = {rede: (redes_atuais.get(rede) or {}).get("url") for rede in _REDES_INFLUENCER}
+            redes_novas = await resolver_redes_influencer({k: v for k, v in entradas.items() if v})
+            if not redes_novas:
+                return await interaction.followup.send(
+                    embed=criar_embed("⚠️ Nada para revalidar", "Nenhuma rede pública respondeu agora.", "Amarelo"),
+                    ephemeral=True,
+                )
+            await salvar_redes_influenciador(interaction.guild.id, candidato_id, redes_novas)
+            cfg = await obter_config(interaction.guild.id)
+            apto, motivo = _avaliar_requisitos_influencer(redes_novas, cfg)
+            dados_atualizados = await obter_influenciador(interaction.guild.id, candidato_id) or {}
+            await interaction.channel.send(
+                embed=criar_embed(
+                    "🔄 Redes revalidadas em tempo real",
+                    f"{descrever_redes_embed(dados_atualizados)}\n\n**Requisitos:** {motivo}",
+                    "Esmeralda" if apto else "Amarelo",
+                )
+            )
+            return await interaction.followup.send(
+                embed=criar_embed("✅ Revalidado", motivo, "Esmeralda" if apto else "Amarelo"), ephemeral=True
+            )
+
+    async def _resolver_candidato(self, interaction: discord.Interaction) -> int:
+        if self.user_id > 0:
+            return self.user_id
+        # Ticket recém-aberto (id 0): descobre o candidato pelo canal/permissões
+        try:
+            if isinstance(interaction.channel, discord.TextChannel):
+                for alvo, permitido in interaction.channel.overwrites.items():
+                    if isinstance(alvo, discord.Member) and permitido.view_channel and not alvo.bot:
+                        if int(alvo.id) != int(interaction.guild.owner_id or 0):
+                            async with aiosqlite.connect(DATABASE_FILE) as db:
+                                linha = await (await db.execute(
+                                    "SELECT user_id FROM influenciadores WHERE guild_id = ? AND canal_ticket_id = ?",
+                                    (interaction.guild.id, interaction.channel.id),
+                                )).fetchone()
+                            if linha and int(linha[0]) == int(alvo.id):
+                                self.user_id = int(alvo.id)
+                                return self.user_id
+        except Exception:
+            pass
+        try:
+            async with aiosqlite.connect(DATABASE_FILE) as db:
+                linha = await (await db.execute(
+                    "SELECT user_id FROM influenciadores WHERE guild_id = ? AND canal_ticket_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (interaction.guild.id, getattr(interaction.channel, "id", 0)),
+                )).fetchone()
+            if linha:
+                self.user_id = int(linha[0])
+                return self.user_id
+        except Exception:
+            pass
+        return 0
+
+
+# ══════════════════════════════════════════════════════════════
+#  PERGUNTA DE LIVE NO DIÁRIO (influenciador que reservou vaga)
+# ══════════════════════════════════════════════════════════════
+
+class InfluenciadorPerguntaLiveView(discord.ui.View):
+    """Pergunta simples no canal de pagamento: 'Você está em LIVE agora?'."""
+
+    def __init__(self, slot_id: int):
+        super().__init__(timeout=None)
+        self.slot_id = int(slot_id)
+        seletor = discord.ui.Select(
+            custom_id=f"ff_inf_live_sel:{self.slot_id}",
+            placeholder="🔴 Você está em LIVE agora?",
+            options=[
+                discord.SelectOption(
+                    label="Sim, estou em LIVE agora",
+                    value="sim",
+                    description="Divulgar seu diário no canal de Caça aos Influenciadores",
+                ),
+                discord.SelectOption(
+                    label="Não, ainda não estou em live",
+                    value="nao",
+                    description="Nada será publicado; você pode avisar depois em /influenciador",
+                ),
+            ],
+        )
+        seletor.callback = self._responder
+        self.add_item(seletor)
+
+    async def _responder(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            return await interaction.response.send_message("❌ Use no servidor.", ephemeral=True)
+        escolha = str((interaction.data or {}).get("values", ["nao"])[0])
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            linha = await (await db.execute("SELECT * FROM slots WHERE id = ?", (self.slot_id,))).fetchone()
+        if not linha:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Reserva não encontrada", "Esta reserva não existe mais.", "Vermelho"),
+                ephemeral=True,
+            )
+        dados_slot = dict(linha)
+        if int(dados_slot.get("comprador_id") or 0) != int(interaction.user.id) and not await e_dono_ou_gerente(interaction.user):
+            return await interaction.response.send_message(
+                embed=criar_embed("🔒 Reserva de outro jogador", "Só o dono da reserva responde esta pergunta.", "Vermelho"),
+                ephemeral=True,
+            )
+
+        if escolha == "nao":
+            async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                await db.execute("UPDATE slots SET influencer_em_live = 0 WHERE id = ?", (self.slot_id,))
+                await db.commit()
+            marcar_sujo()
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "👍 Tudo certo",
+                    "Sem problemas! Quando entrar em live, use `/influenciador` ➜ **Avisar que estou em live**.",
+                    "Cinza Escuro",
+                ),
+                ephemeral=True,
+            )
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            await db.execute("UPDATE slots SET influencer_em_live = 1 WHERE id = ?", (self.slot_id,))
+            await db.commit()
+        marcar_sujo()
+
+        if int(dados_slot.get("confirmado") or 0) == 1:
+            ok, mensagem = await anunciar_caca_influencer_do_slot(interaction.guild, self.slot_id)
+        else:
+            ok, mensagem = (
+                True,
+                "Anotado! Assim que o **pagamento for confirmado**, seu anúncio será publicado automaticamente.",
+            )
+        await interaction.followup.send(
+            embed=criar_embed(
+                "🔴 LIVE registrada!" if ok else "⚠️ Live registrada com pendência",
+                mensagem,
+                "Esmeralda" if ok else "Amarelo",
+            ),
+            ephemeral=True,
+        )
+
+
+async def _registrar_views_influenciadores(guild: discord.Guild) -> int:
+    """Reidrata as views persistentes (tickets de candidatura e perguntas de live) de uma guild."""
+    if not guild:
+        return 0
+    registradas = 0
+    try:
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            tickets = await (await db.execute(
+                "SELECT user_id, status FROM influenciadores WHERE guild_id = ? "
+                "AND canal_ticket_id IS NOT NULL AND canal_ticket_id > 0",
+                (guild.id,),
+            )).fetchall()
+            slots_live = await (await db.execute(
+                "SELECT id FROM slots WHERE guild_id = ? AND confirmado = 1 "
+                "AND COALESCE(influencer_em_live, 0) = 1",
+                (guild.id,),
+            )).fetchall()
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] registrar views guild={guild.id}: {erro}")
+        return 0
+
+    for linha in tickets:
+        try:
+            encerrado = str(linha["status"] or "") in ("recusado",)
+            bot.add_view(InfluenciadorTicketView(int(linha["user_id"] or 0), encerrado=encerrado))
+            registradas += 1
+        except Exception:
+            continue
+    for linha in slots_live:
+        try:
+            bot.add_view(InfluenciadorPerguntaLiveView(int(linha["id"] or 0)))
+            registradas += 1
+        except Exception:
+            continue
+    return registradas
+
+
+async def enviar_pergunta_live_influencer(guild: discord.Guild, canal, slot_id: int, user_id: int, rotulo: str = "") -> bool:
+    """Manda a pergunta de LIVE no canal de pagamento da reserva (silencioso se falhar)."""
+    if not canal or not user_id:
+        return False
+    try:
+        dados_inf = await obter_influenciador(guild.id, int(user_id))
+        if not dados_inf or str(dados_inf.get("status") or "") != "aprovado":
+            return False
+        embed = criar_embed(
+            "🎬 Influenciador detectado!",
+            f"{mencao(user_id)}, você é **Influenciador Fire Force**!\n\n"
+            "Responda abaixo se está **em LIVE agora** para que seu diário seja divulgado "
+            "no canal de **Caça aos Influenciadores** com o card HD das suas redes.\n\n"
+            f"> **Reserva:** `#{int(slot_id)}`" + (f" • `{rotulo}`" if rotulo else ""),
+            "Vermelho",
+            footer="Fire Force • Programa de Influenciadores",
+        )
+        await canal.send(content=mencao(user_id), embed=embed, view=InfluenciadorPerguntaLiveView(int(slot_id)))
+        return True
+    except Exception as erro:
+        _log_arquivo(f"[INFLUENCER] pergunta de live slot={slot_id}: {type(erro).__name__}: {erro}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════════
+#  /INFLUENCIADOR • ADMIN HUB (Dono & Gerente) e AUTOSSERVIÇO
+# ══════════════════════════════════════════════════════════════
+
+_INF_POR_PAGINA = 20
+
+
+def _inf_ciclo_texto(cfg: dict) -> str:
+    ciclo = str((cfg or {}).get("inf_ciclo_comissao") or "semana").strip().lower()
+    return "dia" if ciclo == "dia" else "semana"
+
+
+async def _montar_embed_influencer_hub(guild: discord.Guild) -> discord.Embed:
+    cfg = await obter_config(guild.id)
+    total = await contar_influenciadores(guild.id)
+    aprovados = await contar_influenciadores(guild.id, status="aprovado")
+    pendentes = await contar_influenciadores(guild.id, status="pendente")
+    try:
+        valor = arredondar(float(cfg.get("inf_valor_convite") or 0.25))
+    except Exception:
+        valor = 0.25
+    ciclo = _inf_ciclo_texto(cfg)
+    cargo = guild.get_role(int(cfg["cargo_influencer"])) if cfg.get("cargo_influencer") else None
+    canal_caca = guild.get_channel(int(cfg["canal_caca_influencer"])) if cfg.get("canal_caca_influencer") else None
+    paginas = max(1, math.ceil(total / _INF_POR_PAGINA))
+
+    return criar_embed(
+        "🎬 Central dos Influenciadores",
+        f"**Comunidade credenciada**\n"
+        f"> **Total cadastrado:** `{total}` influenciadores\n"
+        f"> **Aprovados:** `{aprovados}` • **Pendentes:** `{pendentes}`\n\n"
+        f"**Configuração atual**\n"
+        f"> **Cargo de Influenciador:** {cargo.mention if cargo else '`não vinculado`'}\n"
+        f"> **Canal de Caça:** {canal_caca.mention if canal_caca else '`não configurado`'}\n"
+        f"> **Comissão por convite:** `{formatar_moeda(valor)}`\n"
+        f"> **Ciclo de pagamento:** `{ciclo}`\n\n"
+        f"**Requisitos mínimos**\n"
+        f"> YouTube `{int(cfg.get('inf_req_yt_min') or 500)}` • "
+        f"Instagram `{int(cfg.get('inf_req_ig_min') or 1000)}` • "
+        f"TikTok `{int(cfg.get('inf_req_tt_min') or 1000)}`\n\n"
+        f"-# 📄 {total} cadastro(s) • até {_INF_POR_PAGINA} por página ({paginas} página(s))",
+        "Vermelho",
+        footer="Fire Force • Influenciadores (Dono & Gerente)",
+    )
+
+
+def _montar_embed_lista_influenciadores(linhas: list, total: int, pagina: int, pagina_total: int,
+                                        busca: str = "") -> discord.Embed:
+    if not linhas:
+        texto = "`Nenhum influenciador encontrado`" + (f" para a busca `{busca}`." if busca else ".")
+        return criar_embed("🎬 Influenciadores", texto, "Cinza Escuro")
+
+    blocos = []
+    for indice, dados in enumerate(linhas, start=(pagina - 1) * _INF_POR_PAGINA + 1):
+        status = str(dados.get("status") or "pendente")
+        marca = {"aprovado": "✅", "pendente": "⏳", "recusado": "❌"}.get(status, "⏳")
+        redes = redes_do_influenciador(dados)
+        total_seg = sum(int(r.get("seguidores_num") or 0) for r in redes.values())
+        resumo_redes = " • ".join(
+            f"{_REDE_ROTULO[r][:2]}:{redes[r].get('seguidores') or '?'}" for r in _REDES_INFLUENCER if redes.get(r)
+        ) or "sem redes"
+        pagos = int(dados.get("total_convites_pagos") or 0)
+        comissao = arredondar(dados.get("total_comissao_recebida") or 0)
+        blocos.append(
+            f"`{indice:03d}.` {marca} {mencao(dados.get('user_id'))} "
+            f"— **{formatar_numero_social(total_seg) or '0'}** seg • {resumo_redes}\n"
+            f"-# `{pagos} convites` • `{formatar_moeda(comissao)}` pagos"
+        )
+    titulo = f"🎬 Influenciadores ({total})"
+    descricao = "\n".join(blocos)
+    if busca:
+        descricao = f"-# 🔎 Busca: `{busca}`\n" + descricao
+    return criar_embed(
+        titulo, descricao, "Vermelho",
+        footer=f"Fire Force • Página {pagina}/{pagina_total}",
+    )
+
+
+class InfluenciadorBuscaModal(discord.ui.Modal, title="🔎 Buscar Influenciador"):
+    termo = discord.ui.TextInput(
+        label="Nome, @, ID do Discord ou rede",
+        placeholder="Ex: kaique, @nickff, 123456789012345678",
+        required=False,
+        max_length=90,
+    )
+
+    def __init__(self, pagina_atual: int = 1, autor_id: int = 0):
+        super().__init__()
+        self.pagina_atual = int(pagina_atual)
+        self.autor_id = int(autor_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        termo = str(self.termo.value or "").strip()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        total = await contar_influenciadores(interaction.guild.id, busca=termo)
+        paginas = max(1, math.ceil(total / _INF_POR_PAGINA))
+        linhas = await listar_influenciadores(
+            interaction.guild.id, busca=termo, limite=_INF_POR_PAGINA, offset=0
+        )
+        embed = _montar_embed_lista_influenciadores(linhas, total, 1, paginas, termo)
+        await interaction.followup.send(
+            embed=embed,
+            view=InfluenciadorHubListaView(1, termo, interaction.user.id),
+            ephemeral=True,
+        )
+
+
+class InfluenciadorHubListaView(discord.ui.View):
+    """Lista paginada (20 por página) + ações de comissão e ajuste de taxa."""
+
+    def __init__(self, pagina: int = 1, busca: str = "", autor_id: int = 0):
+        super().__init__(timeout=600)
+        self.pagina = max(1, int(pagina))
+        self.busca = str(busca or "")
+        self.autor_id = int(autor_id)
+
+        seletor = discord.ui.Select(
+            placeholder="🎬 Selecione um influenciador para pagar comissão...",
+            options=[discord.SelectOption(label="Carregando...", value="0")],
+            custom_id="ff_inf_admin_sel",
+        )
+        seletor.callback = self._acoes_influenciador
+        self.add_item(seletor)
+        self._seletor = seletor
+
+        botao_busca = discord.ui.Button(
+            label="Buscar", emoji="🔎", style=discord.ButtonStyle.secondary,
+            custom_id="ff_inf_admin_busca",
+        )
+        botao_busca.callback = self._abrir_busca
+        self.add_item(botao_busca)
+
+        botao_anterior = discord.ui.Button(
+            label="Anterior", emoji="◀️", style=discord.ButtonStyle.secondary,
+            custom_id="ff_inf_admin_prev", disabled=True,
+        )
+        botao_anterior.callback = self._pagina_anterior
+        self.add_item(botao_anterior)
+        self._botao_anterior = botao_anterior
+
+        botao_proxima = discord.ui.Button(
+            label="Próxima", emoji="▶️", style=discord.ButtonStyle.secondary,
+            custom_id="ff_inf_admin_next",
+        )
+        botao_proxima.callback = self._pagina_proxima
+        self.add_item(botao_proxima)
+        self._botao_proxima = botao_proxima
+
+        botao_config = discord.ui.Button(
+            label="Configurar", emoji="⚙️", style=discord.ButtonStyle.primary,
+            custom_id="ff_inf_admin_config",
+        )
+        botao_config.callback = self._abrir_config
+        self.add_item(botao_config)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.autor_id and int(interaction.user.id) != self.autor_id:
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Painel de outro ADM", "Abra seu próprio `/influenciador`.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        if not await e_dono_ou_gerente(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente Dono e Gerente gerenciam influenciadores.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _carregar(self, interaction: discord.Interaction):
+        total = await contar_influenciadores(interaction.guild.id, busca=self.busca)
+        paginas = max(1, math.ceil(total / _INF_POR_PAGINA))
+        self.pagina = max(1, min(self.pagina, paginas))
+        linhas = await listar_influenciadores(
+            interaction.guild.id, busca=self.busca, limite=_INF_POR_PAGINA,
+            offset=(self.pagina - 1) * _INF_POR_PAGINA,
+        )
+        return linhas, total, paginas
+
+    def _atualizar_controles(self, linhas: list, paginas: int):
+        opcoes = []
+        for dados in linhas[:25]:
+            redes = redes_do_influenciador(dados)
+            total_seg = sum(int(r.get("seguidores_num") or 0) for r in redes.values())
+            rotulo = (
+                f"{formatar_numero_social(total_seg) or '0'} seg • "
+                f"{str(dados.get('status') or 'pendente')}"
+            )
+            nome_exibir = (
+                str(dados.get("ff_nome") or "").strip()
+                or str(dados.get("yt_nome") or "").strip()
+                or str(dados.get("ig_nome") or "").strip()
+                or str(dados.get("tt_nome") or "").strip()
+                or f"ID {int(dados.get('user_id') or 0)}"
+            )
+            opcoes.append(
+                discord.SelectOption(
+                    label=nome_exibir[:100],
+                    value=str(int(dados.get("id") or 0)),
+                    description=rotulo[:100],
+                )
+            )
+        if not opcoes:
+            opcoes = [discord.SelectOption(label="Nenhum influenciador nesta página", value="0")]
+        self._seletor.options = opcoes
+        self._botao_anterior.disabled = self.pagina <= 1
+        self._botao_proxima.disabled = self.pagina >= paginas
+
+    async def montar(self, interaction: discord.Interaction):
+        linhas, total, paginas = await self._carregar(interaction)
+        self._atualizar_controles(linhas, paginas)
+        embed = _montar_embed_lista_influenciadores(linhas, total, self.pagina, paginas, self.busca)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def _pagina_anterior(self, interaction: discord.Interaction):
+        self.pagina -= 1
+        await self.montar(interaction)
+
+    async def _pagina_proxima(self, interaction: discord.Interaction):
+        self.pagina += 1
+        await self.montar(interaction)
+
+    async def _abrir_busca(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(InfluenciadorBuscaModal(self.pagina, interaction.user.id))
+
+    async def _abrir_config(self, interaction: discord.Interaction):
+        cfg = await obter_config(interaction.guild.id)
+        await interaction.response.send_message(
+            embed=await _montar_embed_config_influencer(interaction.guild, cfg),
+            view=InfluenciadorConfigView(interaction.user.id),
+            ephemeral=True,
+        )
+
+    async def _acoes_influenciador(self, interaction: discord.Interaction):
+        bruto = str((interaction.data or {}).get("values", ["0"])[0])
+        if not bruto.isdigit() or int(bruto) <= 0:
+            return await interaction.response.send_message(
+                embed=criar_embed("⚠️ Nenhum influenciador selecionado", "Use a busca para localizar alguém.", "Amarelo"),
+                ephemeral=True,
+            )
+        id_registro = int(bruto)
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            linha = await (await db.execute(
+                "SELECT * FROM influenciadores WHERE id = ? AND guild_id = ?",
+                (id_registro, interaction.guild.id),
+            )).fetchone()
+        if not linha:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Registro não encontrado", "Atualize a lista com a busca.", "Vermelho"),
+                ephemeral=True,
+            )
+        dados = dict(linha)
+        await interaction.response.send_message(
+            embed=await _montar_embed_ficha_influencer(interaction.guild, dados),
+            view=InfluenciadorFichaAdminView(dados, self.pagina, self.busca, interaction.user.id),
+            ephemeral=True,
+        )
+
+
+async def _montar_embed_ficha_influencer(guild: discord.Guild, dados: dict) -> discord.Embed:
+    cfg = await obter_config(guild.id)
+    taxa = await obter_taxa_influenciador(dados, cfg)
+    resumo = await resumo_comissoes_influenciador(guild.id, int(dados.get("user_id") or 0))
+    status = str(dados.get("status") or "pendente")
+    marca = {"aprovado": "✅ Aprovado", "pendente": "⏳ Pendente", "recusado": "❌ Recusado"}.get(status, status)
+    ciclo_cfg = _inf_ciclo_texto(cfg)
+    embed = criar_embed(
+        f"🎬 Ficha do Influenciador • {mencao(dados.get('user_id'))}",
+        f"**Status:** {marca}\n"
+        f"**ID do registro:** `{int(dados.get('id') or 0)}`\n\n"
+        f"**Redes verificadas (tempo real):**\n{descrever_redes_embed(dados)}\n\n"
+        f"**Comissionamento**\n"
+        f"> **Taxa por convite:** `{formatar_moeda(taxa)}`"
+        f"{' *(personalizada)*' if float(dados.get('taxa_convite_custom') or 0) > 0 else ' *(padrão)*'}\n"
+        f"> **Ciclo da guild:** `{ciclo_cfg}`\n"
+        f"> **Convites pagos (total):** `{int(dados.get('total_convites_pagos') or 0)}`\n"
+        f"> **Comissão recebida (total):** `{formatar_moeda(dados.get('total_comissao_recebida') or 0)}`\n"
+        f"> **Últimos 7 dias:** `{resumo['semana_convites']}` convites • `{formatar_moeda(resumo['semana_valor'])}`\n"
+        f"> **No mês:** `{resumo['mes_convites']}` convites • `{formatar_moeda(resumo['mes_valor'])}`",
+        "Vermelho",
+        thumb=str(dados.get("yt_foto") or dados.get("ig_foto") or dados.get("tt_foto") or "") or None,
+        footer="Fire Force • Influenciadores",
+    )
+    return embed
+
+
+class InfluenciadorFichaAdminView(discord.ui.View):
+    """Ações rápidas sobre UM influenciador: pagar comissão, ajustar taxa, revalidar."""
+
+    def __init__(self, dados: dict, pagina: int = 1, busca: str = "", autor_id: int = 0):
+        super().__init__(timeout=600)
+        self.dados = dict(dados or {})
+        self.pagina = int(pagina)
+        self.busca = str(busca or "")
+        self.autor_id = int(autor_id)
+
+        sel = discord.ui.Select(
+            placeholder="💸 Escolha a ação para este influenciador...",
+            custom_id="ff_inf_ficha_sel",
+            options=[
+                discord.SelectOption(
+                    label="Pagar comissão de convites",
+                    value="pagar",
+                    description="Informa quantos convites ele fez e credita na carteira",
+                ),
+                discord.SelectOption(
+                    label="Definir taxa personalizada",
+                    value="taxa",
+                    description="Muda o valor por convite só para este influenciador",
+                ),
+                discord.SelectOption(
+                    label="Revalidar redes em tempo real",
+                    value="revalidar",
+                    description="Relê YouTube/Instagram/TikTok e atualiza números e fotos",
+                ),
+                discord.SelectOption(
+                    label="Voltar para a lista",
+                    value="voltar",
+                    description="Retorna à página de influenciadores",
+                ),
+            ],
+        )
+        sel.callback = self._rotar
+        self.add_item(sel)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await e_dono_ou_gerente(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente Dono e Gerente.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _rotar(self, interaction: discord.Interaction):
+        acao = str((interaction.data or {}).get("values", ["voltar"])[0])
+        if acao == "voltar":
+            view = InfluenciadorHubListaView(self.pagina, self.busca, interaction.user.id)
+            linhas, total, paginas = await view._carregar(interaction)
+            view._atualizar_controles(linhas, paginas)
+            return await interaction.response.edit_message(
+                embed=_montar_embed_lista_influenciadores(linhas, total, view.pagina, paginas, self.busca),
+                view=view,
+            )
+        if acao == "pagar":
+            cfg = await obter_config(interaction.guild.id)
+            ciclo = str(cfg.get("inf_ciclo_comissao") or "semana").lower()
+            await interaction.response.send_modal(
+                InfluenciadorPagarComissaoModal(self.dados, ciclo if ciclo in ("semana", "dia") else "semana")
+            )
+            return
+        if acao == "taxa":
+            await interaction.response.send_modal(InfluenciadorTaxaModal(self.dados))
+            return
+        if acao == "revalidar":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            redes_atuais = redes_do_influenciador(self.dados)
+            entradas = {r: (redes_atuais.get(r) or {}).get("url") for r in _REDES_INFLUENCER}
+            redes_novas = await resolver_redes_influencer({k: v for k, v in entradas.items() if v})
+            if not redes_novas:
+                return await interaction.followup.send(
+                    embed=criar_embed("⚠️ Nada para revalidar", "Nenhuma rede respondeu agora.", "Amarelo"),
+                    ephemeral=True,
+                )
+            db_id = int(self.dados.get("id") or 0)
+            async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                for rede, info in redes_novas.items():
+                    campos = _INF_COLUNAS_REDE[rede]
+                    await db.execute(
+                        f"UPDATE influenciadores SET {campos[0]} = ?, {campos[1]} = ?, "
+                        f"{campos[2]} = ?, {campos[3]} = ?, atualizado_em = ? WHERE id = ?",
+                        (
+                            info.get("url") or "", info.get("nome") or "",
+                            info.get("seguidores") or "", info.get("foto") or "",
+                            agora_brt().isoformat(), db_id,
+                        ),
+                    )
+                await db.commit()
+            marcar_sujo()
+            async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                db.row_factory = aiosqlite.Row
+                linha = await (await db.execute("SELECT * FROM influenciadores WHERE id = ?", (db_id,))).fetchone()
+            self.dados = dict(linha) if linha else self.dados
+            return await interaction.followup.send(
+                embed=await _montar_embed_ficha_influencer(interaction.guild, self.dados),
+                view=InfluenciadorFichaAdminView(self.dados, self.pagina, self.busca, self.autor_id),
+                ephemeral=True,
+            )
+
+
+class InfluenciadorPagarComissaoModal(discord.ui.Modal):
+    """Passo 1: pergunta EXATAMENTE quantos convites ele fez no ciclo configurado."""
+
+    def __init__(self, dados: dict, ciclo: str = "semana"):
+        self.dados = dict(dados or {})
+        self.ciclo = "dia" if str(ciclo).lower() == "dia" else "semana"
+        pergunta = (
+            "Quantos convites ele fez no dia?"
+            if self.ciclo == "dia"
+            else "Quantos convites ele fez na semana?"
+        )
+        super().__init__(title=f"💸 Comissão • {pergunta}"[:45])
+        self.pergunta = pergunta
+        self.campo_convites = discord.ui.TextInput(
+            label=pergunta[:45],
+            placeholder="Ex: 40",
+            required=True,
+            max_length=6,
+        )
+        self.add_item(self.campo_convites)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        bruto = re.sub(r"\D", "", str(self.campo_convites.value or ""))
+        convites = int(bruto) if bruto else 0
+        if convites <= 0:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Quantidade inválida", "Informe um número inteiro de convites maior que zero.", "Vermelho"),
+                ephemeral=True,
+            )
+        cfg = await obter_config(interaction.guild.id)
+        taxa_padrao = await obter_taxa_influenciador(self.dados, cfg)
+        await interaction.response.send_message(
+            embed=criar_embed(
+                "💸 Confirmar Comissão (1 de 2)",
+                f"**Influenciador:** {mencao(self.dados.get('user_id'))}\n"
+                f"**Pergunta:** _{self.pergunta}_\n"
+                f"**Convites informados:** `{convites}`\n"
+                f"**Taxa por convite:** `{formatar_moeda(taxa_padrao)}`\n"
+                f"**Total a creditar:** **`{formatar_moeda(taxa_padrao * convites)}`**\n\n"
+                "Deseja usar a **taxa padrão** acima ou informar uma **taxa personalizada**?",
+                "Vermelho",
+            ),
+            view=InfluenciadorConfirmarComissaoView(
+                self.dados, convites, taxa_padrao, self.ciclo, interaction.user.id
+            ),
+            ephemeral=True,
+        )
+
+
+class InfluenciadorConfirmarComissaoView(discord.ui.View):
+    """Passo 2: confirmar com taxa padrão ou abrir modal de taxa personalizada."""
+
+    def __init__(self, dados: dict, convites: int, taxa: float, ciclo: str, autor_id: int):
+        super().__init__(timeout=600)
+        self.dados = dict(dados or {})
+        self.convites = int(convites)
+        self.taxa = arredondar(taxa)
+        self.ciclo = ciclo
+        self.autor_id = int(autor_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.autor_id:
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Confirmação de outro ADM", "Quem abriu esta confirmação precisa concluir.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        if not await e_dono_ou_gerente(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente Dono e Gerente.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Confirmar e Creditar", emoji="✅", style=discord.ButtonStyle.success,
+        custom_id="ff_inf_conf_pagar",
+    )
+    async def confirmar(self, interaction: discord.Interaction, botao: discord.ui.Button):
+        await self._pagar(interaction, self.taxa)
+
+    @discord.ui.button(
+        label="Usar Taxa Personalizada", emoji="✏️", style=discord.ButtonStyle.primary,
+        custom_id="ff_inf_conf_taxa",
+    )
+    async def personalizada(self, interaction: discord.Interaction, botao: discord.ui.Button):
+        await interaction.response.send_modal(
+            InfluenciadorTaxaComissaoModal(self.dados, self.convites, self.ciclo, self.autor_id)
+        )
+
+    @discord.ui.button(
+        label="Cancelar", emoji="✖️", style=discord.ButtonStyle.secondary,
+        custom_id="ff_inf_conf_cancelar",
+    )
+    async def cancelar(self, interaction: discord.Interaction, botao: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=criar_embed("✖️ Comissão cancelada", "Nenhum valor foi creditado.", "Cinza Escuro"),
+            view=None,
+        )
+
+    async def _pagar(self, interaction: discord.Interaction, taxa: float):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        user_id = int(self.dados.get("user_id") or 0)
+        taxa = arredondar(max(0.0, float(taxa or 0)))
+        total = arredondar(taxa * self.convites)
+        if not user_id or total <= 0:
+            return await interaction.followup.send(
+                embed=criar_embed("❌ Valor inválido", "Não consegui calcular a comissão.", "Vermelho"),
+                ephemeral=True,
+            )
+        descricao = f"Comissão de {self.convites} convites ({self.ciclo})"
+        resultado = await pagar_comissao_influenciador(
+            interaction.guild.id, user_id, self.ciclo, self.convites, taxa,
+            interaction.user.id, descricao, ref=f"inf:{self.dados.get('id')}",
+        )
+        if resultado is None:
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "❌ Falha ao pagar comissão",
+                    "Nada foi creditado nem registrado. Nenhum valor saiu — tente novamente em instantes.",
+                    "Vermelho",
+                ),
+                ephemeral=True,
+            )
+        comissao_id, total = resultado
+        await avisar_jogador(
+            interaction.guild, user_id,
+            criar_embed(
+                "💸 Comissão de Influenciador creditada!",
+                f"**Convites validados:** `{self.convites}`\n"
+                f"**Taxa por convite:** `{formatar_moeda(taxa)}`\n"
+                f"**Total creditado:** **`{formatar_moeda(total)}`**\n"
+                f"**Ciclo:** `{self.ciclo}`\n"
+                f"**Pago por:** {mencao(interaction.user.id)}\n\n"
+                "O valor já está disponível na sua carteira (`/carteira`).",
+                "Esmeralda",
+                footer="Fire Force • Influenciadores",
+            ),
+        )
+        await registrar_log(
+            interaction.guild, "💸 INFLUENCIADOR",
+            "💸 Comissão de influenciador paga",
+            f"**Influenciador:** {mencao(user_id)}\n"
+            f"> **Convites:** `{self.convites}` • **Taxa:** `{formatar_moeda(taxa)}`\n"
+            f"> **Total:** `{formatar_moeda(total)}` • **Ciclo:** `{self.ciclo}`\n"
+            f"> **Comissão #** `{comissao_id}` • **Pago por:** {mencao(interaction.user.id)}",
+            "Esmeralda",
+        )
+        await interaction.followup.send(
+            embed=criar_embed(
+                "✅ Comissão Creditada",
+                f"{mencao(user_id)} recebeu **`{formatar_moeda(total)}`** "
+                f"({self.convites} convites × `{formatar_moeda(taxa)}`).\n"
+                "Recibo enviado por DM e registro salvo no log.",
+                "Esmeralda",
+            ),
+            ephemeral=True,
+        )
+
+
+class InfluenciadorTaxaComissaoModal(discord.ui.Modal, title="✏️ Taxa Personalizada de Comissão"):
+    valor = discord.ui.TextInput(
+        label="Valor por convite (R$)",
+        placeholder="Ex: 0,50",
+        required=True,
+        max_length=12,
+    )
+    salvar_como_padrao = discord.ui.TextInput(
+        label="Salvar como taxa fixa dele? (sim/não)",
+        placeholder="não",
+        required=False,
+        max_length=5,
+    )
+
+    def __init__(self, dados: dict, convites: int, ciclo: str, autor_id: int):
+        super().__init__()
+        self.dados = dict(dados or {})
+        self.convites = int(convites)
+        self.ciclo = ciclo
+        self.autor_id = int(autor_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        bruto = str(self.valor.value or "").replace("R$", "").replace(" ", "").replace(",", ".")
+        try:
+            taxa = arredondar(float(bruto))
+        except Exception:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Valor inválido", "Use algo como `0,50` ou `1.20`.", "Vermelho"),
+                ephemeral=True,
+            )
+        if taxa <= 0:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Valor inválido", "A taxa precisa ser maior que zero.", "Vermelho"),
+                ephemeral=True,
+            )
+        fixar = str(self.salvar_como_padrao.value or "").strip().lower() in ("sim", "s", "yes", "1")
+        if fixar:
+            try:
+                async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                    await db.execute(
+                        "UPDATE influenciadores SET taxa_convite_custom = ?, atualizado_em = ? "
+                        "WHERE id = ? AND guild_id = ?",
+                        (taxa, agora_brt().isoformat(), int(self.dados.get("id") or 0), interaction.guild.id),
+                    )
+                    await db.commit()
+                marcar_sujo()
+                self.dados["taxa_convite_custom"] = taxa
+            except Exception as erro:
+                _log_arquivo(f"[INFLUENCER] fixar taxa: {erro}")
+        total = arredondar(taxa * self.convites)
+        view = InfluenciadorConfirmarComissaoView(self.dados, self.convites, taxa, self.ciclo, self.autor_id)
+        await interaction.response.send_message(
+            embed=criar_embed(
+                "💸 Confirmar Comissão (2 de 2)",
+                f"**Influenciador:** {mencao(self.dados.get('user_id'))}\n"
+                f"**Convites:** `{self.convites}` • **Taxa personalizada:** `{formatar_moeda(taxa)}`\n"
+                f"**Total a creditar:** **`{formatar_moeda(total)}`**\n"
+                + (f"\n-# ✅ Taxa fixa deste influenciador salva em `{formatar_moeda(taxa)}`." if fixar else ""),
+                "Vermelho",
+            ),
+            view=view,
+            ephemeral=True,
+        )
+
+
+class InfluenciadorTaxaModal(discord.ui.Modal, title="⚙️ Taxa Personalizada do Influenciador"):
+    valor = discord.ui.TextInput(
+        label="Novo valor por convite (R$) — 0 volta ao padrão",
+        placeholder="Ex: 0,40",
+        required=True,
+        max_length=12,
+    )
+
+    def __init__(self, dados: dict):
+        super().__init__()
+        self.dados = dict(dados or {})
+
+    async def on_submit(self, interaction: discord.Interaction):
+        bruto = str(self.valor.value or "").replace("R$", "").replace(" ", "").replace(",", ".")
+        try:
+            taxa = arredondar(float(bruto))
+        except Exception:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Valor inválido", "Use `0,50` para R$ 0,50 ou `0` para o padrão.", "Vermelho"),
+                ephemeral=True,
+            )
+        if taxa < 0:
+            taxa = 0.0
+        try:
+            async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                await db.execute(
+                    "UPDATE influenciadores SET taxa_convite_custom = ?, atualizado_em = ? "
+                    "WHERE id = ? AND guild_id = ?",
+                    (taxa, agora_brt().isoformat(), int(self.dados.get("id") or 0), interaction.guild.id),
+                )
+                await db.commit()
+            marcar_sujo()
+        except Exception as erro:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Falha ao salvar", f"`{type(erro).__name__}`", "Vermelho"),
+                ephemeral=True,
+            )
+        self.dados["taxa_convite_custom"] = taxa
+        texto = (
+            f"`{formatar_moeda(taxa)}` por convite (personalizada)."
+            if taxa > 0
+            else "Voltou a usar a **taxa padrão** da guild."
+        )
+        await interaction.response.send_message(
+            embed=criar_embed("✅ Taxa atualizada", texto, "Esmeralda"), ephemeral=True
+        )
+
+
+# ---------- configuração do programa (cargo, canal, ciclo, valor e mínimos) ----------
+
+async def _montar_embed_config_influencer(guild: discord.Guild, cfg: dict) -> discord.Embed:
+    cfg = cfg or {}
+    cargo = guild.get_role(int(cfg["cargo_influencer"])) if cfg.get("cargo_influencer") else None
+    canal = guild.get_channel(int(cfg["canal_caca_influencer"])) if cfg.get("canal_caca_influencer") else None
+    try:
+        valor = arredondar(float(cfg.get("inf_valor_convite") or 0.25))
+    except Exception:
+        valor = 0.25
+    extra = str(cfg.get("inf_req_extra") or "").strip()
+    return criar_embed(
+        "⚙️ Configurações dos Influenciadores",
+        f"**Cargo & Canal**\n"
+        f"> **Cargo de Influenciador:** {cargo.mention if cargo else '`não vinculado`'}\n"
+        f"> **Canal de Caça aos Influenciadores:** {canal.mention if canal else '`não configurado`'}\n\n"
+        f"**Comissão**\n"
+        f"> **Valor por convite:** `{formatar_moeda(valor)}`\n"
+        f"> **Ciclo de pagamento:** `{_inf_ciclo_texto(cfg)}`\n\n"
+        f"**Requisitos mínimos**\n"
+        f"> **YouTube:** `{int(cfg.get('inf_req_yt_min') or 500)}` inscritos\n"
+        f"> **Instagram:** `{int(cfg.get('inf_req_ig_min') or 1000)}` seguidores\n"
+        f"> **TikTok:** `{int(cfg.get('inf_req_tt_min') or 1000)}` seguidores\n"
+        f"> **Regras extras:** {extra or '`nenhuma`'}",
+        "Cinza Escuro",
+        footer="Fire Force • Influenciadores",
+    )
+
+
+class InfluenciadorConfigView(discord.ui.View):
+    """Painel de configuração do programa (somente Dono & Gerente)."""
+
+    def __init__(self, autor_id: int = 0):
+        super().__init__(timeout=600)
+        self.autor_id = int(autor_id)
+
+        seletor = discord.ui.Select(
+            placeholder="⚙️ O que deseja configurar?",
+            custom_id="ff_inf_cfg_sel",
+            options=[
+                discord.SelectOption(label="Cargo de Influenciador", value="cargo", description="Cargo entregue automaticamente ao aprovar"),
+                discord.SelectOption(label="Canal de Caça aos Influenciadores", value="canal", description="Canal onde os cards de live são publicados"),
+                discord.SelectOption(label="Valor por Convite", value="valor", description="Comissão padrão paga por convite (R$)"),
+                discord.SelectOption(label="Ciclo de Comissão", value="ciclo", description="Pagar por semana ou por dia"),
+                discord.SelectOption(label="Requisitos Mínimos", value="requisitos", description="Mínimo de inscritos/seguidores por rede"),
+                discord.SelectOption(label="Publicar Painel Público", value="publicar", description="Envia o painel 'Quero ser Influenciador' neste canal"),
+            ],
+        )
+        seletor.callback = self._rotar
+        self.add_item(seletor)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await e_dono_ou_gerente(interaction.user):
+            await interaction.response.send_message(
+                embed=criar_embed("🔒 Exclusivo Dono & Gerente", "Somente Dono e Gerente configuram o programa.", "Vermelho"),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _rotar(self, interaction: discord.Interaction):
+        acao = str((interaction.data or {}).get("values", ["cargo"])[0])
+        cfg = await obter_config(interaction.guild.id)
+
+        if acao == "cargo":
+            return await interaction.response.send_modal(InfluenciadorConfigCargoModal(cfg))
+        if acao == "canal":
+            return await interaction.response.send_modal(InfluenciadorConfigCanalModal(cfg))
+        if acao == "valor":
+            return await interaction.response.send_modal(InfluenciadorConfigValorModal(cfg))
+        if acao == "requisitos":
+            return await interaction.response.send_modal(InfluenciadorConfigRequisitosModal(cfg))
+        if acao == "ciclo":
+            ciclo_atual = _inf_ciclo_texto(cfg)
+            novo = "dia" if ciclo_atual == "semana" else "semana"
+            await salvar_config(interaction.guild.id, inf_ciclo_comissao=novo)
+            marcar_sujo()
+            cfg = await obter_config(interaction.guild.id)
+            await registrar_log(
+                interaction.guild, "🎬 INFLUENCIADOR", "⚙️ Ciclo de comissão alterado",
+                f"{interaction.user.mention} definiu o ciclo como `{novo}`.", "Cinza Escuro",
+            )
+            return await interaction.response.edit_message(
+                embed=await _montar_embed_config_influencer(interaction.guild, cfg),
+                view=InfluenciadorConfigView(self.autor_id),
+            )
+        if acao == "publicar":
+            canal = interaction.channel
+            try:
+                await canal.send(
+                    embed=embed_painel_influenciador(cfg),
+                    view=InfluenciadorPainelPublicoView(),
+                )
+            except Exception as erro:
+                return await interaction.response.send_message(
+                    embed=criar_embed("❌ Falha ao publicar", f"`{type(erro).__name__}`", "Vermelho"),
+                    ephemeral=True,
+                )
+            return await interaction.response.send_message(
+                embed=criar_embed("✅ Painel publicado", f"Painel público enviado em {canal.mention}.", "Esmeralda"),
+                ephemeral=True,
+            )
+
+
+class InfluenciadorConfigCargoModal(discord.ui.Modal, title="⚙️ Cargo de Influenciador"):
+    cargo_id = discord.ui.TextInput(
+        label="ID do cargo (vazio = remover)",
+        placeholder="Ex: 1234567890123456789",
+        required=False,
+        max_length=25,
+    )
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self.cfg = cfg or {}
+
+    async def on_submit(self, interaction: discord.Interaction):
+        bruto = re.sub(r"\D", "", str(self.cargo_id.value or ""))
+        if bruto:
+            cargo = interaction.guild.get_role(int(bruto))
+            if not cargo:
+                return await interaction.response.send_message(
+                    embed=criar_embed("❌ Cargo não encontrado", "Copie o **ID** do cargo (Modo Desenvolvedor).", "Vermelho"),
+                    ephemeral=True,
+                )
+            await salvar_config(interaction.guild.id, cargo_influencer=int(bruto))
+            texto = f"Cargo definido como {cargo.mention}."
+        else:
+            await salvar_config(interaction.guild.id, cargo_influencer=None)
+            texto = "Cargo de influenciador **removido**."
+        marcar_sujo()
+        cfg = await obter_config(interaction.guild.id)
+        await interaction.response.send_message(
+            embed=criar_embed("✅ Cargo atualizado", texto, "Esmeralda"),
+            ephemeral=True,
+        )
+        await interaction.channel.send(
+            embed=await _montar_embed_config_influencer(interaction.guild, cfg),
+            view=InfluenciadorConfigView(interaction.user.id),
+        )
+
+
+class InfluenciadorConfigCanalModal(discord.ui.Modal, title="⚙️ Canal de Caça aos Influenciadores"):
+    canal_id = discord.ui.TextInput(
+        label="ID do canal (vazio = remover)",
+        placeholder="Ex: 1234567890123456789",
+        required=False,
+        max_length=25,
+    )
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self.cfg = cfg or {}
+
+    async def on_submit(self, interaction: discord.Interaction):
+        bruto = re.sub(r"\D", "", str(self.canal_id.value or ""))
+        if bruto:
+            canal = interaction.guild.get_channel(int(bruto))
+            if not canal:
+                return await interaction.response.send_message(
+                    embed=criar_embed("❌ Canal não encontrado", "Copie o **ID** do canal (Modo Desenvolvedor).", "Vermelho"),
+                    ephemeral=True,
+                )
+            await salvar_config(interaction.guild.id, canal_caca_influencer=int(bruto))
+            texto = f"Canal definido como {canal.mention}."
+        else:
+            await salvar_config(interaction.guild.id, canal_caca_influencer=None)
+            texto = "Canal de Caça **removido**."
+        marcar_sujo()
+        cfg = await obter_config(interaction.guild.id)
+        await interaction.response.send_message(
+            embed=criar_embed("✅ Canal atualizado", texto, "Esmeralda"),
+            ephemeral=True,
+        )
+        await interaction.channel.send(
+            embed=await _montar_embed_config_influencer(interaction.guild, cfg),
+            view=InfluenciadorConfigView(interaction.user.id),
+        )
+
+
+class InfluenciadorConfigValorModal(discord.ui.Modal, title="⚙️ Valor por Convite"):
+    valor = discord.ui.TextInput(
+        label="Valor em R$ por convite",
+        placeholder="Ex: 0,25",
+        required=True,
+        max_length=12,
+    )
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self.cfg = cfg or {}
+
+    async def on_submit(self, interaction: discord.Interaction):
+        bruto = str(self.valor.value or "").replace("R$", "").replace(" ", "").replace(",", ".")
+        try:
+            valor = arredondar(float(bruto))
+        except Exception:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Valor inválido", "Use `0,25` para R$ 0,25.", "Vermelho"),
+                ephemeral=True,
+            )
+        if valor <= 0:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Valor inválido", "O valor precisa ser maior que zero.", "Vermelho"),
+                ephemeral=True,
+            )
+        await salvar_config(interaction.guild.id, inf_valor_convite=valor)
+        marcar_sujo()
+        cfg = await obter_config(interaction.guild.id)
+        await interaction.response.send_message(
+            embed=criar_embed(
+                "✅ Valor atualizado",
+                f"Comissão padrão agora é **`{formatar_moeda(valor)}` por convite**.",
+                "Esmeralda",
+            ),
+            ephemeral=True,
+        )
+        await interaction.channel.send(
+            embed=await _montar_embed_config_influencer(interaction.guild, cfg),
+            view=InfluenciadorConfigView(interaction.user.id),
+        )
+
+
+class InfluenciadorConfigRequisitosModal(discord.ui.Modal, title="⚙️ Requisitos Mínimos"):
+    yt = discord.ui.TextInput(label="Mínimo YouTube (inscritos)", placeholder="500", required=False, max_length=10)
+    ig = discord.ui.TextInput(label="Mínimo Instagram (seguidores)", placeholder="1000", required=False, max_length=10)
+    tt = discord.ui.TextInput(label="Mínimo TikTok (seguidores)", placeholder="1000", required=False, max_length=10)
+    extra = discord.ui.TextInput(
+        label="Regras extras (opcional)",
+        placeholder="Ex: precisa postar 1 story por diário",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=300,
+    )
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self.cfg = cfg or {}
+
+    async def on_submit(self, interaction: discord.Interaction):
+        dados = {}
+        for chave, campo in (("inf_req_yt_min", self.yt), ("inf_req_ig_min", self.ig), ("inf_req_tt_min", self.tt)):
+            bruto = re.sub(r"\D", "", str(campo.value or ""))
+            if bruto:
+                dados[chave] = int(bruto)
+        dados["inf_req_extra"] = str(self.extra.value or "").strip()[:300]
+        await salvar_config(interaction.guild.id, **dados)
+        marcar_sujo()
+        cfg = await obter_config(interaction.guild.id)
+        await interaction.response.send_message(
+            embed=criar_embed("✅ Requisitos atualizados", "Mínimos por rede salvos com sucesso.", "Esmeralda"),
+            ephemeral=True,
+        )
+        await interaction.channel.send(
+            embed=await _montar_embed_config_influencer(interaction.guild, cfg),
+            view=InfluenciadorConfigView(interaction.user.id),
+        )
+
+
+# ---------- autoatendimento do influenciador aprovado ----------
+
+class InfluenciadorAtualizarRedesModal(discord.ui.Modal, title="🔄 Atualizar Minhas Redes"):
+    link_youtube = discord.ui.TextInput(
+        label="Link do YouTube (deixe vazio p/ remover)",
+        placeholder="https://www.youtube.com/@seucanal",
+        required=False, max_length=200,
+    )
+    link_instagram = discord.ui.TextInput(
+        label="Link do Instagram (deixe vazio p/ remover)",
+        placeholder="https://www.instagram.com/seuperfil",
+        required=False, max_length=200,
+    )
+    link_tiktok = discord.ui.TextInput(
+        label="Link do TikTok (deixe vazio p/ remover)",
+        placeholder="https://www.tiktok.com/@seuperfil",
+        required=False, max_length=200,
+    )
+
+    def __init__(self, dados: dict):
+        super().__init__()
+        self.dados = dict(dados or {})
+        redes = redes_do_influenciador(self.dados)
+        if redes.get("youtube"):
+            self.link_youtube.default = redes["youtube"]["url"]
+        if redes.get("instagram"):
+            self.link_instagram.default = redes["instagram"]["url"]
+        if redes.get("tiktok"):
+            self.link_tiktok.default = redes["tiktok"]["url"]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        entradas = {
+            "youtube": str(self.link_youtube.value or "").strip(),
+            "instagram": str(self.link_instagram.value or "").strip(),
+            "tiktok": str(self.link_tiktok.value or "").strip(),
+        }
+        if not any(entradas.values()):
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "❌ Pelo menos uma rede",
+                    "Mantenha pelo menos **uma** rede cadastrada para continuar como influenciador.",
+                    "Vermelho",
+                ),
+                ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        redes = await resolver_redes_influencer(entradas)
+        if not redes:
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "❌ Não consegui ler os perfis",
+                    "Confira os links e se os perfis estão **públicos**. Nada foi alterado.",
+                    "Vermelho",
+                ),
+                ephemeral=True,
+            )
+        removidas = [r for r in _REDES_INFLUENCER if not entradas.get(r)]
+        # Limpa no banco as redes que o influenciador removeu
+        try:
+            async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                for rede in removidas:
+                    campos = _INF_COLUNAS_REDE[rede]
+                    await db.execute(
+                        f"UPDATE influenciadores SET {campos[0]} = '', {campos[1]} = '', "
+                        f"{campos[2]} = '', {campos[3]} = '' WHERE guild_id = ? AND user_id = ?",
+                        (interaction.guild.id, interaction.user.id),
+                    )
+                await db.commit()
+        except Exception as erro:
+            _log_arquivo(f"[INFLUENCER] limpar redes removidas: {erro}")
+
+        await salvar_redes_influenciador(interaction.guild.id, interaction.user.id, redes)
+        dados_novos = await obter_influenciador(interaction.guild.id, interaction.user.id) or {}
+        cfg = await obter_config(interaction.guild.id)
+        apto, motivo = _avaliar_requisitos_influencer(redes, cfg)
+        await interaction.followup.send(
+            embed=criar_embed(
+                "✅ Redes atualizadas em tempo real",
+                f"{descrever_redes_embed(dados_novos)}\n\n**Requisitos:** {motivo}",
+                "Esmeralda" if apto else "Amarelo",
+            ),
+            ephemeral=True,
+        )
+        if not apto:
+            await avisar_jogador(
+                interaction.guild, interaction.user.id,
+                criar_embed(
+                    "⚠️ Atenção aos requisitos",
+                    "Suas novas redes ficaram abaixo do mínimo exigido.\n\n"
+                    f"**Situação:** {motivo}\n\n"
+                    "Seus benefícios continuam ativos, mas mantenha os números em dia.",
+                    "Amarelo",
+                ),
+            )
+        await registrar_log(
+            interaction.guild, "🎬 INFLUENCIADOR", "🔄 Redes atualizadas pelo influenciador",
+            f"{interaction.user.mention} atualizou o cadastro.\n{descrever_redes_embed(dados_novos)}",
+            "Cinza Escuro",
+        )
+
+
+class InfluenciadorEscolherSlotModal(discord.ui.Modal, title="🔴 Avisar que Estou em LIVE"):
+    numero_vaga = discord.ui.TextInput(
+        label="Número da sua vaga no diário",
+        placeholder="Ex: 7",
+        required=True,
+        max_length=4,
+    )
+
+    def __init__(self, dados: dict, slots: list):
+        super().__init__()
+        self.dados = dict(dados or {})
+        self.slots = list(slots or [])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        bruto = re.sub(r"\D", "", str(self.numero_vaga.value or ""))
+        if not bruto:
+            return await interaction.response.send_message(
+                embed=criar_embed("❌ Vaga inválida", "Informe o número da sua vaga (ex: `7`).", "Vermelho"),
+                ephemeral=True,
+            )
+        numero = int(bruto)
+        achado = None
+        for slot in self.slots:
+            if int(slot.get("numero") or 0) == numero:
+                achado = slot
+                break
+        if not achado:
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "❌ Vaga não encontrada",
+                    "Não achei uma vaga confirmada sua com esse número. "
+                    "Confira em `/carteira` ou no painel de diários.",
+                    "Vermelho",
+                ),
+                ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+            await db.execute("UPDATE slots SET influencer_em_live = 1 WHERE id = ?", (int(achado["id"]),))
+            await db.commit()
+        marcar_sujo()
+        ok, mensagem = await anunciar_caca_influencer_do_slot(interaction.guild, int(achado["id"]))
+        await interaction.followup.send(
+            embed=criar_embed(
+                "🔴 LIVE publicada!" if ok else "⚠️ Live marcada",
+                mensagem,
+                "Esmeralda" if ok else "Amarelo",
+            ),
+            ephemeral=True,
+        )
+
+
+class InfluenciadorMembroView(discord.ui.View):
+    """Painel do influenciador aprovado: atualizar redes e avisar live."""
+
+    def __init__(self, dados: dict):
+        super().__init__(timeout=600)
+        self.dados = dict(dados or {})
+        seletor = discord.ui.Select(
+            placeholder="🎬 O que você quer fazer agora?",
+            custom_id="ff_inf_membro_sel",
+            options=[
+                discord.SelectOption(
+                    label="Atualizar minhas redes",
+                    value="redes",
+                    description="Troquei de @ / perfil: relê os números e fotos em tempo real",
+                ),
+                discord.SelectOption(
+                    label="Avisar que estou em LIVE",
+                    value="live",
+                    description="Publica seu diário confirmado no canal de Caça aos Influenciadores",
+                ),
+                discord.SelectOption(
+                    label="Ver minhas comissões",
+                    value="comissoes",
+                    description="Totais pagos na semana e no mês",
+                ),
+            ],
+        )
+        seletor.callback = self._rotar
+        self.add_item(seletor)
+
+    async def _rotar(self, interaction: discord.Interaction):
+        acao = str((interaction.data or {}).get("values", ["redes"])[0])
+        dados = await obter_influenciador(interaction.guild.id, interaction.user.id)
+        if not dados or str(dados.get("status") or "") != "aprovado":
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "⏳ Cadastro em análise",
+                    "Seu cadastro ainda não está aprovado. Use o painel público para se candidatar.",
+                    "Amarelo",
+                ),
+                ephemeral=True,
+            )
+        self.dados = dados
+
+        if acao == "redes":
+            return await interaction.response.send_modal(InfluenciadorAtualizarRedesModal(dados))
+
+        if acao == "comissoes":
+            cfg = await obter_config(interaction.guild.id)
+            resumo = await resumo_comissoes_influenciador(interaction.guild.id, interaction.user.id)
+            taxa = await obter_taxa_influenciador(dados, cfg)
+            return await interaction.response.send_message(
+                embed=criar_embed(
+                    "💸 Minhas Comissões",
+                    f"**Taxa por convite:** `{formatar_moeda(taxa)}`\n"
+                    f"**Ciclo combinado:** `{_inf_ciclo_texto(cfg)}`\n\n"
+                    f"**Últimos 7 dias:** `{resumo['semana_convites']}` convites ➜ `{formatar_moeda(resumo['semana_valor'])}`\n"
+                    f"**No mês:** `{resumo['mes_convites']}` convites ➜ `{formatar_moeda(resumo['mes_valor'])}`\n"
+                    f"**Total histórico:** `{int(dados.get('total_convites_pagos') or 0)}` convites ➜ "
+                    f"`{formatar_moeda(dados.get('total_comissao_recebida') or 0)}`",
+                    "Cinza Escuro",
+                ),
+                ephemeral=True,
+            )
+
+        if acao == "live":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            try:
+                async with aiosqlite.connect(DATABASE_FILE, timeout=30) as db:
+                    db.row_factory = aiosqlite.Row
+                    linhas = await (await db.execute(
+                        "SELECT s.*, h.tipo, h.categoria, h.horario FROM slots s "
+                        "JOIN horarios h ON h.id = s.horario_id "
+                        "WHERE s.guild_id = ? AND s.comprador_id = ? AND s.confirmado = 1 "
+                        "AND COALESCE(s.influencer_anunciado, 0) = 0 "
+                        "ORDER BY s.numero ASC LIMIT 20",
+                        (interaction.guild.id, interaction.user.id),
+                    )).fetchall()
+            except Exception as erro:
+                return await interaction.followup.send(
+                    embed=criar_embed("❌ Erro ao buscar reservas", f"`{type(erro).__name__}`", "Vermelho"),
+                    ephemeral=True,
+                )
+            slots = [dict(l) for l in linhas]
+            if not slots:
+                return await interaction.followup.send(
+                    embed=criar_embed(
+                        "🎮 Nenhuma vaga confirmada disponível",
+                        "Compre e confirme um diário primeiro para poder anunciar sua live.\n"
+                        "Se já anunciou antes, cada vaga só pode ser divulgada **uma vez**.",
+                        "Cinza Escuro",
+                    ),
+                    ephemeral=True,
+                )
+            lista = "\n".join(
+                f"> **#{int(s.get('numero') or 0):02d}** • `{formatar_rotulo_diario(s.get('tipo'), s.get('categoria'))}` "
+                f"às `{s.get('horario')}`"
+                for s in slots[:12]
+            )
+            return await interaction.followup.send(
+                embed=criar_embed(
+                    "🔴 Qual vaga está em LIVE?",
+                    f"Clique no botão e informe o número da vaga:\n\n{lista}",
+                    "Vermelho",
+                ),
+                view=InfluenciadorEscolherSlotView(dados, slots),
+                ephemeral=True,
+            )
+
+
+class InfluenciadorEscolherSlotView(discord.ui.View):
+    def __init__(self, dados: dict, slots: list):
+        super().__init__(timeout=600)
+        self.dados = dict(dados or {})
+        self.slots = list(slots or [])
+
+    @discord.ui.button(
+        label="Informar nº da vaga", emoji="🔴", style=discord.ButtonStyle.danger,
+        custom_id="ff_inf_membro_live",
+    )
+    async def informar(self, interaction: discord.Interaction, botao: discord.ui.Button):
+        await interaction.response.send_modal(InfluenciadorEscolherSlotModal(self.dados, self.slots))
+
+
+async def _montar_embed_influencer_membro(guild: discord.Guild, dados: dict) -> discord.Embed:
+    cfg = await obter_config(guild.id)
+    taxa = await obter_taxa_influenciador(dados, cfg)
+    resumo = await resumo_comissoes_influenciador(guild.id, int(dados.get("user_id") or 0))
+    total_seg = total_seguidores_influenciador(dados)
+    return criar_embed(
+        "🎬 Painel do Influenciador",
+        f"Bem-vindo de volta, {mencao(dados.get('user_id'))}!\n\n"
+        f"**Suas redes verificadas**\n{descrever_redes_embed(dados)}\n\n"
+        f"> **Alcance somado:** `{formatar_numero_social(total_seg) or '0'}`\n"
+        f"> **Taxa por convite:** `{formatar_moeda(taxa)}` • ciclo `{_inf_ciclo_texto(cfg)}`\n"
+        f"> **Últimos 7 dias:** `{resumo['semana_convites']}` convites • `{formatar_moeda(resumo['semana_valor'])}`\n\n"
+        "Escolha uma ação abaixo. Usou um **novo @**? Atualize aqui que os números e a foto são "
+        "lidos novamente **em tempo real**.",
+        "Vermelho",
+        thumb=str(dados.get("yt_foto") or dados.get("ig_foto") or dados.get("tt_foto") or "") or None,
+        footer="Fire Force • Programa de Influenciadores",
+    )
+
+
+@bot.tree.command(name="influenciador", description="🎬 Programa de Influenciadores: painel do influenciador ou central de gestão")
+@app_commands.guild_only()
+async def cmd_influenciador(interaction: discord.Interaction):
+    if not INFLUENCIADORES_ATIVO:
+        return await interaction.response.send_message(
+            embed=criar_embed("⏸️ Programa desativado", "O programa de influenciadores está desativado neste servidor.", "Cinza Escuro"),
+            ephemeral=True,
+        )
+    guild = interaction.guild
+    if not guild:
+        return await interaction.response.send_message(
+            embed=criar_embed("❌ Use no servidor", "Este comando só funciona dentro do servidor.", "Vermelho"),
+            ephemeral=True,
+        )
+
+    if await e_dono_ou_gerente(interaction.user):
+        embed = await _montar_embed_influencer_hub(guild)
+        view = InfluenciadorHubListaView(1, "", interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        linhas, total, paginas = await view._carregar(interaction)
+        view._atualizar_controles(linhas, paginas)
+        return await interaction.followup.send(
+            embed=embed,
+            view=view,
+            ephemeral=True,
+        )
+
+    dados = await obter_influenciador(guild.id, interaction.user.id)
+    if not dados:
+        cfg = await obter_config(guild.id)
+        return await interaction.response.send_message(
+            embed=embed_painel_influenciador(cfg),
+            view=InfluenciadorPainelPublicoView(),
+            ephemeral=True,
+        )
+    if str(dados.get("status") or "") != "aprovado":
+        return await interaction.response.send_message(
+            embed=criar_embed(
+                "⏳ Cadastro em análise",
+                "Sua candidatura está com o **Dono/Gerente**.\n\n"
+                f"**Redes enviadas:**\n{descrever_redes_embed(dados)}",
+                "Amarelo",
+            ),
+            ephemeral=True,
+        )
+    embed = await _montar_embed_influencer_membro(guild, dados)
+    await interaction.response.send_message(
+        embed=embed, view=InfluenciadorMembroView(dados), ephemeral=True
+    )
+
+
+@bot.tree.command(name="painel_influenciador", description="🎬 Publicar o painel público 'Quero ser Influenciador' neste canal")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_channels=True)
+async def cmd_painel_influenciador(interaction: discord.Interaction):
+    if not INFLUENCIADORES_ATIVO:
+        return await interaction.response.send_message(
+            embed=criar_embed("⏸️ Programa desativado", "O programa de influenciadores está desativado neste servidor.", "Cinza Escuro"),
+            ephemeral=True,
+        )
+    if not await e_dono_ou_gerente(interaction.user):
+        return await interaction.response.send_message(
+            embed=criar_embed("❌ Sem Permissão", "Apenas **Dono** ou **Gerente** publicam o painel.", "Vermelho"),
+            ephemeral=True,
+        )
+    cfg = await obter_config(interaction.guild.id)
+    await interaction.channel.send(
+        embed=embed_painel_influenciador(cfg),
+        view=InfluenciadorPainelPublicoView(),
+    )
+    await interaction.response.send_message(
+        embed=criar_embed(
+            "✅ Painel Publicado",
+            "Painel **Virar Influenciador** enviado neste canal.\n"
+            "-# Configure cargo, canal e comissão em `/influenciador`.",
+            "Esmeralda",
+        ),
+        ephemeral=True,
+    )
+
+
 # ==================== AUTO-UPDATE SEM DESLIGAR A MÁQUINA ====================
 
 _ARQUIVO_BOT_PATH = os.path.abspath(__file__)
@@ -21775,6 +25276,13 @@ async def _inicializar_bot():
     bot.add_view(PainelCarteiraView())
     bot.add_view(ParceriaSolicitacaoPainelView())
     bot.add_view(DivulgacaoPainelView())
+    if INFLUENCIADORES_ATIVO:
+        bot.add_view(InfluenciadorPainelPublicoView())
+        for guild_varredura in bot.guilds:
+            try:
+                await _registrar_views_influenciadores(guild_varredura)
+            except Exception as erro:
+                _log_arquivo(f"[INFLUENCER] views guild={guild_varredura.id}: {type(erro).__name__}: {erro}")
 
     await processar_repeticao_diaria()
 
