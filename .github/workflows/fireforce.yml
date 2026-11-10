@@ -53,6 +53,15 @@ jobs:
       - name: 📥 Baixar o código
         uses: actions/checkout@v4
 
+      - name: ⏱️ Marcar o início do relógio (limite de 6h conta do RUN, não do job)
+        shell: pwsh
+        run: |
+          # O pré-aquecimento roda ANTES deste job — mas o cronômetro de 6h do
+          # GitHub conta desde o início do RUN. Se a janela do bot contasse só a
+          # partir daqui, o run passaria das 6h e seria cortado à força.
+          "$(Get-Date -Format o)" | Set-Content -Path "$env:GITHUB_WORKSPACE\ff_inicio_run.txt" -Encoding UTF8
+          Write-Host "Início do run marcado."
+
       # ---------------------------------------------------------------- RDP ---
       - name: 🖥️ Preparar o RDP (usuário runneradmin + senha do segredo)
         shell: pwsh
@@ -360,8 +369,27 @@ jobs:
         run: |
           . "$env:GITHUB_WORKSPACE\bastao_helpers.ps1"
           $meu = [long]$env:GITHUB_RUN_ID
-          $fim = (Get-Date).AddMinutes(350)           # 5h50: termina ANTES do corte de 6h
-          $avisoFallback = (Get-Date).AddMinutes(338) # 5h38: dispara a próxima se ninguém veio
+
+          # A janela conta do INÍCIO DO RUN (pré-aquecimento incluído), não do
+          # começo deste step — senão o run passaria do limite de 6h do GitHub
+          # e seria cortado sem o bot salvar. Custo do pré-aquecimento já entra
+          # na conta, então a máquina antiga fica no ar até a nova estar pronta.
+          $inicioRun = Get-Content -Path "$env:GITHUB_WORKSPACE\ff_inicio_run.txt" -ErrorAction SilentlyContinue
+          if ($inicioRun) {
+            $inicioRun = [datetime]::Parse($inicioRun.Trim()).ToUniversalTime()
+            Write-Host "Run iniciado em $($inicioRun.ToString('HH:mm:ss')) UTC."
+          } else {
+            $inicioRun = (Get-Date).ToUniversalTime()
+            Write-Host "Aviso: não achei o carimbo de início; usando agora como referência."
+          }
+          $fim = $inicioRun.AddMinutes(340)           # 5h40 do run: margem sobre o corte de 6h
+          $avisoFallback = $inicioRun.AddMinutes(330) # 5h30 do run: dispara a próxima se ninguém veio
+          $restanteMin = [int](($fim - (Get-Date)).TotalMinutes)
+          Write-Host "Janela desta máquina: até $($fim.ToString('HH:mm:ss')) UTC (faltam ~$restanteMin min)."
+          if ($restanteMin -le 5) {
+            Write-Host "Esta run já consumiu quase todo o limite de 6h. Disparando a próxima e liberando agora."
+            $fim = (Get-Date)
+          }
           $fallbackFeito = $false
           $ultimoLog = Get-Date
           $ultimoPoll = (Get-Date).AddSeconds(-30)
@@ -403,7 +431,7 @@ jobs:
 
             # (b) fim da janela de 5h50
             if ($agora -ge $fim) {
-              EncerrarLimpo "janela de 5h50 concluída"
+              EncerrarLimpo "janela do limite de 6h concluída"
               Write-Host "Disparando a próxima máquina para não ficar sem bot..."
               [void](FF-DispararProxima)
               break
