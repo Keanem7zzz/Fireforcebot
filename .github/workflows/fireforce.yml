@@ -103,9 +103,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 📦 Instalar as bibliotecas do bot
+      # As versões vêm FIXAS do requirements.txt: cada máquina nova monta
+      # exatamente o mesmo conjunto de bibliotecas. Sem isso, uma versão nova
+      # lançada no PyPI quebraria todas as máquinas seguintes sem nenhuma
+      # mudança no código do bot.
+      - name: 📦 Instalar as bibliotecas do bot (versões fixas do requirements.txt)
         shell: pwsh
-        run: python -m pip install --quiet --disable-pip-version-check discord.py aiohttp aiosqlite "qrcode[pil]" Pillow
+        run: python -m pip install --quiet --disable-pip-version-check -r requirements.txt
 
       - name: 🛠️ Criar os controles do bot (vigia + atalhos)
         shell: pwsh
@@ -122,6 +126,7 @@ jobs:
           if ((Test-Path $log) -and ((Get-Item $log).Length -gt 4MB)) { Remove-Item $log -Force }
           $q = 0
           $flagFim = Join-Path $PSScriptRoot "_encerrar_ciclo.flag"
+          $flagPausa = Join-Path $PSScriptRoot "ff_auto_update_pausado.flag"
           if (Test-Path $flagFim) { Remove-Item $flagFim -Force -ErrorAction SilentlyContinue }
           Escrever "vigia ligado (auto-update ativo)"
           while ($true) {
@@ -129,7 +134,13 @@ jobs:
               Escrever "fim de ciclo sinalizado - vigia encerrando de forma limpa."
               break
             }
-            if (Test-Path (Join-Path $PSScriptRoot ".git")) {
+            # Se o bot fez rollback (a versao da main quebrou ao subir), NAO
+            # puxo a main de novo: isso recolocaria exatamente o codigo quebrado
+            # por cima da copia boa que o bot acabou de restaurar. O proprio bot
+            # apaga este arquivo quando a main recebe uma correcao.
+            if (Test-Path $flagPausa) {
+              Escrever "auto-update pausado (versao da main quebrou) - mantendo a versao restaurada, sem puxar a main."
+            } elseif (Test-Path (Join-Path $PSScriptRoot ".git")) {
               git fetch origin main --quiet 2>$null
               if ($LASTEXITCODE -eq 0) {
                 git checkout -f origin/main -- fireforce_bot.py 2>$null

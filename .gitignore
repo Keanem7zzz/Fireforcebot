@@ -1,0 +1,93 @@
+# ==============================================================================
+#  🔒 ARQUIVOS QUE NUNCA PODEM IR PARA O GITHUB
+# ==============================================================================
+#  POR QUE ISSO EXISTE:
+#  O bot roda DENTRO da pasta do repositório (no runner do GitHub Actions e no
+#  RDP). Enquanto ele está no ar, ele CRIA arquivos nessa mesma pasta — e alguns
+#  deles são a coisa mais sensível do projeto inteiro:
+#
+#     .env          → seu TOKEN do Discord + a CHAVE MESTRA do Supabase
+#     ffv1.db       → o banco com saldo, chaves PIX, depósitos e saques de todos
+#     fireforce.log → o log (pode conter trecho de erro com dado de jogador)
+#
+#  Sem este arquivo, um único "git add ." (seu, de alguém no RDP, ou de um
+#  assistente de IA trabalhando na pasta) PUBLICARIA tudo isso na internet.
+#  Com o token, qualquer pessoa vira o bot. Com a chave do Supabase, apaga ou
+#  leva o backup inteiro.
+#
+#  Este arquivo não apaga nada e não muda NADA no funcionamento do bot.
+#  Ele só diz ao git: "esses aqui você ignora, sempre".
+# ==============================================================================
+
+# ---------- segredos ----------
+.env
+config.env
+*.env
+
+# ---------- banco de dados local (e os arquivos auxiliares do modo WAL) ----------
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ---------- logs ----------
+*.log
+*.log.1
+*.log.2
+
+# ---------- arquivos que o workflow cria na hora, dentro do workspace ----------
+vigia_bot.ps1
+iniciar_bot.ps1
+reiniciar_bot.ps1
+status_bot.ps1
+ff_inicio_ciclo.txt
+
+# ---------- controle do ciclo de 6h e do auto-update ----------
+_encerrar_ciclo.flag
+ff_auto_update_pausado.flag
+ff_upd_pendente.json
+fireforce_bot.py.bak
+fireforce_bot.py.candidate
+*.upd_tmp
+
+# ---------- imagens geradas em disco (o bot manda as suas direto da memória,
+#            mas se algum dia uma parar aqui, não vai para o GitHub) ----------
+tabela_fireforce.png
+perfil_fireforce.png
+booyah_fireforce.png
+pix_qrcode.png
+pix_adm.png
+deposito_pix.png
+chave_pix.png
+teste_pix_adm.png
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------- ferramentas de análise / editores ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ==============================================================================
+#  ⚠️ O QUE *NÃO* ESTÁ AQUI (e por isso continua sendo publicado normalmente):
+#     • fireforce_bot.py            → o bot
+#     • batimento.txt               → o carimbo que mantém o agendamento vivo
+#     • requirements.txt            → as versões fixas das bibliotecas
+#     • supabase_setup.sql          → o SQL que cria as tabelas no Supabase
+#     • README.md / ANALISE_TECNICA.md
+#     • .github/workflows/*.yml     → os 4 workflows
+# ==============================================================================

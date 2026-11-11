@@ -1,0 +1,195 @@
+# ==============================================================================
+#  ✅ CHECAGEM (CI) — barra código quebrado ANTES de ele chegar na main
+# ==============================================================================
+#  POR QUE ISSO EXISTE:
+#  O bot se atualiza SOZINHO a cada 60 segundos puxando a branch `main`. Isso
+#  quer dizer que qualquer coisa que cair na `main` vai para o bot NO AR em
+#  menos de um minuto. Até agora, nada conferia essa mudança antes — o único
+#  teste era o próprio bot em produção.
+#
+#  Este workflow roda automaticamente em TODO pull request e em TODO push na
+#  main, e responde uma pergunta só: **este código liga?**
+#
+#  O que ele confere:
+#     1. sintaxe válida + compilação
+#     2. o módulo CARREGA de verdade (pega nome digitado errado, import que
+#        não existe, assinatura que mudou)
+#     3. os comandos slash continuam registrando
+#     4. nenhuma intent privilegiada foi ligada sem querer
+#     5. nenhum nome inexistente no código (pega o erro que só aparece ao usar)
+#     6. COMPORTAMENTO: a rede de segurança do auto-update, o bloqueio de saldo
+#        negativo, o CRC do PIX, a transferência atômica e o cache do painel
+#        (testes/teste_seguranca.py — não precisa de token nem de internet)
+#     7. os workflows continuam sendo YAML válido
+#     8. o .gitignore continua protegendo .env e o banco de dados
+#
+#  Por que 5 e 6 não são a mesma coisa: um código com erro de LÓGICA carrega
+#  perfeitamente e registra todos os comandos. Deixar o saldo ficar negativo,
+#  errar o CRC do PIX ou desligar o rollback só aparece quando alguém EXERCITA
+#  a função — e é isso que o item 6 faz, sem tocar no bot em produção.
+#
+#  Se qualquer item HARD falhar, o pull request aparece com um ❌ vermelho e
+#  você sabe que NÃO é para mergear. Nada aqui mexe no bot nem publica nada.
+#
+#  CUSTO: ~1 minuto de máquina Ubuntu por pull request (praticamente nada).
+# ==============================================================================
+
+name: Checagem (CI)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    # O commit do "batimento" só troca uma data em batimento.txt — não precisa
+    # rodar checagem de código para isso.
+    paths-ignore:
+      - "batimento.txt"
+  workflow_dispatch:            # botão para rodar na mão quando quiser
+
+permissions:
+  contents: read                # só precisa LER o repositório — não publica nada
+
+# Se você empurrar outra correção enquanto a checagem anterior ainda roda,
+# a antiga é cancelada (só a última importa).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checagem:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 📥 Baixar o código
+        uses: actions/checkout@v4
+
+      - name: 🐍 Instalar o Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"          # guarda as bibliotecas entre execuções (mais rápido)
+
+      - name: 📦 Instalar as bibliotecas (as MESMAS versões fixas do bot)
+        run: |
+          python -m pip install --quiet --disable-pip-version-check -r requirements.txt
+          # pyflakes acha "nome que não existe"; pyyaml valida os workflows.
+          # São ferramentas de checagem, não fazem parte do bot em produção.
+          python -m pip install --quiet --disable-pip-version-check pyflakes pyyaml
+
+      # ---------------------------------------------------------------- HARD ---
+      - name: ✅ Checagem principal do bot (sintaxe + carga + nomes)
+        run: python checagem_ci.py fireforce_bot.py
+
+      # A checagem acima responde "este código LIGA?". Esta responde "este código
+      # se COMPORTA?". As duas são necessárias: um erro de lógica (deixar o saldo
+      # ficar negativo, errar o CRC do PIX, desligar o rollback) carrega e registra
+      # os 45 comandos perfeitamente — só o teste de comportamento pega.
+      - name: ✅ Testes de comportamento (rede de segurança, dinheiro, PIX, painel)
+        run: python testes/teste_seguranca.py
+
+      - name: ✅ Conferir se os workflows são YAML válido
+        run: |
+          python - <<'PY'
+          import glob, sys, yaml
+          falhas = []
+          arquivos = sorted(glob.glob(".github/workflows/*.yml")) + sorted(glob.glob(".github/workflows/*.yaml"))
+          if not arquivos:
+              print("❌ Nenhum workflow encontrado em .github/workflows/ — algo sumiu.")
+              sys.exit(1)
+          for caminho in arquivos:
+              try:
+                  with open(caminho, "r", encoding="utf-8") as arq:
+                      documento = yaml.safe_load(arq)
+                  if not isinstance(documento, dict) or "jobs" not in documento:
+                      falhas.append(f"{caminho}: não parece um workflow (faltou a chave 'jobs')")
+                  else:
+                      print(f"  ✅ {caminho} — YAML válido, {len(documento['jobs'])} job(s)")
+              except Exception as erro:
+                  falhas.append(f"{caminho}: {type(erro).__name__}: {erro}")
+          if falhas:
+              print("\n❌ WORKFLOW QUEBRADO:")
+              for item in falhas:
+                  print(f"   • {item}")
+              sys.exit(1)
+          print(f"\n✅ {len(arquivos)} workflows válidos.")
+          PY
+
+      # A autoridade aqui é o próprio git (`git check-ignore`), não uma busca por
+      # texto no .gitignore. Buscar texto engana: ".env" aparece dentro de
+      # "*.env", então um .gitignore quebrado pareceria correto.
+      - name: 🔒 Conferir se os segredos continuam protegidos
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys
+
+          # Cada um destes arquivos é criado pelo bot DENTRO da pasta do
+          # repositório enquanto ele roda. Nenhum pode ir para o GitHub.
+          sensiveis = [
+              ".env",                      # TOKEN do Discord + chave do Supabase
+              "config.env",
+              "ffv1.db",                   # banco: saldo, chaves PIX, depósitos
+              "ffv1.db-wal",
+              "ffv1.db-shm",
+              "fireforce.log",             # log do bot
+              "fireforce.log.1",
+              "vigia.log",
+              "vigia_bot.ps1",             # criados pelo workflow na hora
+              "iniciar_bot.ps1",
+              "reiniciar_bot.ps1",
+              "status_bot.ps1",
+              "ff_inicio_ciclo.txt",
+              "_encerrar_ciclo.flag",      # controle do ciclo de 6h
+              "ff_auto_update_pausado.flag",
+              "ff_upd_pendente.json",      # controle do auto-update
+              "fireforce_bot.py.bak",      # cópia de segurança da versão boa
+              "fireforce_bot.py.candidate",
+              "ffv1.db.upd_tmp",
+              "__pycache__/qualquer.pyc",
+          ]
+
+          if not os.path.exists(".gitignore"):
+              print("❌ O arquivo .gitignore SUMIU do repositório.")
+              print("   Sem ele, o .env (token + chave do Supabase) e o ffv1.db")
+              print("   (banco com saldo e chaves PIX) podem ser publicados.")
+              sys.exit(1)
+
+          # git check-ignore devolve 0 para o que ESTÁ ignorado, 1 para o que não está.
+          expostos = []
+          for arquivo in sensiveis:
+              retorno = subprocess.run(
+                  ["git", "check-ignore", "-q", arquivo], capture_output=True).returncode
+              if retorno != 0:
+                  expostos.append(arquivo)
+
+          if expostos:
+              print("❌ O .gitignore NÃO protege mais estes arquivos:")
+              for arquivo in expostos:
+                  print(f"   • {arquivo}")
+              print("   Um 'git add .' publicaria isso no GitHub.")
+              sys.exit(1)
+          print(f"✅ .gitignore protege os {len(sensiveis)} arquivos sensíveis (verificado pelo git).")
+
+          # Confirma também que nada sensível já foi commitado no passado.
+          rastreados = subprocess.run(["git", "ls-files"], capture_output=True,
+                                      text=True).stdout.split()
+          proibidos = [a for a in rastreados
+                       if a.endswith((".env", ".db", ".log", ".db-wal", ".db-shm"))
+                       or a.endswith(".ps1") and a.startswith(("vigia", "iniciar", "reiniciar", "status"))]
+          if proibidos:
+              print(f"❌ Arquivos sensíveis ESTÃO commitados: {proibidos}")
+              sys.exit(1)
+          print(f"✅ Nenhum arquivo sensível entre os {len(rastreados)} arquivos do repositório.")
+          PY
+
+      # ------------------------------------------------------------- RESUMO ---
+      - name: 📄 Resumo
+        if: always()
+        run: |
+          echo "======================================================"
+          echo "  ✅ Se tudo acima está verde, esta versão é segura:"
+          echo "     o bot carrega, os comandos registram, a rede de"
+          echo "     segurança e o dinheiro se comportam como devem,"
+          echo "     e nenhum segredo está exposto."
+          echo "  ❌ Se algo ficou vermelho, NÃO mergeie — o bot se"
+          echo "     atualiza sozinho a partir da main em até 60s."
+          echo "======================================================"
