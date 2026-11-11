@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════
-#  🔥 FIRE FORCE — BOT PREMIUM v13.7 (BLINDADO & AUTO-UPDATE)
+#  🔥 FIRE FORCE — BOT PREMIUM v13.7.3 (BLINDADO & AUTO-UPDATE)
 #  Liga Oficial de Diários Free Fire
 #
 #  • Consulta de ID do Free Fire OB55 multi-provedor + cache + Avatar/Clã
@@ -7,6 +7,9 @@
 #  • Finalização de Diário em 2 Etapas (Premiação por Kill + Ticket de Recebimento)
 #  • Carteira Minimalista Privada, PIX Direto ao ADM, Vaga VIP e Carteira do Suporte
 #  • Auto-Update em segundo plano (60s) sem desligar a máquina + Encerramento Limpo de Ciclo
+#  • Rede de Segurança do Auto-Update: a versão nova é CARREGADA num processo à parte
+#    antes de substituir o arquivo, há cópia `.bak` e, se ela cair 2x antes de o bot
+#    ficar pronto, o rollback é automático e o auto-update pausa até a `main` corrigir
 #  • Blindagem Anti-Falhas: SQLite WAL + busy_timeout global, Escudo Global de Views/Modals,
 #    Roteador Dinâmico de Componentes Persistentes e Trava Anti-Wipe no Supabase
 # ══════════════════════════════════════════════════════════════
@@ -33,7 +36,7 @@ import qrcode
 import io
 import asyncio
 import datetime
-from typing import Optional, List, Dict
+from typing import Optional, Dict
 
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -89,7 +92,7 @@ _ENV_LIDOS = _carregar_env_do_arquivo()
 # ==================== CONFIGURAÇÃO GLOBAL ====================
 TOKEN = "SEU_TOKEN_AQUI"
 DATABASE_FILE = "ffv1.db"
-VERSAO_BOT = "13.7"
+VERSAO_BOT = "13.7.3"
 TAXA_MOEDAS_ADM_PIX = 1.00
 TAXA_VAGA_VIP_ADM_PIX = 0.50
 BLOQUEIO_COMPRA_PADRAO_MIN = 10
@@ -3778,7 +3781,6 @@ def renderizar_card_booyah_png(
     # Sub-cards dos jogadores (1 p/ Solo, 2 p/ Duo, 3 p/ Trio, 4 p/ Squad)
     area_top = 352
     area_bot = H - 96
-    card_h = area_bot - area_top  # 712px em 2x
 
     if qtd == 1:
         col_w, gap_col, av_sz = 680, 0, 340
@@ -5277,6 +5279,19 @@ def formatar_tempo_restante(segundos: float) -> str:
 
 _VISTAS_PAINEL_INSCRICAO_REGISTRADAS = {}
 _PAINEL_PAGINA_ATUAL = {}
+# Assinatura do último painel publicado, no mesmo molde de _TABELA_ASSINATURA_CACHE.
+# O loop de 15s chama rebuild_painel para TODOS os painéis: sem isto eram 2 chamadas
+# HTTP por painel a cada 15s (fetch_message + edit) = ~8/min por painel, mesmo sem
+# NADA ter mudado. A contagem regressiva do painel tem granularidade de minuto
+# (formatar_tempo_restante arredonda para cima), então a assinatura é montada com o
+# conteúdo JÁ RENDERIZADO: quando o minuto vira, ela muda e o painel é reeditado na
+# hora; entre um minuto e outro, o resultado seria idêntico e o HTTP é dispensado.
+# O cache ainda tem PRAZO DE VALIDADE: sem ele, um painel totalmente fechado (sem
+# contagem regressiva, logo com assinatura eternamente igual) nunca seria recriado
+# se alguém apagasse a mensagem no Discord. Com o prazo, ele se cura sozinho.
+_PAINEL_ASSINATURA_CACHE: dict = {}
+_PAINEL_ASSINATURA_MAX = 300
+_PAINEL_ASSINATURA_VALIDADE_SEG = 300
 
 
 def _registrar_view_painel_inscricao(view: discord.ui.View, message_id: int) -> None:
@@ -5416,7 +5431,6 @@ async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[in
     if page is None:
         page = _PAINEL_PAGINA_ATUAL.get(int(painel_id), 0)
     page = max(0, min(int(page or 0), total_paginas - 1))
-    _PAINEL_PAGINA_ATUAL[int(painel_id), ] if False else None
     _PAINEL_PAGINA_ATUAL[int(painel_id)] = page
     if total_paginas > 1:
         inicio = page * tamanho_pagina + 1
@@ -5431,6 +5445,33 @@ async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[in
         opcoes_select, tipo, painel_id, page=page,
         possui_horarios=bool(horarios), repetir=repetir
     )
+
+    # Só o caminho de FUNDO (sem interaction) pode ser dispensado. Quando o
+    # usuário clicou em algo, este edit_message É a resposta ao clique: pular
+    # aqui deixaria o clique sem resposta e o Discord acusaria falha na interação.
+    assinatura_painel = None
+    if interaction is None:
+        assinatura_painel = (
+            int(painel["message_id"] or 0),
+            int(painel_id),
+            int(page),
+            str(tipo or ""),
+            str(categoria or ""),
+            corpo_painel[:4000],
+            fechados,
+            len(opcoes_select),
+            tuple(
+                (str(o.label or ""), str(o.value or ""), str(o.description or ""), str(o.emoji or ""))
+                for o in opcoes_select
+            ),
+        )
+        guardado = _PAINEL_ASSINATURA_CACHE.get(int(painel_id))
+        if (guardado and guardado[1] == assinatura_painel
+                and (time.time() - guardado[0]) < _PAINEL_ASSINATURA_VALIDADE_SEG):
+            return                      # nada visível mudou: economiza o HTTP
+        if len(_PAINEL_ASSINATURA_CACHE) > _PAINEL_ASSINATURA_MAX:
+            _PAINEL_ASSINATURA_CACHE.clear()   # painéis apagados não viram lixo eterno
+
     try:
         if interaction is not None:
             await interaction.response.edit_message(embed=embed, view=view)
@@ -5438,7 +5479,12 @@ async def rebuild_painel(guild: discord.Guild, painel_id: int, page: Optional[in
         else:
             msg = await canal.fetch_message(painel["message_id"])
             await msg.edit(embed=embed, view=view)
+            # Só marco DEPOIS de o edit ter dado certo. Se o Discord falhou no
+            # meio do caminho, o próximo ciclo tenta de novo em vez de acreditar
+            # que o painel já está publicado.
+            _PAINEL_ASSINATURA_CACHE[int(painel_id)] = (time.time(), assinatura_painel)
     except discord.NotFound:
+        _PAINEL_ASSINATURA_CACHE.pop(int(painel_id), None)
         msg = await canal.send(embed=embed, view=view)
         async with aiosqlite.connect(DATABASE_FILE) as db:
             await db.execute("UPDATE paineis SET message_id = ? WHERE id = ?", (msg.id, painel_id))
@@ -9105,8 +9151,8 @@ async def loop_expirar():
                             avisos.append((
                                 canal,
                                 "⌛ Reserva Expirada",
-                                f"A reserva ficou sem confirmação de pagamento dentro do prazo e foi cancelada.\n"
-                                f"Sem problema: é só fazer a inscrição novamente quando quiser."
+                                "A reserva ficou sem confirmação de pagamento dentro do prazo e foi cancelada.\n"
+                                "Sem problema: é só fazer a inscrição novamente quando quiser."
                             ))
                     if pendentes_antigas:
                         await db.commit()
@@ -10666,6 +10712,7 @@ async def cmd_relatorio(interaction: discord.Interaction):
 @app_commands.guild_only()
 async def cmd_help(interaction: discord.Interaction):
     eh_dg = await e_dono_ou_gerente(interaction.user)
+    eh_dono = await e_dono_do_servidor(interaction.user)
     eh_adm = await pode_usar_pix(interaction.user)
     eh_sup = await pode_usar_trabalho(interaction.user)
 
@@ -10712,9 +10759,20 @@ async def cmd_help(interaction: discord.Interaction):
                   "• `/vagavip` • `/relatorio` • `/blacklist` • `/setup` • `/diagnostico` • `/config` • `/logs` • `/saude`\n"
                   "• `/diario` • `/painel` • `/ish` • `/booyah` • `/painelcupom` • `/reset` • `/vitoria` • `/removervitoria`\n"
                   "• `/painelcarteira` • `/addsaldo` • `/ticket` • `/staff` • `/parceria` • `/divulgacao`\n"
-                  "• `/vaga` • `/anunciar` • `/embed` • `/evento` • `/painelranking` • `/backup` • `/restaurar` • `/dados`",
+                  "• `/vaga` • `/anunciar` • `/embed` • `/evento` • `/painelranking` • `/backup` • `/restaurar` • `/dados`\n"
+                  "• `/info` — Versão, servidores, latência e estado técnico do bot",
             inline=False
         )
+        if eh_dono:
+            # Estes dois existem no bot mas não apareciam em lugar nenhum do /help:
+            # só o Dono real pode usá-los (Gerente não basta), então a seção só
+            # aparece para quem de fato vai enxergar o comando no Discord.
+            embed.add_field(
+                name="🔱 Exclusivo Dono do Servidor",
+                value="• `/reparar_pendencias` — Corrigir tickets órfãos e cancelar depósito abandonado (dupla confirmação)\n"
+                      "• `/tickets_fechar` — Fechar atendimentos regulares por filtro (todos, categoria, usuário ou protocolo)",
+                inline=False
+            )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -12460,6 +12518,10 @@ async def movimentar_saldo(user_id: int, guild_id: int, valor: float, tipo: str,
         atual = arredondar(linha["saldo"] if linha else 0)
         novo = arredondar(atual + valor)
         if novo < 0 and not permitir_negativo:
+            # Desfaz de propósito, no mesmo padrão de transferir_saldo_atomic.
+            # O `async with` já desfaría ao fechar a conexão, mas até lá o
+            # BEGIN IMMEDIATE continua segurando o lock de escrita à toa.
+            await db.rollback()
             return None
         await db.execute(
             "UPDATE carteira SET saldo = ?, atualizado_em = ? WHERE user_id = ? AND guild_id = ?",
@@ -13198,7 +13260,7 @@ class SaqueModal(discord.ui.Modal, title="💸 Sacar — PIX"):
             f"carteira.\n> 🔖 Protocolo: `#{saque_id}`\n"
             f"> 📋 Status: **{'liberado para pagar ✅' if liberado else 'na fila de pagamento 🤝'}**\n"
             f"> 🏦 Chave: `{mascarar_chave(chave)}`"
-            + (f"\n> ⏱️ O pagamento sai pelo **dono/gerente** — de minutos até 24h ou mais."
+            + ("\n> ⏱️ O pagamento sai pelo **dono/gerente** — de minutos até 24h ou mais."
                if liberado else "\n> ⏳ Entra na fila de pagamento assim que o caixa liberar."),
             "Amarelo", marcar=None)
         await notificar_saque(interaction.guild, saque_id)
@@ -14547,7 +14609,7 @@ async def cmd_logs(interaction: discord.Interaction, acao: app_commands.Choice[s
             embed=criar_embed("✅ Canal configurado",
                               f"Os anúncios de **{rotulo}** vão sair em {canal.mention}.\n\n"
                               + dica_canal +
-                              f"> 💛 Use `/logs acao:Testar` pra ver como fica.", "Esmeralda"), ephemeral=True)
+                              "> 💛 Use `/logs acao:Testar` pra ver como fica.", "Esmeralda"), ephemeral=True)
         await registrar_log(interaction.guild, "⚙️ CONFIG", "📢 Canal público configurado",
                             f"{acao.name} → {canal.mention}", "Azul")
         return
@@ -14669,14 +14731,28 @@ async def cmd_saude(interaction: discord.Interaction):
                + (f"\n> ⚠️ Último erro: `{str(_sync_erro or _sql_erro)[:110]}`"
                   if (_sync_erro or _sql_erro) else "")),
         inline=False)
+    pausa_upd = _ler_pausa_auto_update()
+    if pausa_upd:
+        # Pausado não "verifica a cada 60s" no sentido normal: ele verifica, mas
+        # se recusa a aplicar enquanto a main tiver o mesmo código que quebrou.
+        estado_upd = (f"🛡️ PAUSADO — a `v{pausa_upd.get('versao_ruim') or '?'}` quebrou "
+                      f"ao subir e foi revertida")
+        linha_ciclo = ""
+    elif AUTO_UPDATE_ATIVO:
+        estado_upd = "✅ ativo"
+        linha_ciclo = f" (verifica `main` a cada `{AUTO_UPDATE_SEGUNDOS}s`)"
+    else:
+        estado_upd = "⏸️ desativado"
+        linha_ciclo = ""
     embed.add_field(
         name="🔄 Auto-Update (GitHub)",
         value=(
-            f"> {'✅ ativo' if AUTO_UPDATE_ATIVO else '⏸️ desativado'} "
-            f"(verifica `main` a cada `{AUTO_UPDATE_SEGUNDOS}s`)\n"
-            f"> Versão em execução: `v{VERSAO_BOT}` • Commit: `{_obter_commit_curto_local()}`\n"
+            f"> {estado_upd}{linha_ciclo}\n"
+            f"> Versão em execução: `v{VERSAO_BOT}` • Commit: `{await _obter_commit_curto_local_async()}`\n"
             f"> Última checagem: {_ha(_AUTO_UPDATE_ULTIMA_CHECAGEM)}"
             + (f"\n> ⚠️ Aviso: `{_AUTO_UPDATE_ULTIMO_ERRO[:100]}`" if _AUTO_UPDATE_ULTIMO_ERRO else "")
+            + ("\n> 🔓 Volta a atualizar sozinho quando a `main` receber uma correção."
+               if pausa_upd else "")
         ),
         inline=False,
     )
@@ -15467,7 +15543,7 @@ async def salvar_estado(forcar: bool = False) -> str:
     """Envia a fotografia para o Supabase (com trava anti-sobrescrita de banco vazio + fatiamento automático)."""
     global _sync_sujo, _sync_ultimo, _sync_erro
     if not supabase_configurado():
-        return "Supabase não configurado (defina SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY)."
+        return ("Supabase não configurado (defina SUPABASE_URL e uma chave: SUPABASE_KEY ou SUPABASE_ANON_KEY).")
 
     if _SUPABASE_BLOQUEIO_BANCO_VAZIO:
         _sync_erro = "bloqueado p/ proteger backup em nuvem (aguardando restauração inicial)"
@@ -15626,7 +15702,17 @@ async def carregar_estado(forcar: bool = False) -> tuple:
 #    • ff_rankings      → tops: saldo, transferências, depósitos, ganhos,
 #                         vitórias, comissões e carteira de trabalho
 #
-#  O SQL que cria essas tabelas está no arquivo `supabase_setup.sql`.
+#  IMPORTANTE: este arquivo NÃO cria tabela nenhuma. As tabelas vivem no projeto
+#  Supabase de cada dono e são criadas lá (no SQL Editor do painel), uma vez só.
+#  Se uma faltar, o upsert volta com 42P01 (relation does not exist) e o /dados
+#  mostra o erro — o bot nunca tenta criar nem "consertar" esquema sozinho.
+#
+#  As tuplas logo abaixo (COLUNAS_FF_CONFIG, CARGOS_DO_BOT, CATEGORIAS_SQL) são o
+#  CONTRATO com essas tabelas: se você renomear uma coluna no Supabase, renomeie
+#  aqui também, senão o PostgREST devolve 400 e a linha não entra.
+#
+#  Chave usada (primeira que existir): SUPABASE_SERVICE_ROLE_KEY → SUPABASE_KEY →
+#  SUPABASE_ANON_KEY. Com a anon o RLS vale, então o projeto precisa aceitá-la.
 # ══════════════════════════════════════════════════════════════
 
 COLUNAS_FF_CONFIG = (
@@ -15822,7 +15908,7 @@ async def sincronizar_estruturado(silencioso: bool = False) -> str:
     """
     global _sql_ultimo, _sql_erro, _sql_linhas
     if not supabase_configurado():
-        return "❌ Supabase não configurado (defina `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY`)."
+        return ("❌ Supabase não configurado (defina `SUPABASE_URL` e uma chave: `SUPABASE_KEY` ou `SUPABASE_ANON_KEY`).")
 
     total, erros = 0, []
     for guild in await guilds_para_sync():
@@ -18174,7 +18260,7 @@ async def registrar_log_suporte(guild, tipo: str, titulo: str, descricao: str, c
     if not canal:
         return
     try:
-        await canal.send(embed=criar_embed(titulo, descricao, cor, footer=f"🔥 Fire Force • atendimento"))
+        await canal.send(embed=criar_embed(titulo, descricao, cor, footer="🔥 Fire Force • atendimento"))
     except Exception:
         pass
 
@@ -18778,7 +18864,6 @@ async def loop_cupons():
 
 async def evento_ativo(guild_id: int, valor: float = None, tipo: str = None, categoria: str = None):
     """Evento rolando agora (e compatível com o diário, se informado)."""
-    agora = agora_brt().isoformat()
     async with aiosqlite.connect(DATABASE_FILE) as db:
         db.row_factory = aiosqlite.Row
         eventos = await (await db.execute(
@@ -19064,7 +19149,7 @@ async def cmd_backup(interaction: discord.Interaction):
     embed = criar_embed("☁️ Backup", f"{mensagem}\n{estruturas}",
                         "Esmeralda" if mensagem.startswith("✅") else "Vermelho")
     embed.add_field(name="⚙️ Supabase", value=("> Configurado ✅" if supabase_configurado()
-                                               else "> ❌ Não configurado (defina `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY`)"),
+                                               else "> ❌ Não configurado (defina `SUPABASE_URL` e uma chave: `SUPABASE_KEY` ou `SUPABASE_ANON_KEY`)"),
                     inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -21461,8 +21546,357 @@ _AUTO_UPDATE_ULTIMA_CHECAGEM: float = 0.0
 _AUTO_UPDATE_ULTIMO_ERRO: str = ""
 _lock_auto_update = asyncio.Lock()
 
+# ---------- REDE DE SEGURANÇA DO AUTO-UPDATE (v13.7.3) ----------
+#  O bot puxa a `main` e troca o PRÓPRIO arquivo a cada 60s. Isso é ótimo até o
+#  dia em que uma mudança ruim cai na `main`: sem proteção, o vigia baixa a mesma
+#  versão quebrada de novo e de novo (até 300 quedas) e não existe volta.
+#
+#  São DUAS redes, uma atrás da outra:
+#
+#  REDE 1 — validar ANTES de trocar (`_validar_candidato_por_carga`):
+#           o código novo é carregado de verdade num processo separado. "Texto
+#           Python válido" não é "código que funciona": um nome digitado errado
+#           é sintaxe perfeita e derruba o bot ao ligar. Se a carga falhar, a
+#           atualização é RECUSADA e o bot continua na versão boa.
+#
+#  REDE 2 — voltar atrás DEPOIS (`_verificar_rollback_no_arranque`):
+#           cobre o que só aparece depois da carga (erro dentro do on_ready).
+#           Antes de trocar, guardamos uma cópia da versão boa em `.bak` e um
+#           marcador `ff_upd_pendente.json`. O marcador só é apagado quando o
+#           bot termina de subir de verdade. Se ele cair antes disso 2 vezes
+#           dentro de 10 minutos da atualização, o `.bak` é recolocado no lugar,
+#           o auto-update é PAUSADO e a equipe é avisada no canal de logs.
+#
+#  A pausa é ESPERTA: ela guarda o hash da versão ruim. Quando você empurra uma
+#  correção na `main` (hash diferente), o bot sai da pausa sozinho e volta a se
+#  atualizar — não precisa entrar no RDP para destravar nada.
+_ARQUIVO_BAK = _ARQUIVO_BOT_PATH + ".bak"
+_ARQUIVO_CANDIDATO = _ARQUIVO_BOT_PATH + ".candidate"
+_ARQUIVO_UPD_PENDENTE = os.path.join(_DIRETORIO_BOT, "ff_upd_pendente.json")
+_ARQUIVO_PAUSA_AUTO_UPDATE = os.path.join(_DIRETORIO_BOT, "ff_auto_update_pausado.flag")
+_QUEDAS_ATE_ROLLBACK = 2          # quantas subidas incompletas até voltar atrás
+_JANELA_QUEDA_RAPIDA_SEG = 600    # só é culpa da atualização se cair dentro de 10 min
+_TEMPO_MAXIMO_CARGA_SEG = 120     # teto para o candidato carregar (o normal é <2s)
+_ROLLBACK_ACONTECEU: str = ""     # preenchido no arranque quando o .bak foi recolocado
+
+# Roda DENTRO do processo filho: carrega o candidato e devolve um retrato em
+# JSON. `sys.dont_write_bytecode` evita criar __pycache__ de um arquivo que vai
+# ser apagado em seguida. É seguro: o `bot.run()` do candidato está protegido
+# por `if __name__ == "__main__"`, então nada conecta no Discord nem toca no banco.
+_SCRIPT_CARGA_CANDIDATO = r"""
+import importlib.machinery, importlib.util, json, sys
+sys.dont_write_bytecode = True
+try:
+    carregador = importlib.machinery.SourceFileLoader("ff_candidato", sys.argv[1])
+    spec = importlib.util.spec_from_loader("ff_candidato", carregador)
+    modulo = importlib.util.module_from_spec(spec)
+    carregador.exec_module(modulo)
+    comandos = len(modulo.bot.tree.get_commands()) if getattr(modulo, "bot", None) else 0
+    saida = {"ok": True, "versao": str(getattr(modulo, "VERSAO_BOT", "") or ""),
+             "comandos": comandos}
+except BaseException as erro:
+    saida = {"ok": False, "erro": f"{type(erro).__name__}: {erro}"}
+print("__FF_CANDIDATO__" + json.dumps(saida, ensure_ascii=False))
+"""
+
+
+def _ler_json_arquivo(caminho: str) -> dict:
+    """Lê um JSON de controle; devolve {} se não existir ou estiver corrompido."""
+    try:
+        with open(caminho, "r", encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+        return dados if isinstance(dados, dict) else {}
+    except Exception:
+        return {}
+
+
+def _gravar_json_arquivo(caminho: str, dados: dict) -> bool:
+    """Grava um JSON de controle de forma atômica (nunca deixa arquivo pela metade).
+
+    Devolve True quando gravou. Quem chama precisa saber: sem o marcador no
+    disco, a rede de segurança do rollback simplesmente não existe.
+    """
+    temporario = f"{caminho}.tmp"
+    try:
+        with open(temporario, "w", encoding="utf-8") as arquivo:
+            json.dump(dados, arquivo, ensure_ascii=False)
+            arquivo.flush()
+            os.fsync(arquivo.fileno())
+        os.replace(temporario, caminho)
+        return True
+    except Exception as erro:
+        _log_arquivo(f"[AUTO-UPDATE] não consegui gravar {os.path.basename(caminho)}: {erro}")
+        return False
+
+
+def _remover_arquivo(caminho: str) -> None:
+    try:
+        if os.path.exists(caminho):
+            os.remove(caminho)
+    except Exception:
+        pass
+
+
+def _validar_candidato_por_carga(bytes_novos: bytes) -> tuple[bool, str]:
+    """REDE 1: carrega o código novo de verdade num processo separado.
+
+    Devolve `(ok, detalhe)`. Se `ok` for False, a atualização NÃO deve ser
+    aplicada — o bot continua na versão que está funcionando.
+    """
+    try:
+        with open(_ARQUIVO_CANDIDATO, "wb") as arquivo:
+            arquivo.write(bytes_novos)
+            arquivo.flush()
+            os.fsync(arquivo.fileno())
+    except Exception as erro:
+        return False, f"não consegui gravar o candidato para teste: {erro}"
+
+    try:
+        resultado = subprocess.run(
+            [sys.executable, "-c", _SCRIPT_CARGA_CANDIDATO, _ARQUIVO_CANDIDATO],
+            cwd=_DIRETORIO_BOT,
+            capture_output=True,
+            text=True,
+            timeout=_TEMPO_MAXIMO_CARGA_SEG,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"o código novo não carregou em {_TEMPO_MAXIMO_CARGA_SEG}s (travou?)"
+    except Exception as erro:
+        return False, f"falha ao testar o código novo: {type(erro).__name__}: {erro}"
+    finally:
+        _remover_arquivo(_ARQUIVO_CANDIDATO)
+
+    retrato = {}
+    for linha in (resultado.stdout or "").splitlines():
+        if linha.startswith("__FF_CANDIDATO__"):
+            try:
+                retrato = json.loads(linha[len("__FF_CANDIDATO__"):])
+            except Exception:
+                retrato = {}
+    if not retrato.get("ok"):
+        motivo = retrato.get("erro") or (resultado.stderr or "sem detalhe").strip()[-300:]
+        return False, f"o código novo QUEBRA ao ligar → {motivo}"
+
+    comandos = int(retrato.get("comandos") or 0)
+    if comandos <= 0:
+        return False, "o código novo carregou mas não registrou nenhum comando slash"
+    return True, f"carregou ok (v{retrato.get('versao') or '?'}, {comandos} comandos)"
+
+
+def _marcar_atualizacao_pendente(nova_versao: str, commit: str, hash_novo: str) -> bool:
+    """REDE 2 (parte 1): guarda a versão boa em `.bak` e abre o marcador.
+
+    O marcador só é apagado por `_confirmar_versao_estavel()`, quando o bot
+    termina de subir. Enquanto ele existir, uma queda conta como suspeita.
+    Devolve False se não conseguiu criar a cópia de segurança — nesse caso a
+    atualização é abortada (melhor não atualizar do que atualizar sem rede).
+    """
+    try:
+        with open(_ARQUIVO_BOT_PATH, "rb") as origem, open(_ARQUIVO_BAK, "wb") as destino:
+            destino.write(origem.read())
+            destino.flush()
+            os.fsync(destino.fileno())
+    except Exception as erro:
+        _log_arquivo(f"[AUTO-UPDATE] sem cópia de segurança, atualização abortada: {erro}")
+        return False
+
+    _gravar_json_arquivo(_ARQUIVO_UPD_PENDENTE, {
+        "de": VERSAO_BOT,
+        "para": nova_versao,
+        "commit": commit,
+        "hash": hash_novo,
+        "quando": time.time(),
+        "quedas": 0,
+    })
+    if not os.path.exists(_ARQUIVO_UPD_PENDENTE):
+        # Sem o marcador, a queda não seria detectada e o rollback nunca
+        # aconteceria. Descarta a cópia e aborta a atualização.
+        _remover_arquivo(_ARQUIVO_BAK)
+        _log_arquivo("[AUTO-UPDATE] marcador não foi gravado no disco — atualização abortada.")
+        return False
+    return True
+
+
+def _verificar_rollback_no_arranque() -> None:
+    """REDE 2 (parte 2): roda ANTES de `bot.run()`, no arranque de cada processo.
+
+    Se o marcador ainda existe, quer dizer que a última subida NÃO terminou —
+    ou seja, a versão que acabou de ser aplicada caiu antes de ficar pronta.
+    Depois de `_QUEDAS_ATE_ROLLBACK` tentativas dentro da janela, recoloca o
+    `.bak`, pausa o auto-update e sai com código 42 para o vigia relançar já
+    com a versão boa.
+
+    Nunca impede o bot de subir: qualquer erro aqui é só registrado.
+    """
+    global _ROLLBACK_ACONTECEU
+    if not os.path.exists(_ARQUIVO_UPD_PENDENTE):
+        # Sem marcador não há atualização em dúvida. Se sobrou um `.bak`, é
+        # resíduo de uma tentativa que nem chegou a marcar (disco cheio, etc.):
+        # não tem função e só ocupa espaço ao lado do arquivo do bot.
+        if os.path.exists(_ARQUIVO_BAK):
+            _remover_arquivo(_ARQUIVO_BAK)
+            _log_arquivo("[ROLLBACK] cópia de segurança órfã removida (não havia atualização pendente).")
+        return
+    try:
+        marcador = _ler_json_arquivo(_ARQUIVO_UPD_PENDENTE)
+        if not marcador:
+            _remover_arquivo(_ARQUIVO_UPD_PENDENTE)
+            return
+
+        aplicado_em = float(marcador.get("quando") or 0)
+        idade = time.time() - aplicado_em if aplicado_em else 0.0
+        if idade > _JANELA_QUEDA_RAPIDA_SEG:
+            # A versão anterior viveu o bastante: esta queda NÃO é culpa da
+            # atualização (pode ter sido o fim do ciclo de 6h, falta de internet
+            # ou o host que reiniciou). Limpa a rede e segue a vida.
+            _remover_arquivo(_ARQUIVO_UPD_PENDENTE)
+            _remover_arquivo(_ARQUIVO_BAK)
+            return
+
+        quedas = int(marcador.get("quedas") or 0) + 1
+        marcador["quedas"] = quedas
+
+        if quedas < _QUEDAS_ATE_ROLLBACK or not os.path.exists(_ARQUIVO_BAK):
+            _gravar_json_arquivo(_ARQUIVO_UPD_PENDENTE, marcador)
+            aviso = (f"[ROLLBACK] a versão v{marcador.get('para')} caiu {quedas}x antes de ficar pronta "
+                     f"(volta automática em {_QUEDAS_ATE_ROLLBACK} quedas)")
+            if not os.path.exists(_ARQUIVO_BAK):
+                aviso += " — SEM cópia de segurança, não dá para voltar"
+            print(f"  ⚠️ {aviso}")
+            _log_arquivo(aviso)
+            return
+
+        # ---- volta para a versão boa ----
+        with open(_ARQUIVO_BAK, "rb") as arquivo_bom:
+            bytes_bons = arquivo_bom.read()
+        temporario = f"{_ARQUIVO_BOT_PATH}.upd_tmp"
+        with open(temporario, "wb") as arquivo_saida:
+            arquivo_saida.write(bytes_bons)
+            arquivo_saida.flush()
+            os.fsync(arquivo_saida.fileno())
+        os.replace(temporario, _ARQUIVO_BOT_PATH)
+
+        versao_ruim = str(marcador.get("para") or "?")
+        hash_ruim = str(marcador.get("hash") or "")
+        motivo = (f"a `main` passou de v{marcador.get('de')} para v{versao_ruim} "
+                  f"(`{marcador.get('commit') or '?'}`) e a versão nova caiu {quedas}x "
+                  f"antes de o bot ficar pronto")
+        _gravar_json_arquivo(_ARQUIVO_PAUSA_AUTO_UPDATE, {
+            "hash_ruim": hash_ruim,
+            "versao_ruim": versao_ruim,
+            "versao_restaurada": str(marcador.get("de") or VERSAO_BOT),
+            "motivo": motivo,
+            "quando": time.time(),
+            "avisado": False,
+        })
+        _remover_arquivo(_ARQUIVO_UPD_PENDENTE)
+        _remover_arquivo(_ARQUIVO_BAK)
+
+        _ROLLBACK_ACONTECEU = (
+            f"v{marcador.get('de')} ➜ v{versao_ruim} (`{marcador.get('commit') or '?'}`)")
+        mensagem = (
+            f"[ROLLBACK] ❌ v{versao_ruim} caiu {quedas}x seguidas antes de ficar pronta. "
+            f"Versão v{marcador.get('de')} restaurada a partir da cópia de segurança. "
+            f"Auto-update PAUSADO para o hash {hash_ruim[:12]} — volta sozinho quando a "
+            f"`main` receber uma correção (hash diferente).")
+        print(f"  🛡️ {mensagem}")
+        _log_arquivo(mensagem)
+
+        # O processo atual tem a versão ruim carregada na memória: precisa
+        # reiniciar para carregar a versão boa que acabou de ser recolocada.
+        # Código 42 = o vigia relança em 1s (em vez dos 5s de uma queda comum).
+        sys.exit(AUTO_UPDATE_EXIT_CODE)
+    except SystemExit:
+        raise
+    except Exception as erro:
+        _log_arquivo(f"[ROLLBACK] erro na verificação de arranque (ignorando): "
+                     f"{type(erro).__name__}: {erro}")
+
+
+def _confirmar_versao_estavel() -> None:
+    """REDE 2 (parte 3): o bot subiu até o fim — a versão atual é boa.
+
+    Apaga o marcador e a cópia de segurança. Chamado no fim de
+    `_inicializar_bot()`, que é o ponto em que painéis, views e loops já estão
+    de pé. Se o bot cair depois daqui, NÃO conta como atualização ruim.
+    """
+    if not os.path.exists(_ARQUIVO_UPD_PENDENTE) and not os.path.exists(_ARQUIVO_BAK):
+        return
+    marcador = _ler_json_arquivo(_ARQUIVO_UPD_PENDENTE)
+    _remover_arquivo(_ARQUIVO_UPD_PENDENTE)
+    _remover_arquivo(_ARQUIVO_BAK)
+    if marcador.get("para"):
+        _log_arquivo(f"[AUTO-UPDATE] ✅ v{marcador['para']} subiu até o fim e foi aprovada "
+                     f"(cópia de segurança liberada).")
+
+
+def _ler_pausa_auto_update() -> dict:
+    """Conteúdo do arquivo de pausa ({} quando o auto-update está livre)."""
+    if not os.path.exists(_ARQUIVO_PAUSA_AUTO_UPDATE):
+        return {}
+    return _ler_json_arquivo(_ARQUIVO_PAUSA_AUTO_UPDATE)
+
+
+async def _avisar_rollback_se_pendente() -> None:
+    """Avisa a equipe UMA vez quando o bot acabou de voltar para a versão boa.
+
+    O processo que fez o rollback sai imediatamente (código 42) para carregar a
+    versão restaurada, então ele não tem como avisar ninguém — quem avisa é a
+    versão boa, no primeiro arranque depois da volta. O campo `avisado` no
+    arquivo de pausa garante que o aviso sai uma única vez.
+    """
+    pausa = _ler_pausa_auto_update()
+    if not pausa or pausa.get("avisado"):
+        return
+    try:
+        corpo = (
+            f"Uma atualização da `main` **quebrou o bot ao subir**, então ele voltou "
+            f"sozinho para a versão anterior usando a cópia de segurança.\n\n"
+            f"• **Versão que quebrou:** `v{pausa.get('versao_ruim') or '?'}`\n"
+            f"• **Versão no ar agora:** `v{pausa.get('versao_restaurada') or VERSAO_BOT}` ✅\n"
+            f"• **Auto-update:** pausado para esse código — **volta sozinho** assim que a "
+            f"`main` receber uma correção\n"
+            f"• **O que aconteceu:** {pausa.get('motivo') or _ROLLBACK_ACONTECEU or 'a versão nova caiu repetidas vezes antes de o bot ficar pronto'}\n\n"
+            f"-# 🛡️ Nada foi perdido: o estado foi salvo no Supabase antes da troca e o "
+            f"banco local não foi tocado."
+        )
+        avisos_ok = 0
+        for guild in list(bot.guilds):
+            try:
+                await registrar_log(guild, "🛡️ ROLLBACK AUTOMÁTICO",
+                                    "🛡️ Bot voltou para a versão anterior sozinho",
+                                    corpo, "Amarelo")
+                avisos_ok += 1
+            except Exception:
+                pass
+        if avisos_ok == 0:
+            # Ninguém recebeu (Discord fora do ar, servidor sem canal de log).
+            # NÃO marco como avisado: o próximo arranque tenta de novo.
+            _log_arquivo("[ROLLBACK] aviso pendente — nenhum servidor recebeu, tento no próximo arranque.")
+            return
+        pausa["avisado"] = True
+        _gravar_json_arquivo(_ARQUIVO_PAUSA_AUTO_UPDATE, pausa)
+    except Exception as erro:
+        _log_arquivo(f"[ROLLBACK] não consegui avisar no Discord: {erro}")
+
+
+# O commit curto NÃO muda durante a vida de um processo (aplicar uma atualização
+# sempre reinicia o bot), então vale cachear. Sem o cache, esta função rodava
+# `subprocess.run(git, timeout=6)` de forma BLOQUEANTE dentro do event loop —
+# a cada 60s pelo auto-update e em cada /saude — concorrendo com o `git fetch`
+# do vigia, que pode segurar o lock do índice. Pior caso: 6 segundos com o loop
+# congelado, sem nenhum botão do Discord responder.
+_COMMIT_CURTO_CACHE: Optional[str] = None
+
 
 def _obter_commit_curto_local() -> str:
+    """Commit curto do HEAD (com cache). Função síncrona e bloqueante: fora de
+    contexto async, use sempre `_obter_commit_curto_local_async()`."""
+    global _COMMIT_CURTO_CACHE
+    if _COMMIT_CURTO_CACHE:
+        return _COMMIT_CURTO_CACHE
     try:
         if os.path.isdir(os.path.join(_DIRETORIO_BOT, ".git")):
             res = subprocess.run(
@@ -21473,10 +21907,17 @@ def _obter_commit_curto_local() -> str:
                 timeout=6,
             )
             if res.returncode == 0 and res.stdout.strip():
-                return res.stdout.strip()[:10]
+                _COMMIT_CURTO_CACHE = res.stdout.strip()[:10]
+                return _COMMIT_CURTO_CACHE
     except Exception:
         pass
-    return (_HASH_CODIGO_INICIAL[:7] if _HASH_CODIGO_INICIAL else "local")
+    _COMMIT_CURTO_CACHE = (_HASH_CODIGO_INICIAL[:7] if _HASH_CODIGO_INICIAL else "local")
+    return _COMMIT_CURTO_CACHE
+
+
+async def _obter_commit_curto_local_async() -> str:
+    """Versão que NÃO congela o event loop: joga o git para uma thread."""
+    return await asyncio.to_thread(_obter_commit_curto_local)
 
 
 def _buscar_codigo_remoto_git_sync() -> tuple[Optional[bytes], str, str]:
@@ -21517,10 +21958,12 @@ def _buscar_codigo_remoto_git_sync() -> tuple[Optional[bytes], str, str]:
 
 def _aplicar_arquivos_git_sync(bytes_novos: bytes) -> None:
     """Grava o novo código de forma atômica e alinha os arquivos rastreados sem tocar em .env, ffv1.db ou vigia."""
+    global _COMMIT_CURTO_CACHE
     tmp_path = f"{_ARQUIVO_BOT_PATH}.upd_tmp"
     with open(tmp_path, "wb") as f_out:
         f_out.write(bytes_novos)
         f_out.flush()
+        os.fsync(f_out.fileno())
     os.replace(tmp_path, _ARQUIVO_BOT_PATH)
 
     if os.path.isdir(os.path.join(_DIRETORIO_BOT, ".git")):
@@ -21537,6 +21980,8 @@ def _aplicar_arquivos_git_sync(bytes_novos: bytes) -> None:
                 capture_output=True,
                 timeout=15,
             )
+            # o reset moveu o HEAD: o commit curto em cache ficou velho
+            _COMMIT_CURTO_CACHE = None
         except Exception:
             pass
 
@@ -21588,8 +22033,32 @@ async def _checar_e_aplicar_auto_update() -> tuple[str, str]:
         if hash_remoto_norm == _HASH_CODIGO_INICIAL:
             return (
                 "atualizado",
-                f"O bot já está na versão mais recente (`v{VERSAO_BOT}` • commit `{_obter_commit_curto_local()}`).",
+                f"O bot já está na versão mais recente (`v{VERSAO_BOT}` • commit "
+                f"`{await _obter_commit_curto_local_async()}`).",
             )
+
+        # ---------- pausa inteligente pós-rollback ----------
+        # Se uma versão anterior quebrou e o bot voltou para a cópia de
+        # segurança, não vamos colocar a MESMA versão quebrada de volta. Mas se a
+        # `main` já recebeu uma correção (hash diferente), a pausa cai sozinha —
+        # ninguém precisa entrar no RDP para destravar o auto-update.
+        pausa = _ler_pausa_auto_update()
+        if pausa:
+            hash_ruim = str(pausa.get("hash_ruim") or "")
+            if hash_ruim and hash_ruim == hash_remoto_norm:
+                _AUTO_UPDATE_ULTIMO_ERRO = (
+                    f"pausado: v{pausa.get('versao_ruim')} quebrou ao subir e foi revertida")
+                return (
+                    "pausado",
+                    f"🛡️ Auto-update **pausado**: a versão `v{pausa.get('versao_ruim')}` quebrou ao subir "
+                    f"e o bot voltou para `v{VERSAO_BOT}`. A `main` ainda tem o mesmo código quebrado — "
+                    f"assim que você empurrar uma correção, ele volta a se atualizar sozinho.",
+                )
+            _remover_arquivo(_ARQUIVO_PAUSA_AUTO_UPDATE)
+            _log_arquivo(
+                f"[AUTO-UPDATE] 🔓 pausa removida: a `main` mudou "
+                f"({hash_ruim[:12]} ➜ {hash_remoto_norm[:12]}), retomando as atualizações.")
+            print("  🔓 [AUTO-UPDATE] main corrigida — pausa removida, retomando atualizações.")
 
         # Valida UTF-8 + sintaxe Python ANTES de substituir o arquivo
         try:
@@ -21601,6 +22070,36 @@ async def _checar_e_aplicar_auto_update() -> tuple[str, str]:
             _AUTO_UPDATE_ULTIMO_ERRO = f"sintaxe remota inválida: {erro_ast}"
             _log_arquivo(f"[AUTO-UPDATE] abortado ({_AUTO_UPDATE_ULTIMO_ERRO})")
             return ("erro", f"Atualização abortada por segurança (`{_AUTO_UPDATE_ULTIMO_ERRO}`).")
+
+        # ---------- REDE 1: carregar de verdade, não só validar o texto ----------
+        # Sintaxe válida NÃO é código que funciona. Um nome digitado errado é
+        # Python perfeito e derruba o bot no instante em que ele liga — e o vigia
+        # ficaria baixando a mesma versão quebrada para sempre. Aqui o código novo
+        # é carregado num processo separado; se não subir, a atualização é
+        # RECUSADA e o bot segue na versão boa.
+        ok_carga, detalhe_carga = await asyncio.to_thread(
+            _validar_candidato_por_carga, bytes_remotos)
+        if not ok_carga:
+            _AUTO_UPDATE_ULTIMO_ERRO = detalhe_carga[:240]
+            _log_arquivo(f"[AUTO-UPDATE] ❌ atualização RECUSADA na validação de carga: {detalhe_carga}")
+            print(f"  🛡️ [AUTO-UPDATE] atualização recusada: {detalhe_carga}")
+            for g_val in list(bot.guilds):
+                try:
+                    await registrar_log(
+                        g_val,
+                        "🛡️ AUTO-UPDATE BLOQUEADO",
+                        "🛡️ Uma atualização quebrada foi bloqueada",
+                        f"O código novo na `main` **não liga**, então o bot recusou a troca e "
+                        f"**continua na versão boa** `v{VERSAO_BOT}`.\n\n"
+                        f"• **Motivo:** `{detalhe_carga[:400]}`\n"
+                        f"• **O que fazer:** corrija o erro na `main`. Assim que o código novo "
+                        f"carregar, o bot se atualiza sozinho.",
+                        "Amarelo",
+                    )
+                except Exception:
+                    pass
+            return ("recusada", f"🛡️ Atualização **recusada** — o código novo não liga: `{detalhe_carga[:200]}`")
+        _log_arquivo(f"[AUTO-UPDATE] validação de carga ok ({detalhe_carga})")
 
         m_ver = re.search(r'VERSAO_BOT\s*=\s*["\']([^"\']+)["\']', texto_novo)
         nova_versao = m_ver.group(1) if m_ver else "?"
@@ -21616,6 +22115,17 @@ async def _checar_e_aplicar_auto_update() -> tuple[str, str]:
                 await salvar_estado(forcar=True)
             except Exception as erro_sb:
                 _log_arquivo(f"[AUTO-UPDATE] aviso ao salvar Supabase antes do restart: {erro_sb}")
+
+        # ---------- REDE 2: cópia de segurança + marcador ANTES de trocar ----------
+        # Se a versão nova subir pela metade (erro dentro do on_ready, que a REDE 1
+        # não pega), o marcador continua existindo e o arranque seguinte recoloca
+        # o .bak no lugar. Sem cópia de segurança não há como voltar, então nesse
+        # caso é melhor NÃO atualizar.
+        if not await asyncio.to_thread(
+                _marcar_atualizacao_pendente, nova_versao, commit_remoto, hash_remoto_norm):
+            _AUTO_UPDATE_ULTIMO_ERRO = "sem cópia de segurança da versão atual"
+            return ("erro", f"🛡️ Atualização adiada: {_AUTO_UPDATE_ULTIMO_ERRO} "
+                            f"(o bot continua em `v{VERSAO_BOT}` e tenta de novo no próximo ciclo).")
 
         await asyncio.to_thread(_aplicar_arquivos_git_sync, bytes_remotos)
 
@@ -21923,6 +22433,12 @@ async def _inicializar_bot():
   ╚══════════════════════════════════════════╝
     """)
 
+    # REDE 2 do auto-update: o bot subiu até o fim, então a versão em execução é
+    # boa. Apaga o marcador e a cópia de segurança — uma queda daqui pra frente
+    # (fim do ciclo de 6h, host que reiniciou) NÃO dispara rollback.
+    _confirmar_versao_estavel()
+    await _avisar_rollback_se_pendente()
+
 
 @bot.event
 async def on_ready():
@@ -22090,7 +22606,6 @@ class PatenteCargoRoleView(discord.ui.View):
         return True
 
     async def _salvar_cargo(self, interaction: discord.Interaction):
-        cargo = interaction.data.get("resolved", {}).get("roles", {})
         rid = int(interaction.data["values"][0])
         role_obj = interaction.guild.get_role(rid)
         if not role_obj or role_obj.is_default() or role_obj.managed:
@@ -22982,7 +23497,14 @@ def _problema_no_token(token: str) -> Optional[str]:
 
 def _run():
     print(f"\n  🔥 Iniciando Fire Force Pro v{VERSAO_BOT}...")
-    print("  📦 Dependências: pip install discord.py qrcode[pil] aiosqlite Pillow aiohttp")
+    print("  📦 Dependências: pip install -r requirements.txt")
+
+    # REDE 2 do auto-update: se a versão aplicada na última troca caiu antes de
+    # subir por completo, é aqui que o bot volta sozinho para a cópia de
+    # segurança. Precisa rodar ANTES de bot.run() — e só roda quando este
+    # arquivo é o programa principal, nunca quando é importado para teste
+    # (checagem_ci.py e a validação de carga dependem disso).
+    _verificar_rollback_no_arranque()
 
     token = _token_do_ambiente()
     problema = _problema_no_token(token)
@@ -22995,7 +23517,7 @@ def _run():
         print("   3️⃣  Crie um arquivo `.env` ao lado do bot e coloque: DISCORD_TOKEN=seu_token")
         print("       (ou configure o segredo DISCORD_TOKEN no painel da hospedagem)")
         print("   4️⃣  Nunca publique o token nem envie o `.env` para outras pessoas.")
-        print("   5️⃣  Rode de novo:  python fireforce_bot_v11.py\n")
+        print("   5️⃣  Rode de novo:  python fireforce_bot.py\n")
         return
 
     try:
